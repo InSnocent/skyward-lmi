@@ -8,6 +8,13 @@ use std::path::Path;
 pub mod ramdisk {
     /// The device configuration, copied from `devices/<codename>.toml`.
     pub const CONFIG: &str = "skyward/device.toml";
+    /// Binary SHA-256 of the ROM accepted by a temporary A-only installer.
+    pub const BLOCK_OTA_DIGEST: &str = "skyward/block-ota-install.sha256";
+    /// Enable the A-only read-only data decryption test.
+    pub const DATA_READONLY: &str = "skyward/data-readonly";
+    pub const DATA_SAMPLE: &str = "skyward/data-sample";
+    pub const LMI_APP_RESTORE_TEST: &str = "skyward/lmi-app-restore-test";
+    pub const LMI_DATA_BACKUP: &str = "skyward/lmi-data-backup";
     /// The UI typeface.
     pub const FONT: &str = "skyward/MiSansVF.ttf";
     /// The terminal's monospaced typeface.
@@ -207,14 +214,25 @@ const DATA: &str = "/data";
 /// and the ticks of the screen going off by the power key, made too.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Haptics {
+    #[serde(default)]
+    pub backend: HapticsBackend,
     /// The driver's number for a click waveform it keeps, on phones whose
     /// driver plays the waveforms it keeps.
     #[serde(default)]
     pub click: Option<i16>,
     /// The file the driver says the motor's resonant frequency in, in
     /// tenths of a hertz whatever its label.
+    #[serde(default)]
     pub resonance: String,
     pub strength: Strength,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HapticsBackend {
+    #[default]
+    Qualcomm,
+    Aw8697,
 }
 
 /// How strongly the click plays, each as a share of the most its waveform
@@ -288,6 +306,9 @@ pub struct Display {
     /// sliding over another rounds its leading corners to it.
     #[serde(default)]
     pub corner_radius: u32,
+    /// Use the kernel backlight device's reported maximum for the slider.
+    #[serde(default)]
+    pub use_backlight_max: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -544,8 +565,15 @@ impl DeviceConfig {
             ensure!(plain && !folder.is_empty(), "[backup] data_skipped: {folder} is not a path from the top of {DATA}");
         }
         if let Some(haptics) = &cfg.haptics {
-            let file = &haptics.resonance;
-            ensure!(Path::new(file).is_absolute(), "[haptics] resonance: {file} is not an absolute path");
+            match haptics.backend {
+                HapticsBackend::Qualcomm => {
+                    let file = &haptics.resonance;
+                    ensure!(Path::new(file).is_absolute(), "[haptics] resonance: {file} is not an absolute path");
+                }
+                HapticsBackend::Aw8697 => {
+                    ensure!(haptics.click.is_some_and(|id| id >= 0), "[haptics] AW8697 requires a nonnegative waveform number");
+                }
+            }
             let Strength { lightest, strongest } = haptics.strength;
             ensure!(
                 0.0 < lightest && lightest < strongest && strongest <= 1.0,
@@ -640,6 +668,15 @@ mod tests {
         assert_eq!(logd.libraries, ["/mnt/system/system/lib64/libsysutils.so", "/mnt/system/system/lib64/libcap.so"]);
         let ishtar = DeviceConfig::parse(include_str!("../../../devices/ishtar.toml")).unwrap();
         assert_eq!(ishtar.logd, None, "the 13 Ultra's recovery carries both");
+    }
+
+    #[test]
+    fn lmi_uses_the_aw8697_waveform_without_a_resonance_file() {
+        let cfg = DeviceConfig::parse(include_str!("../../../devices/lmi.toml")).unwrap();
+        assert!(cfg.display.use_backlight_max);
+        let haptics = cfg.haptics.unwrap();
+        assert_eq!((haptics.backend, haptics.click), (HapticsBackend::Aw8697, Some(0)));
+        assert!(haptics.resonance.is_empty());
     }
 
     #[test]

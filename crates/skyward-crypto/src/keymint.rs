@@ -128,8 +128,24 @@ pub struct KeyMint<'a> {
 impl<'a> KeyMint<'a> {
     /// Reach the running key service, or say that none is.
     pub fn open(binder: &'a Binder) -> Result<KeyMint<'a>> {
-        let device = service::find(binder, SERVICE)?
-            .with_context(|| format!("{SERVICE} is not running; the phone's key service has to be started first"))?;
+        let device = match service::find(binder, SERVICE)? {
+            Some(device) => device,
+            None => {
+                const COMPAT: &str = "android.security.compat";
+                const INTERFACE: &str = "android.security.compat.IKeystoreCompatService";
+                const GET_KEYMINT_DEVICE: u32 = 1;
+                const TRUSTED_ENVIRONMENT: i32 = 1;
+                let compat = service::find(binder, COMPAT)?
+                    .with_context(|| format!("neither {SERVICE} nor {COMPAT} is running"))?;
+                let mut call = Parcel::call(INTERFACE);
+                call.i32(TRUSTED_ENVIRONMENT);
+                let reply = compat.transact(GET_KEYMINT_DEVICE, &call).context("reach the legacy hardware key service")?;
+                let mut answer = reply.read();
+                status::ok(&mut answer).context("reach the legacy hardware key service")?;
+                let handle = answer.object()?.context("the compatibility service returned no hardware key device")?;
+                Handle::hold(binder, handle)?
+            }
+        };
         Ok(KeyMint { device })
     }
 

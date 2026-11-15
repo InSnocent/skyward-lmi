@@ -231,10 +231,60 @@ pub const LOW_BATTERY: u8 = 20;
 /// in figures over their unit as the stock bar gives a speed. `ink` colours
 /// the clock and every mark but the battery.
 pub fn status_bar(c: &mut Canvas, t: &Theme, f: &Fonts, bar: &Bar, ink: Rgba) {
+    status_bar_inks(c, t, f, bar, ink, ink);
+}
+
+/// Choose ink separately for the clock and the group of marks, using the
+/// wallpaper and any page transition already painted behind them.
+pub(crate) fn wallpaper_status_bar(c: &mut Canvas, t: &Theme, f: &Fonts, bar: &Bar) {
+    let m = &t.m;
+    let cy = m.status_cy;
+    let sample = |left, right| status_ink(c, left, right, cy, m.dp(6.0));
+    let clock_end = m.status_x + c.text_width(&f.status, bar.clock, m.status_px);
+    let clock_ink = sample(m.status_x, clock_end);
+
+    let mut width = 0.0;
+    if let Some((_, charging)) = bar.battery {
+        width += BATTERY_W_DP + BATTERY_CAP_DP;
+        if charging.is_some() {
+            width += BOLT_W_DP + 3.0;
+        }
+    }
+    width += if bar.data.is_some() { LOCK_BODY_W_DP + MARK_GAP_DP } else { 0.0 };
+    width += if bar.slot.is_some() { BADGE_DP + MARK_GAP_DP } else { 0.0 };
+    width += if bar.temp.is_some() { 25.0 } else { 0.0 };
+    width += if bar.wlan.is_some() { 46.0 } else { 0.0 };
+    let right = m.w as f32 - m.status_right.min(m.status_bolt_right);
+    let marks_ink = sample(right - m.dp(width.max(12.0)), right);
+    let marks = if marks_ink.r == 0 {
+        Theme::light(m.w, m.h, m.px_per_dp)
+    } else {
+        Theme::dark(m.w, m.h, m.px_per_dp)
+    };
+    status_bar_inks(c, &marks, f, bar, clock_ink, marks_ink);
+}
+
+fn status_ink(c: &Canvas, left: f32, right: f32, cy: f32, radius: f32) -> Rgba {
+    let mut luma = 0u32;
+    for y in [cy - radius, cy, cy + radius] {
+        let row = y.round().clamp(0.0, c.h as f32 - 1.0) as usize * c.w as usize;
+        for portion in [0.1, 0.3, 0.5, 0.7, 0.9] {
+            let x = (left + (right - left) * portion).round().clamp(0.0, c.w as f32 - 1.0) as usize;
+            let index = (row + x) * 4;
+            let rgb = &c.data[index..index + 3];
+            luma += 54 * u32::from(rgb[0]) + 183 * u32::from(rgb[1]) + 19 * u32::from(rgb[2]);
+        }
+    }
+    // Around this grey, black and white text have similar contrast.
+    let bit = if luma < 118 * 256 * 15 { 255 } else { 0 };
+    Rgba::rgb(bit, bit, bit)
+}
+
+fn status_bar_inks(c: &mut Canvas, t: &Theme, f: &Fonts, bar: &Bar, clock_ink: Rgba, ink: Rgba) {
     let m = &t.m;
     let cy = m.status_cy;
     // Digits carry no descender, so centre on half their height (≈0.72 em).
-    c.text(&f.status, bar.clock, m.status_x, cy + m.status_px * 0.36, m.status_px, ink, None);
+    c.text(&f.status, bar.clock, m.status_x, cy + m.status_px * 0.36, m.status_px, clock_ink, None);
     let mut right = m.w as f32 - m.status_right;
     if let Some((level, charging)) = bar.battery {
         if let Some(kind) = charging {
@@ -1724,6 +1774,7 @@ pub struct SliderBlock {
 #[derive(Clone, Copy)]
 pub enum Caption {
     Sun,
+    Opacity,
     /// A phone between the lines of its shaking.
     Vibrate,
 }
@@ -1753,6 +1804,12 @@ pub fn slider_card(c: &mut Canvas, t: &Theme, f: &Fonts, top: f32, caption: Capt
                 let (ux, uy) = (a.cos(), a.sin());
                 c.line(scx + ux * m.dp(8.3), lcy + uy * m.dp(8.3), scx + ux * m.dp(8.9), lcy + uy * m.dp(8.9), m.dp(2.0), t.pal.mono_icon);
             }
+        }
+        Caption::Opacity => {
+            let radius = m.dp(7.5);
+            c.stroke_round_rect(scx - radius, lcy - radius, radius * 2.0, radius * 2.0, radius, m.dp(1.8), t.pal.mono_icon);
+            c.line(scx - m.dp(5.0), lcy + m.dp(5.0), scx + m.dp(5.0), lcy - m.dp(5.0), m.dp(1.8), t.pal.mono_icon);
+            c.fill_circle(scx + m.dp(2.0), lcy + m.dp(2.0), m.dp(2.3), t.pal.mono_icon);
         }
         Caption::Vibrate => {
             c.stroke_round_rect(scx - m.dp(4.3), lcy - m.dp(7.7), m.dp(8.6), m.dp(15.4), m.dp(2.2), m.dp(2.0), t.pal.mono_icon);
@@ -2810,6 +2867,26 @@ mod tests {
             // Within a dp of the place's centre, three pixels a dp.
             assert!((x - 100.0).abs() <= 3.0 && (y - 100.0).abs() <= 3.0, "{icon:?} centred: ({x}, {y})");
             assert!(right - l <= 66.0 && bottom - top <= 66.0, "{icon:?} within 22 dp: {}x{}", right - l, bottom - top);
+        }
+    }
+
+    #[test]
+    fn wallpaper_status_uses_contrasting_ink_for_the_clock_and_marks() {
+        let f = crate::font::bundled();
+        let t = Theme::light(540, 1200, 1.375);
+        let bar = Bar { clock: "01:27", battery: None, wlan: None, data: Some(false), slot: None, temp: None };
+        for clock_bg in [0, 255] {
+            let right_bg = 255 - clock_bg;
+            let mut c = Canvas::filled(t.m.w, t.m.h, Rgba::rgb(clock_bg, clock_bg, clock_bg));
+            c.fill_rect(270.0, 0.0, 270.0, t.m.h as f32, Rgba::rgb(right_bg, right_bg, right_bg));
+            wallpaper_status_bar(&mut c, &t, &f, &bar);
+            let ink = |side: usize, expected: u8| {
+                c.data.chunks_exact(t.m.w as usize * 4).take(80).any(|row| {
+                    row[side * 1080..(side + 1) * 1080].chunks_exact(4).any(|pixel| pixel[0].abs_diff(expected) < 20)
+                })
+            };
+            assert!(ink(0, right_bg), "the clock contrasts with the left side");
+            assert!(ink(1, clock_bg), "the lock icon contrasts with the right side");
         }
     }
 

@@ -9,7 +9,7 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -61,6 +61,57 @@ pub fn start(services: &[Service], libraries: Option<&Path>) -> Result<()> {
         ready(&waiting)?;
     }
     Ok(())
+}
+
+/// Services owned by the lmi data operation. They stop before its source
+/// partitions can be released for the ROM updater.
+#[derive(Default)]
+pub struct Managed(Vec<Child>);
+
+impl Managed {
+    pub fn start(services: &[Service]) -> Result<Self> {
+        let paths = ueventd::PASSWD_FILES.iter().chain(&ueventd::GROUP_FILES).copied().collect::<Vec<_>>();
+        let accounts = ueventd::accounts(&paths);
+        let mut started = Self::default();
+        for service in services {
+            let who = Credentials::of(service, &accounts)?;
+            let mut child = spawn(service, &who)?;
+            if service.oneshot {
+                let status = child.wait().with_context(|| format!("wait for {}", service.path))?;
+                ensure!(status.success(), "{} ended: {status}", service.path);
+                continue;
+            }
+            started.0.push(child);
+            ready(service)?;
+            ensure!(started.0.last_mut().expect("a child just started").try_wait()?.is_none(),
+                "{} exited before becoming ready", service.path);
+        }
+        Ok(started)
+    }
+
+    pub fn stop(&mut self) -> Result<()> {
+        for child in self.0.iter_mut().rev() {
+            if child.try_wait()?.is_none() {
+                if let Err(error) = child.kill() {
+                    if child.try_wait()?.is_none() {
+                        return Err(error).with_context(|| format!("stop recovery service {}", child.id()));
+                    }
+                }
+                child.wait().with_context(|| format!("wait for recovery service {}", child.id()))?;
+            }
+        }
+        self.0.clear();
+        Ok(())
+    }
+}
+
+impl Drop for Managed {
+    fn drop(&mut self) {
+        for child in self.0.iter_mut().rev() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 /// Who a program runs as and what of root's it keeps, as the phone's own
@@ -209,9 +260,30 @@ fn supervise(s: &Service, who: &Credentials) -> ! {
 
 /// Start the program and wait for it to end.
 fn run(s: &Service, who: &Credentials) -> Result<String> {
-    let mut child = command(s, who).spawn().with_context(|| format!("start {}", s.path))?;
+    let mut child = spawn(s, who)?;
     let status = child.wait().context("wait for it")?;
     Ok(format!("pid {} ended: {status}", child.id()))
+}
+
+fn spawn(s: &Service, who: &Credentials) -> Result<Child> {
+    let mut cmd = command(s, who);
+    // The legacy recovery has no logd when its hardware directory starts.
+    // Capture only the loader's startup errors for this program.
+    if s.path == "/mnt/system_ext/bin/hwservicemanager" && Path::new("/skyward/data-readonly").is_file() {
+        cmd.stderr(Stdio::piped());
+    }
+    let mut child = cmd.spawn().with_context(|| format!("start {}", s.path))?;
+    if let Some(stderr) = child.stderr.take() {
+        thread::spawn(move || {
+            use std::io::BufRead;
+            for line in io::BufReader::new(stderr).lines().map_while(std::result::Result::ok) {
+                if line.contains("CANNOT LINK EXECUTABLE") || line.contains("linker:") {
+                    let _ = skyward_sys::kmsg(&format!("hwservicemanager loader: {line}"));
+                }
+            }
+        });
+    }
+    Ok(child)
 }
 
 /// The program as it is started: with what it is given, from the top of the
@@ -224,11 +296,39 @@ fn command(s: &Service, who: &Credentials) -> Command {
         cmd.env("LD_LIBRARY_PATH", s.libraries.join(":"));
     }
     let who = who.clone();
+    let legacy_directory = s.path == "/mnt/system_ext/bin/hwservicemanager"
+        && Path::new("/skyward/data-readonly").is_file();
     // Only system calls run between the fork and the exec, on what was
     // worked out before it.
-    unsafe { cmd.pre_exec(move || who.take_on()) };
+    unsafe {
+        cmd.pre_exec(move || {
+            if legacy_directory {
+                legacy_framework_manifest()?;
+            }
+            who.take_on()
+        })
+    };
     cmd
 }
+
+/// Recovery VINTF fragments are device manifests. Hide them only from the
+/// framework service manager, leaving the recovery's own services alone.
+fn legacy_framework_manifest() -> io::Result<()> {
+    use std::ptr::null;
+    let done = |code| if code == 0 { Ok(()) } else { Err(io::Error::last_os_error()) };
+    unsafe {
+        done(libc::unshare(libc::CLONE_NEWNS))?;
+        done(libc::mount(null(), c"/".as_ptr(), null(), libc::MS_REC | libc::MS_PRIVATE, null()))?;
+        done(libc::mount(
+            c"/skyward/framework-manifest-fragments".as_ptr(),
+            c"/system/etc/vintf/manifest".as_ptr(),
+            null(),
+            libc::MS_BIND,
+            null(),
+        ))
+    }
+}
+
 
 /// Lock in memory every file the running programs have mapped or open on
 /// the `mounted` partitions, so they keep working once those partitions

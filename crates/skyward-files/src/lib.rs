@@ -369,9 +369,21 @@ pub fn make_folders(path: &Path, ownership: Ownership) -> Result<()> {
     }
     let into = path.parent().filter(|p| !p.as_os_str().is_empty()).with_context(|| format!("{} is in no folder", path.display()))?;
     make_folders(into, ownership)?;
+    make_folder(path, ownership)
+}
+
+/// Create one new folder, failing if it already exists.
+pub fn make_folder(path: &Path, ownership: Ownership) -> Result<()> {
+    let into = path.parent().with_context(|| format!("{} is in no folder", path.display()))?;
     let give = give(into, ownership)?;
     fs::create_dir(path).with_context(|| format!("make {}", path.display()))?;
-    given(path, &give, true)
+    if let Err(error) = given(path, &give, true) {
+        return Err(match fs::remove_dir(path) {
+            Ok(()) => error,
+            Err(cleanup) => error.context(format!("could not remove the new folder: {cleanup}")),
+        });
+    }
+    Ok(())
 }
 
 /// Make the file `path`, which is not there yet, given what `ownership`

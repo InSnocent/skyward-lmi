@@ -65,6 +65,8 @@ pub fn render(screen: Screen, cx: &Ctx) -> Frame {
         Screen::Decrypt => decrypt(cx),
         Screen::Home => home(cx),
         Screen::Settings => settings(cx),
+        Screen::Wallpaper => wallpaper(cx),
+        Screen::PickWallpaper => pick_wallpaper(cx),
         Screen::Reboot => reboot(cx),
         Screen::Wipe => wipe(cx),
         Screen::Mount => mount(cx),
@@ -169,6 +171,7 @@ const SCREEN_TIMEOUT: Text = ["息屏时间", "螢幕自動關閉", "Screen time
 const UPDATE: Text = ["系统更新", "系統更新", "System update"];
 const SKYWARD_UPDATE: Text = ["Skyward 更新", "Skyward 更新", "Skyward update"];
 const FILES: Text = ["文件管理", "檔案管理", "File manager"];
+const WALLPAPER: Text = ["壁纸", "桌布", "Wallpaper"];
 const TERMINAL: Text = ["终端", "終端機", "Terminal"];
 const LANGUAGE: Text = ["语言", "語言", "Language"];
 const TIME_ZONE: Text = ["时区", "時區", "Time zone"];
@@ -193,6 +196,24 @@ fn long_page(cx: &Ctx) -> Canvas {
     sheet(cx, cx.t.m.h * 3, cx.t.pal.bg)
 }
 
+fn appearance_background(cx: &Ctx) -> Canvas {
+    let bg = if cx.state.wallpaper().is_some() { cx.t.pal.bg.with_alpha(0) } else { cx.t.pal.bg };
+    sheet(cx, cx.t.m.h * 3, bg)
+}
+
+fn frost_card(c: &mut Canvas, t: &Theme, cards: &mut Vec<Rect>, top: f32, bottom: f32) {
+    if t.pal.card.a == 255 {
+        return;
+    }
+    let m = &t.m;
+    let rect = Rect::new(m.margin, top, m.w as f32 - 2.0 * m.margin, bottom - top);
+    let width = m.dp(0.8);
+    let inset = width / 2.0;
+    let rim = if t.dark { Rgba::rgb(255, 255, 255).with_alpha(45) } else { Rgba::rgb(46, 58, 75).with_alpha(52) };
+    c.stroke_round_rect(rect.x + inset, rect.y + inset, rect.w - width, rect.h - width, m.card_radius - inset, width, rim);
+    cards.push(rect);
+}
+
 /// How tall a long page whose content ends at `bottom` is: to the bottom
 /// margin after it, and never shorter than one screen.
 fn fitted(t: &Theme, bottom: f32) -> u32 {
@@ -214,8 +235,9 @@ fn hits(rects: &[Rect], actions: &[Action]) -> Vec<Hit> {
 /// slot, the data partition's lock and the battery's temperature.
 pub fn home(cx: &Ctx) -> Frame {
     let (t, f, i, l) = (cx.t, cx.f, cx.info, cx.state.lang);
-    let mut c = long_page(cx);
+    let mut c = appearance_background(cx);
     let mut out = Vec::new();
+    let mut frosted_cards = Vec::new();
     // The search bar is left room on the page and drawn over it, folding
     // away as the page scrolls up.
     let bar = Rect::new(t.m.margin, t.m.content_top, t.m.w as f32 - t.m.margin * 2.0, t.m.search_h);
@@ -259,6 +281,7 @@ pub fn home(cx: &Ctx) -> Frame {
         opens.push(Some(Action::Open(Screen::Systems)));
     }
     let card = widgets::device_card(&mut c, t, f, y, &i.model, &sub, &rows);
+    frost_card(&mut c, t, &mut frosted_cards, y, card.bottom);
     out.push(Hit { rect: card.rows[0], action: Action::Open(Screen::About) });
     out.extend(card.rows[1..].iter().zip(&opens).filter_map(|(&rect, open)| open.map(|action| Hit { rect, action })));
     y = card.bottom + t.m.card_gap;
@@ -282,6 +305,7 @@ pub fn home(cx: &Ctx) -> Frame {
     }
     if !rows.is_empty() {
         let first = widgets::list(&mut c, t, f, y, &rows);
+        frost_card(&mut c, t, &mut frosted_cards, y, first.bottom);
         out.extend(hits(&first.rows, &opens));
         y = first.bottom + t.m.card_gap;
     }
@@ -292,6 +316,7 @@ pub fn home(cx: &Ctx) -> Frame {
         Row::new(l.pick(["挂载", "掛載", "Mount"])).icon(SLATE, Icon::Mount),
         Row::new(l.pick(DECRYPT)).icon(BLUE, Icon::Lock).trail(Trail::Value(fmt::data(l, &cx.state.data))),
     ]);
+    frost_card(&mut c, t, &mut frosted_cards, y, tools.bottom);
     out.extend(hits(&tools.rows, &[
         Action::Open(Screen::Install),
         Action::Open(Screen::Backup),
@@ -307,6 +332,7 @@ pub fn home(cx: &Ctx) -> Frame {
         Row::new(l.pick(SETTINGS)).icon(SLATE, Icon::Gear),
         Row::new(l.pick(REBOOT)).icon(ORANGE, Icon::Power).trail(Trail::Value(target)),
     ]);
+    frost_card(&mut c, t, &mut frosted_cards, y, system.bottom);
     out.extend(hits(&system.rows, &[
         Action::Open(Screen::Wipe),
         Action::Open(Screen::Advanced),
@@ -316,7 +342,7 @@ pub fn home(cx: &Ctx) -> Frame {
     // However little it holds, the page scrolls far enough to fold its bar
     // away.
     let height = fitted(t, system.bottom).max(t.m.h + fold.span.ceil() as u32);
-    Frame { back: false, fold: Some(fold), ..Frame::new(t, c.crop_height(height), out, HOME_TITLE, cards_top) }
+    Frame { back: false, fold: Some(fold), frosted_cards, ..Frame::new(t, c.crop_height(height), out, HOME_TITLE, cards_top) }
 }
 
 /// What the home page says beside its entry to the systems: the one that
@@ -349,16 +375,54 @@ fn update_value(cx: &Ctx) -> &'static str {
 
 /// Preferences, opening with the stock「显示与亮度」theme previews.
 pub fn settings(cx: &Ctx) -> Frame {
-    let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
-    let mut c = long_page(cx);
+    let (f, s, l) = (cx.f, cx.state, cx.state.lang);
+    let mut theme = *cx.t;
+    let has_background = s.wallpaper().is_some();
+    if has_background {
+        theme.pal.section = theme.pal.text;
+    }
+    let t = &theme;
+    let mut c = appearance_background(cx);
     let mut out = Vec::new();
+    let mut frosted_cards = Vec::new();
     let top = t.m.content_top;
-    let themes = widgets::theme_picker(&mut c, t, f, l, top + t.m.dp(8.9));
+    let appearance = if s.offers(Screen::Wallpaper) {
+        widgets::section_first(&mut c, t, f, top, l.pick(["外观", "外觀", "Appearance"]))
+    } else {
+        top + t.m.dp(8.9)
+    };
+    let mut picker = *t;
+    if has_background {
+        picker.pal.info = t.pal.text;
+        picker.pal.accent = if t.dark { Rgba::rgb(169, 213, 255) } else { Rgba::rgb(0, 24, 62) };
+    }
+    let themes = widgets::theme_picker(&mut c, &picker, f, l, appearance);
     out.extend(hits(&themes.rows, &[Action::Theme { dark: false }, Action::Theme { dark: true }]));
-    let mut y = widgets::section(&mut c, t, f, themes.bottom, l.pick(["亮度", "亮度", "Brightness"]));
+    let mut y = themes.bottom;
+    if s.offers(Screen::Wallpaper) {
+        y += t.m.card_gap;
+        let glass = Row::new(l.pick(["毛玻璃卡片", "毛玻璃卡片", "Frosted cards"]));
+        let (glass, toggle) = if !s.data.storage_open() {
+            let note = l.pick(["解密后可用", "解密後可用", "Available after decryption"]);
+            (glass.trail(Trail::Value(note)), Action::Open(Screen::Decrypt))
+        } else {
+            let glass = if s.wallpaper().is_none() {
+                glass.subtitle(l.pick(["导入壁纸后生效", "匯入桌布後生效", "Takes effect after importing a wallpaper"]))
+            } else {
+                glass
+            };
+            (glass.trail(Trail::Switch(s.frosted_cards)), Action::Toggle(Switch::FrostedCards))
+        };
+        let row = widgets::list(&mut c, t, f, y, &[Row::new(l.pick(WALLPAPER)).icon(PURPLE, Icon::Layers), glass]);
+        frost_card(&mut c, t, &mut frosted_cards, y, row.bottom);
+        out.extend(hits(&row.rows, &[Action::Open(Screen::Wallpaper), toggle]));
+        y = row.bottom;
+    }
+    y = widgets::section(&mut c, t, f, y, l.pick(["亮度", "亮度", "Brightness"]));
     let off = fmt::screen_off(l, SCREEN_OFF[s.screen_off]);
     let below = Row::new(l.pick(SCREEN_TIMEOUT)).trail(Trail::Value(&off));
     let slider = widgets::slider_card(&mut c, t, f, y, Caption::Sun, l.pick(["屏幕亮度", "螢幕亮度", "Screen brightness"]), s.brightness, Some(below));
+    frost_card(&mut c, t, &mut frosted_cards, y, slider.bottom);
     out.push(Hit { rect: slider.track, action: Action::Slider(Slider::Brightness) });
     if let Some(r) = slider.below {
         out.push(Hit { rect: r, action: Action::Open(Screen::ScreenOff) });
@@ -366,6 +430,7 @@ pub fn settings(cx: &Ctx) -> Frame {
     y = widgets::section(&mut c, t, f, slider.bottom, l.pick(["振动", "震動", "Vibration"]));
     let below = Row::new(l.pick(["触摸振动", "觸控震動", "Touch vibration"])).trail(Trail::Switch(s.vibrate));
     let vibration = widgets::slider_card(&mut c, t, f, y, Caption::Vibrate, l.pick(["振动强度", "震動強度", "Vibration intensity"]), s.vibration, Some(below));
+    frost_card(&mut c, t, &mut frosted_cards, y, vibration.bottom);
     out.push(Hit { rect: vibration.track, action: Action::Slider(Slider::Vibration) });
     if let Some(r) = vibration.below {
         out.push(Hit { rect: r, action: Action::Toggle(Switch::Vibrate) });
@@ -375,18 +440,25 @@ pub fn settings(cx: &Ctx) -> Frame {
         Row::new(l.pick(LANGUAGE)).icon(BLUE, Icon::Globe).trail(Trail::Value(l.name())),
         Row::new(l.pick(TIME_ZONE)).icon(ORANGE, Icon::Clock).trail(Trail::Value(l.pick(TIME_ZONES[s.time_zone].0))),
     ]);
+    frost_card(&mut c, t, &mut frosted_cards, y, general.bottom);
     out.extend(hits(&general.rows, &[Action::Open(Screen::Language), Action::Open(Screen::TimeZone)]));
     y = widgets::section(&mut c, t, f, general.bottom, "USB");
     let usb = widgets::list(&mut c, t, f, y, &[Row::new(l.pick(["文件传输", "檔案傳輸", "File transfer"])).icon(BLUE, Icon::Usb).trail(Trail::Switch(s.file_transfer))]);
+    frost_card(&mut c, t, &mut frosted_cards, y, usb.bottom);
     out.extend(hits(&usb.rows, &[Action::Toggle(Switch::FileTransfer)]));
     let note = l.pick([
         "开启后，可在电脑上管理内部存储中的文件，需先完成「解密」。",
         "開啟後，可在電腦上管理內部儲存空間中的檔案，需先完成「解密」。",
         "When on, a computer can manage the files in internal storage, once it is decrypted.",
     ]);
-    y = widgets::footnote(&mut c, t, f, usb.bottom, note);
+    let mut footnote_theme = *t;
+    if has_background {
+        footnote_theme.pal.value = t.pal.text;
+    }
+    y = widgets::footnote(&mut c, &footnote_theme, f, usb.bottom, note);
     y = widgets::section(&mut c, t, f, y, l.pick(["调试", "偵錯", "Debugging"]));
     let debug = widgets::list(&mut c, t, f, y, &[Row::new(l.pick(TERMINAL)).icon(SLATE, Icon::Terminal)]);
+    frost_card(&mut c, t, &mut frosted_cards, y, debug.bottom);
     out.extend(hits(&debug.rows, &[Action::Open(Screen::Terminal)]));
     y = widgets::section(&mut c, t, f, debug.bottom, l.pick(["关于", "關於", "About"]));
     let mut rows = vec![Row::new(l.pick(ABOUT)).trail(Trail::Value(VERSION))];
@@ -400,8 +472,52 @@ pub fn settings(cx: &Ctx) -> Frame {
         opens.push(Action::Open(Screen::SkywardUpdate));
     }
     let about = widgets::list(&mut c, t, f, y, &rows);
+    frost_card(&mut c, t, &mut frosted_cards, y, about.bottom);
     out.extend(hits(&about.rows, &opens));
-    Frame::new(t, fit(c, t, about.bottom), out, l.pick(SETTINGS), top)
+    Frame { frosted_cards, ..Frame::new(t, fit(c, t, about.bottom), out, l.pick(SETTINGS), top) }
+}
+
+pub fn wallpaper(cx: &Ctx) -> Frame {
+    let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
+    let top = t.m.content_top;
+    let mut c = long_page(cx);
+    let mut out = Vec::new();
+    if !s.data.storage_open() {
+        let unlock = widgets::list(&mut c, t, f, top, &[Row::new(l.pick(["解密以导入图片", "解密以匯入圖片", "Decrypt to import a picture"])).icon(BLUE, Icon::Lock)]);
+        out.extend(hits(&unlock.rows, &[Action::Open(Screen::Decrypt)]));
+        return Frame::new(t, fit(c, t, unlock.bottom), out, l.pick(WALLPAPER), top);
+    }
+
+    let mut y = top;
+    let imported = s.wallpaper();
+    if let Some(image) = imported {
+        let height = t.m.dp(248.0);
+        let card = Rect::new(t.m.margin, top, t.m.w as f32 - 2.0 * t.m.margin, height);
+        c.fill_round_rect(card.x, card.y, card.w, card.h, t.m.card_radius, t.pal.card);
+        let pad = t.m.dp(10.0);
+        let preview = Rect::new(card.x + pad, card.y + pad, card.w - 2.0 * pad, card.h - 2.0 * pad);
+        image.preview(&mut c, t, preview, s.wallpaper_opacity);
+        y = card.y + card.h + t.m.card_gap;
+    }
+
+    let pick = widgets::list(&mut c, t, f, y, &[Row::new(l.pick(["导入图片", "匯入圖片", "Import picture"])).icon(BLUE, Icon::Folder)]);
+    out.extend(hits(&pick.rows, &[Action::Open(Screen::PickWallpaper)]));
+    y = pick.bottom;
+    if imported.is_some() {
+        let percent = s.wallpaper_opacity;
+        let label = tr!(l, "壁纸不透明度 {percent}%", "桌布不透明度 {percent}%", "Wallpaper opacity {percent}%");
+        let slider = widgets::slider_card(&mut c, t, f, y + t.m.card_gap, Caption::Opacity, &label, crate::wallpaper::opacity_level(percent), None);
+        out.push(Hit { rect: slider.track, action: Action::Slider(Slider::WallpaperOpacity) });
+        y = slider.bottom;
+    }
+    if imported.is_some() || s.wallpaper_unreadable {
+        let reset = widgets::list(&mut c, t, f, y + t.m.card_gap, &[
+            Row::new(l.pick(["恢复默认壁纸", "還原預設桌布", "Restore default wallpaper"])).icon(SLATE, Icon::Restore).trail(Trail::None),
+        ]);
+        out.extend(hits(&reset.rows, &[Action::ResetWallpaper]));
+        y = reset.bottom;
+    }
+    Frame::new(t, fit(c, t, y), out, l.pick(WALLPAPER), top)
 }
 
 /// What the settings page says beside its Skyward update entry: an update
@@ -478,18 +594,26 @@ pub fn mount(cx: &Ctx) -> Frame {
                 .iter()
                 .zip(&subs)
                 .map(|(m, sub)| {
-                    let trail = if m.holders.is_empty() { Trail::Switch(m.mounted) } else { Trail::Text(l.pick(["使用中", "使用中", "In use"])) };
+                    let trail = if s.inspect_mounts {
+                        if m.mounted { Trail::Text(l.pick(["只读", "唯讀", "Read-only"])) } else { Trail::None }
+                    } else if m.holders.is_empty() {
+                        Trail::Switch(m.mounted)
+                    } else {
+                        Trail::Text(l.pick(["使用中", "使用中", "In use"]))
+                    };
                     Row::new(&m.base).subtitle(sub).trail(trail)
                 })
                 .collect();
             let list = widgets::list(&mut c, t, f, y, &rows);
-            out.extend(list.rows.iter().zip(mounts).enumerate().map(|(i, (&rect, m))| {
-                let action = match m.holders.is_empty() {
-                    true => Action::MountToggle(i),
-                    false => Action::Unavailable(l.pick(["无法卸载正在使用的分区", "無法卸載正在使用的分割區", "A partition in use can't be unmounted"])),
-                };
-                Hit { rect, action }
-            }));
+            if !s.inspect_mounts {
+                out.extend(list.rows.iter().zip(mounts).enumerate().map(|(i, (&rect, m))| {
+                    let action = match m.holders.is_empty() {
+                        true => Action::MountToggle(i),
+                        false => Action::Unavailable(l.pick(["无法卸载正在使用的分区", "無法卸載正在使用的分割區", "A partition in use can't be unmounted"])),
+                    };
+                    Hit { rect, action }
+                }));
+            }
             let y = match &s.mount_failure {
                 Some(failure) => widgets::footnote(&mut c, t, f, list.bottom, &fmt::mount_failure(l, failure)),
                 None => list.bottom,
@@ -876,6 +1000,47 @@ pub fn install(cx: &Ctx) -> Frame {
         let y = widgets::info_card(&mut c, t, f, y, &facts);
         widgets::section(&mut c, t, f, y, ways)
     };
+    if cx.state.sideload_test || cx.state.block_ota_preflight || cx.state.block_ota_install {
+        let mut rows = Vec::new();
+        let mut actions = Vec::new();
+        let subtitle = l.pick(["在电脑上运行 adb sideload", "在電腦上執行 adb sideload", "Run adb sideload on the computer"]);
+        if cx.state.block_ota_preflight {
+            let title = l.pick(["ADB sideload 只读预检", "ADB sideload 唯讀預檢", "ADB sideload preflight"]);
+            rows.push(Row::new(title).icon(GREEN, Icon::Usb).subtitle(subtitle));
+            actions.push(Action::SideloadPreflight);
+        }
+        if cx.state.block_ota_install || cx.state.sideload_test {
+            let title = if cx.state.block_ota_install {
+                l.pick(["ADB sideload 安装系统", "ADB sideload 安裝系統", "Install system via ADB sideload"])
+            } else {
+                l.pick(["ADB sideload 测试", "ADB sideload 測試", "ADB sideload test"])
+            };
+            rows.push(Row::new(title).icon(GREEN, Icon::Usb).subtitle(subtitle));
+            actions.push(Action::Sideload);
+        }
+        let rows = widgets::list(&mut c, t, f, y, &rows);
+        let note = if cx.state.block_ota_install {
+            l.pick([
+                "验签通过后，需滑动确认才会写入系统分区。",
+                "驗證簽章後，需滑動確認才會寫入系統分割區。",
+                "The signed OTA writes system partitions after you confirm.",
+            ])
+        } else if cx.state.block_ota_preflight {
+            l.pick([
+                "验证更新包签名，并显示脚本声明的分区。预检不会运行安装脚本。",
+                "驗證更新檔簽章，並顯示指令碼宣告的分割區。預檢不會執行安裝指令碼。",
+                "Verifies the OTA signature and shows its declared targets. The updater does not run.",
+            ])
+        } else {
+            l.pick([
+                "仅接受本次测试签名的日志 ZIP。确认后只打印一行日志。",
+                "只接受本次測試簽章的日誌 ZIP。確認後只印出一行日誌。",
+                "Accepts the signed test ZIP. After confirmation it prints one line.",
+            ])
+        };
+        let bottom = widgets::footnote(&mut c, t, f, rows.bottom, note);
+        return Frame::new(t, fit(c, t, bottom), hits(&rows.rows, &actions), l.pick(["安装", "安裝", "Install"]), top);
+    }
     let mut rows = Vec::new();
     if let Some(note) = fmt::snapshot_note(l, &i.snapshot) {
         rows.push(Row::new(fmt::snapshot(l, &i.snapshot)).icon(ORANGE, Icon::Layers).subtitle(note).trail(Trail::None));
@@ -1374,7 +1539,15 @@ pub fn installing(cx: &Ctx) -> Frame {
                 "This zip runs the install script it holds, which can rewrite any partition of this phone.",
             ]);
             let mut y = widgets::list(&mut c, t, f, top, &[standing(name, ORANGE, Icon::Install, detail)]).bottom;
-            if let Some(note) = fmt::snapshot_script_note(l, &i.snapshot) {
+            if let Some(targets) = &s.block_ota_targets {
+                y = widgets::info_card(&mut c, t, f, y + t.m.card_gap, &block_ota_facts(l, targets));
+                let note = l.pick([
+                    "安装会重建 super 并覆盖 boot，现有 Root 可能失效。确认后保持 USB 连接。",
+                    "安裝會重建 super 並覆寫 boot，現有 Root 可能失效。確認後請保持 USB 連線。",
+                    "Installation rebuilds super and replaces boot, which can remove root. Keep USB connected after confirming.",
+                ]);
+                y = widgets::footnote(&mut c, t, f, y, note);
+            } else if let Some(note) = fmt::snapshot_script_note(l, &i.snapshot) {
                 y = widgets::footnote(&mut c, t, f, y, note);
             }
             let (label, danger) = confirm_label(Confirm::RunScript, cx.state);
@@ -1460,6 +1633,14 @@ fn capitalized(l: Lang, phrase: &str) -> String {
 
 /// How an install ended, and where to go from there: another package from
 /// the computer, or back to choose another file.
+fn block_ota_facts(l: Lang, report: &skyward_install::block_preflight::BlockPreflight) -> [(&'static str, String); 3] {
+    [
+        (l.pick(["设备", "裝置", "Device"]), report.device.clone()),
+        (l.pick(["super 逻辑分区", "super 邏輯分割區", "Logical partitions in super"]), report.logical.join(", ")),
+        (l.pick(["独立分区", "獨立分割區", "Physical partitions"]), report.physical.join(", ")),
+    ]
+}
+
 fn finished(
     c: &mut Canvas,
     cx: &Ctx,
@@ -1473,7 +1654,10 @@ fn finished(
     let gap = t.m.card_gap;
     let choose_another = ["选择其他文件", "選擇其他檔案", "Choose another file"];
     let (again, another) = match source {
-        Source::Computer => (Row::new(l.pick(["再次发送", "再次傳送", "Send again"])).icon(GREEN, Icon::Usb), Action::Sideload),
+        Source::Computer => {
+            let action = if cx.state.sideload_preflight { Action::SideloadPreflight } else { Action::Sideload };
+            (Row::new(l.pick(["再次发送", "再次傳送", "Send again"])).icon(GREEN, Icon::Usb), action)
+        }
         Source::File(_) | Source::Opened { .. } => (Row::new(l.pick(choose_another)).icon(GREEN, Icon::Folder), Action::Back),
         Source::Asked { .. } => (Row::new(l.pick(choose_another)).icon(GREEN, Icon::Folder), Action::Open(Screen::Install)),
         Source::Rescue => (Row::new(l.pick(["退出救援模式", "結束救援模式", "Leave rescue mode"])).icon(GREEN, Icon::Usb), Action::Back),
@@ -1482,6 +1666,15 @@ fn finished(
     let installed = l.pick(["安装成功", "安裝成功", "Installed"]);
     let nothing_written = l.pick(["未写入任何内容。", "未寫入任何內容。", "Nothing was written."]);
     match outcome {
+        Outcome::BlockPreflight(report) => {
+            let title = l.pick(["只读预检通过", "唯讀預檢通過", "Preflight passed"]);
+            let detail = l.pick(["原 Recovery 证书验签通过。", "原 Recovery 憑證驗證通過。", "Verified against the original recovery certificates."]);
+            let y = widgets::list(c, t, f, top, &[standing(title, GREEN, Icon::Install, detail)]).bottom;
+            let y = widgets::info_card(c, t, f, y + gap, &block_ota_facts(l, report));
+            let next = widgets::list(c, t, f, y + gap, &[restart, again]);
+            out.extend(hits(&next.rows, &[Action::RebootTo(Target::System), another]));
+            widgets::footnote(c, t, f, next.bottom, nothing_written)
+        }
         Outcome::Installed { slot, .. } => {
             let slot = slot.letter();
             let detail = tr!(
@@ -1822,14 +2015,13 @@ pub fn backup(cx: &Ctx) -> Frame {
     let boot = l.pick(["boot、init_boot、vendor_boot、dtbo、vbmeta 和 recovery", "boot、init_boot、vendor_boot、dtbo、vbmeta 和 recovery", "boot, init_boot, vendor_boot, dtbo, vbmeta and recovery"]);
     let modem = l.pick(["IMEI、基带设置和传感器校准数据", "IMEI、基頻設定和感應器校正資料", "IMEI, modem settings and sensor calibration"]);
     let subs = [boot, system, data, modem];
-    let rows: Vec<Row> = BACKUP_PARTS
-        .iter()
-        .zip(subs)
-        .enumerate()
-        .map(|(k, (name, sub))| Row::new(l.pick(*name)).subtitle(sub).trail(Trail::Check(s.backup[k])))
+    let choices: &[usize] = if s.data_backup_only { &[2] } else { &[0, 1, 2, 3] };
+    let rows: Vec<Row> = choices.iter()
+        .map(|&k| Row::new(l.pick(BACKUP_PARTS[k])).subtitle(subs[k]).trail(Trail::Check(s.backup[k])))
         .collect();
     let parts = widgets::list(&mut c, t, f, y, &rows);
-    out.extend(hits(&parts.rows, &[0, 1, 2, 3].map(Action::BackupPart)));
+    let actions: Vec<_> = choices.iter().copied().map(Action::BackupPart).collect();
+    out.extend(hits(&parts.rows, &actions));
     let y = widgets::section(&mut c, t, f, parts.bottom, l.pick(["存放位置", "存放位置", "Save to"]));
     let storage = match (s.data.storage_open(), i.storage.free.map(fmt::gb)) {
         (true, Some(free)) => tr!(l, "剩余 {free}", "剩餘 {free}", "{free} free"),
@@ -1842,11 +2034,14 @@ pub fn backup(cx: &Ctx) -> Frame {
         Some(UsbDrive::Unreadable(_)) => USB_DRIVE_UNREADABLE,
         None => USB_DRIVE_WANTED,
     });
-    let places = widgets::list(&mut c, t, f, y, &[
-        Row::new(place_name(l, Place::Storage)).subtitle(&storage).trail(Trail::Check(s.backup_to == Place::Storage)),
-        Row::new(place_name(l, Place::UsbDrive)).subtitle(usb).trail(Trail::Check(s.backup_to == Place::UsbDrive)),
-    ]);
-    out.extend(hits(&places.rows, &[Action::BackupTo(Place::Storage), Action::BackupTo(Place::UsbDrive)]));
+    let mut places = vec![Row::new(place_name(l, Place::Storage)).subtitle(&storage).trail(Trail::Check(s.backup_to == Place::Storage))];
+    let mut actions = vec![Action::BackupTo(Place::Storage)];
+    if !s.data_backup_only {
+        places.push(Row::new(place_name(l, Place::UsbDrive)).subtitle(usb).trail(Trail::Check(s.backup_to == Place::UsbDrive)));
+        actions.push(Action::BackupTo(Place::UsbDrive));
+    }
+    let places = widgets::list(&mut c, t, f, y, &places);
+    out.extend(hits(&places.rows, &actions));
     let y = widgets::section(&mut c, t, f, places.bottom, l.pick(["选项", "選項", "Options"]));
     let options = widgets::list(&mut c, t, f, y, &[
         Row::new(l.pick(["压缩", "壓縮", "Compress"])).subtitle(l.pick(["备份更小，耗时更长", "備份更小，耗時更長", "Smaller, and slower to make"])).trail(Trail::Switch(s.compress)),
@@ -1889,11 +2084,17 @@ pub fn restore(cx: &Ctx) -> Frame {
         out.extend(list.rows.iter().enumerate().map(|(k, &rect)| Hit { rect, action: Action::OpenBackup(k) }));
         list.bottom
     };
-    let note = l.pick([
+    let note = if s.data_backup_only {
+        l.pick([
+            "解密后，在内部存储的 Skyward/backups 文件夹中查找数据备份。",
+            "解密後，在內部儲存空間的 Skyward/backups 資料夾中尋找資料備份。",
+            "Decrypt first to find data backups in internal storage under Skyward/backups.",
+        ])
+    } else { l.pick([
         "将在内部存储和 U 盘中的 Skyward/backups 文件夹查找备份，查找内部存储需先完成「解密」。",
         "將在內部儲存空間和 USB 隨身碟中的 Skyward/backups 資料夾尋找備份，尋找內部儲存空間需先完成「解密」。",
         "Backups are looked for in the Skyward/backups folders of internal storage and the USB drive. Internal storage needs the data partition decrypted first.",
-    ]);
+    ]) };
     let bottom = widgets::footnote(&mut c, t, f, bottom, note);
     Frame::new(t, fit(c, t, bottom), out, l.pick(["恢复", "還原", "Restore"]), top)
 }
@@ -3121,6 +3322,28 @@ pub fn choose(cx: &Ctx, place: Place) -> Frame {
     listing(cx, s.folder(Screen::Choose(place)), place_name(l, place), absent, empty, Action::ChooseEntry, l.pick(["选择文件", "選擇檔案", "Choose a file"]))
 }
 
+fn pick_wallpaper(cx: &Ctx) -> Frame {
+    let (s, l) = (cx.state, cx.state.lang);
+    let absent = if s.wallpaper_importing {
+        Some((
+            l.pick(["正在导入图片", "正在匯入圖片", "Importing picture"]),
+            l.pick(["正在准备壁纸预览", "正在準備桌布預覽", "Preparing the wallpaper preview"]),
+        ))
+    } else if !s.data.storage_open() {
+        Some((
+            l.pick(["存储已锁定", "儲存空間已鎖定", "Storage is locked"]),
+            l.pick(["请先解密内部存储", "請先解密內部儲存空間", "Decrypt internal storage first"]),
+        ))
+    } else {
+        None
+    };
+    listing(
+        cx, s.folder(Screen::PickWallpaper), place_name(l, Place::Storage), absent,
+        l.pick(["此文件夹没有 JPG 或 PNG 图片", "此資料夾沒有 JPG 或 PNG 圖片", "No JPG or PNG pictures in this folder"]),
+        Action::WallpaperEntry, l.pick(["选择图片", "選擇圖片", "Choose a picture"]),
+    )
+}
+
 /// A folder laid out as the stock file manager lays one out: the path as
 /// capsules from `top`, held under the bar once scrolled there, then the
 /// entries in one list on the plain page, each row drawn as it scrolls into
@@ -3161,10 +3384,19 @@ fn listing(
 /// drawn as the row comes into view.
 pub fn row(screen: Screen, cx: &Ctx, i: usize, c: &mut Canvas) {
     match screen {
-        Screen::Files | Screen::Choose(_) => {
+        Screen::Files | Screen::Choose(_) | Screen::PickWallpaper => {
             let folder = cx.state.folder(screen);
             let entries = folder.entries.as_ref().expect("a folder listed draws its rows");
-            files::row(c, cx.t, cx.f, cx.state.lang, &entries[i], folder.listed, cx.state.time_zone);
+            let entry = &entries[i];
+            let l = cx.state.lang;
+            let detail;
+            let caption = if screen == Screen::PickWallpaper && matches!(entry.kind, FileKind::Folder { .. }) {
+                l.pick(["文件夹", "資料夾", "Folder"])
+            } else {
+                detail = fmt::file_line(l, entry, folder.listed, cx.state.time_zone);
+                &detail
+            };
+            files::row(c, cx.t, cx.f, entry, caption);
         }
         Screen::Installing => widgets::output_row(c, cx.t, cx.f, &cx.state.script_output, i),
         Screen::PartWork => {

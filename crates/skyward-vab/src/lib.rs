@@ -10,8 +10,8 @@ mod partitions;
 pub mod snapshots;
 
 pub use partitions::{
-    check_merge, map_slot, map_whole, mount_one, mount_partitions, mount_point, mounted_partitions, release_partitions, slot_bases,
-    slot_sizes, snapshots_mapped, start_merge, unmap_slot, unmap_whole, unmount_one, unmount_partitions, Mounted, Mounts, SlotMaps,
+    check_merge, inspect_unslotted, map_slot, map_whole, mount_one, mount_partitions, mount_point, mounted_partitions, release_inspected, release_partitions, slot_bases,
+    slot_sizes, snapshots_mapped, start_merge, unmap_slot, unmap_whole, unmount_one, unmount_partitions, InspectedPartition, Mounted, Mounts, SlotMaps,
     Whole,
 };
 pub use snapshots::Merge;

@@ -84,12 +84,37 @@ const RECOVERY_MANIFEST: &str = "/system/etc/vintf/manifest.xml";
 ///
 /// `wanted` names the hardware services that will be asked for.
 pub fn prepare_hardware_directory(wanted: &[String]) -> Result<()> {
+    prepare_hardware_directory_with(wanted, bundle(RUNTIME_BUNDLE)?)
+}
+
+pub fn prepare_legacy_hardware_directory(wanted: &[String]) -> Result<()> {
+    use skyward_block::mount;
+    for name in [RUNTIME_BUNDLE, "com.android.i18n"] {
+        let source = Path::new("/skyward/apex").join(name);
+        let target = Path::new(BUNDLE_MOUNT).join(name);
+        ensure!(source.is_dir(), "the recovery image is missing staged files for {name}");
+        fs::create_dir_all(&target)?;
+        if !mount::is_mount_point(&target)? {
+            mount::bind(&source, &target)?;
+        }
+    }
+    let runtime = Path::new(BUNDLE_MOUNT).join(RUNTIME_BUNDLE);
+    ensure!(runtime.join(BUNDLE_LOADER).is_file(), "the staged runtime loader is not visible after binding");
+    let program = Path::new("/system/bin/hwservicemanager");
+    if !program.exists() {
+        std::os::unix::fs::symlink("/mnt/system_ext/bin/hwservicemanager", program)
+            .context("expose the installed hardware service manager at its Android path")?;
+    }
+    prepare_hardware_directory_with(wanted, Some(runtime))
+}
+
+fn prepare_hardware_directory_with(wanted: &[String], runtime: Option<PathBuf>) -> Result<()> {
     // A loader and the lowest libraries are built together and agree
     // between them on how a program's own storage is laid out, so the
     // installed system's programs are loaded by the installed system's
     // loader rather than by the older one a recovery carries.
     let loader = Path::new(EARLY_LOADER);
-    let from = bundle(RUNTIME_BUNDLE)?
+    let from = runtime
         .map(|at| at.join(BUNDLE_LOADER))
         .filter(|p| p.is_file())
         .with_context(|| format!("the installed system carries no {RUNTIME_BUNDLE}, which holds the loader its own programs ask for"))?;

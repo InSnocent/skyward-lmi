@@ -133,7 +133,20 @@ fn key(pem: &[u8]) -> Result<Key> {
 /// `keys`. `read` hears, as it is read, how much of what the signature is
 /// of has been read, and of how much; the check stops when it answers
 /// false.
-pub fn verify<R: Read + Seek>(mut file: R, size: u64, keys: &[Key], mut read: impl FnMut(u64, u64) -> bool) -> Result<Verdict> {
+pub fn verify<R: Read + Seek>(file: R, size: u64, keys: &[Key], read: impl FnMut(u64, u64) -> bool) -> Result<Verdict> {
+    verify_zip(file, size, keys, None, read)
+}
+
+/// Verify the OTA signature and match the exact ZIP selected for this build.
+pub fn verify_pinned<R: Read + Seek>(
+    file: R, size: u64, keys: &[Key], digest: [u8; 32], read: impl FnMut(u64, u64) -> bool,
+) -> Result<Verdict> {
+    verify_zip(file, size, keys, Some(digest), read)
+}
+
+fn verify_zip<R: Read + Seek>(
+    mut file: R, size: u64, keys: &[Key], expected: Option<[u8; 32]>, mut read: impl FnMut(u64, u64) -> bool,
+) -> Result<Verdict> {
     if size < FOOTER as u64 {
         return Ok(Verdict::Unsigned);
     }
@@ -163,7 +176,7 @@ pub fn verify<R: Read + Seek>(mut file: R, size: u64, keys: &[Key], mut read: im
     // The signature is of all but the comment and its length.
     let signed = size - comment as u64 - 2;
     let wanted = |hash: Hash| keys.iter().any(|k| k.hash == hash);
-    let (mut sha1, mut sha256) = (wanted(Hash::Sha1).then(Sha1::new), wanted(Hash::Sha256).then(Sha256::new));
+    let (mut sha1, mut sha256) = (wanted(Hash::Sha1).then(Sha1::new), (wanted(Hash::Sha256) || expected.is_some()).then(Sha256::new));
     file.seek(SeekFrom::Start(0)).context("rewind the package")?;
     let mut chunk = vec![0u8; CHUNK];
     let mut done = 0;
@@ -179,6 +192,12 @@ pub fn verify<R: Read + Seek>(mut file: R, size: u64, keys: &[Key], mut read: im
         done += n as u64;
         if !read(done, signed) {
             return Ok(Verdict::Stopped);
+        }
+    }
+    if let Some(expected) = expected {
+        let digest: [u8; 32] = sha256.as_ref().expect("pin requires SHA-256").clone().chain_update(&eocd[EOCD - 2..]).finalize().into();
+        if digest != expected {
+            return Ok(Verdict::Unverified);
         }
     }
     let sha1 = sha1.map(|h| h.finalize().to_vec()).unwrap_or_default();
@@ -268,6 +287,19 @@ mod tests {
                 assert_eq!(check(package, &keys_of(&[other])), Verdict::Unverified);
             }
         }
+    }
+
+    #[test]
+    fn a_pinned_package_requires_the_exact_zip_including_its_comment() {
+        let keys = keys_of(&[TESTKEY]);
+        let expected: [u8; 32] = Sha256::digest(SIGNED_TESTKEY).into();
+        let verify = |package: &[u8]| verify_pinned(Cursor::new(package), package.len() as u64, &keys, expected, |_, _| true).unwrap();
+        assert_eq!(verify(SIGNED_TESTKEY), Verdict::Signed);
+        let mut changed = SIGNED_TESTKEY.to_vec();
+        let start = comment_start(&changed);
+        changed[start] ^= 1;
+        assert_eq!(check(&changed, &keys), Verdict::Signed);
+        assert_eq!(verify(&changed), Verdict::Unverified);
     }
 
     #[test]

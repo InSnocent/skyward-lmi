@@ -77,6 +77,28 @@ impl Installer {
         Installer::spawn(Origin::Computer, detach, options, run)
     }
 
+    /// Receive the temporary image's log-only sideload test package.
+    pub fn start_test() -> Result<Installer> {
+        ensure!(Path::new(crate::sideload_test::CERTIFICATES).is_file(), "sideload test certificate is missing");
+        let options = Options { signed: true, keep: false };
+        Installer::spawn(Origin::SideloadTest, Box::new(|| Ok(())), options, run)
+    }
+
+    /// Receive an OTA and inspect its signed metadata and script declarations.
+    pub fn start_block_preflight() -> Result<Installer> {
+        let path = Path::new("/").join(skyward_config::ramdisk::BLOCK_OTA_DIGEST);
+        let digest = path.try_exists()?.then(|| read_block_digest(&path)).transpose()?;
+        Installer::spawn(Origin::BlockPreflight(digest), Box::new(|| Ok(())), Options::default(), run)
+    }
+
+    /// Receive the specific signed BLOCK OTA this recovery accepts.
+    pub fn start_block_install(detach: Detach) -> Result<Installer> {
+        ensure!(skyward_vab::current_slot()?.is_none(), "BLOCK installation expects an A-only device");
+        let path = Path::new("/").join(skyward_config::ramdisk::BLOCK_OTA_DIGEST);
+        let digest = read_block_digest(&path)?;
+        Installer::spawn(Origin::BlockInstall(digest), detach, Options::default(), run)
+    }
+
     /// Install the file at `path`, from a thread of its own; `detach` and
     /// `options` as for [`Installer::start`].
     pub fn open(path: PathBuf, detach: Detach, options: Options) -> Result<Installer> {
@@ -183,11 +205,19 @@ impl Drop for Installer {
     }
 }
 
+fn read_block_digest(path: &Path) -> Result<[u8; 32]> {
+    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    bytes.try_into().map_err(|_| anyhow!("expected a 32-byte SHA-256 digest"))
+}
+
 /// Where the package comes from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Origin {
     /// The computer, with `adb sideload` or `adb rescue`.
     Computer,
+    SideloadTest,
+    BlockPreflight(Option<[u8; 32]>),
+    BlockInstall([u8; 32]),
     /// A file on the phone.
     File,
     /// The system, which asked before the recovery started for a package
@@ -437,7 +467,7 @@ fn conclude(done: Done, served: Result<Option<Fault>>, origin: Origin) -> Outcom
         }
         (_, Err(e)) => failed(e.context("serve the package")),
         (_, Ok(Some(Fault::Transfer(why)))) => Outcome::Failed(match origin {
-            Origin::Computer => Failure::Disconnected,
+            Origin::Computer | Origin::SideloadTest | Origin::BlockPreflight(_) | Origin::BlockInstall(_) => Failure::Disconnected,
             Origin::File | Origin::Asked { .. } => Failure::Unreadable(why),
         }),
         (_, Ok(Some(Fault::Changed(_)))) => Outcome::Failed(Failure::Changed),
@@ -448,6 +478,15 @@ fn conclude(done: Done, served: Result<Option<Fault>>, origin: Origin) -> Outcom
 }
 
 fn install<S>(ctx: &mut Context, mount: &Mount<S>, size: u64) -> Result<Done> {
+    if let Origin::BlockInstall(digest) = ctx.origin {
+        return run_block_install(ctx, size, digest);
+    }
+    if let Origin::BlockPreflight(digest) = ctx.origin {
+        return run_block_preflight(ctx, size, digest);
+    }
+    if ctx.origin == Origin::SideloadTest {
+        return run_sideload_test(ctx, size);
+    }
     let file = File::open(fuse::PACKAGE).context("open the package")?;
     let package = package::identify(BufReader::with_capacity(1 << 16, file))?;
     let _ = kmsg(&format!("install: {}", describe(&package)));
@@ -531,7 +570,7 @@ fn install_system(ctx: &Context, contents: &skyward_systems::package::Contents) 
 fn waits(origin: Origin, wipe: bool) -> bool {
     match origin {
         Origin::File => true,
-        Origin::Computer => wipe,
+        Origin::Computer | Origin::SideloadTest | Origin::BlockPreflight(_) | Origin::BlockInstall(_) => wipe,
         Origin::Asked { .. } => false,
     }
 }
@@ -890,21 +929,124 @@ fn run_script(ctx: &mut Context, size: u64) -> Result<Done> {
     Ok(Done::Script { code, wipe_cache })
 }
 
+fn inspect_block_ota() -> Result<crate::block_preflight::BlockPreflight> {
+    let device = prop("ro.product.device").filter(|value| !value.is_empty()).context("read the recovery device codename")?;
+    let source = BufReader::new(File::open(fuse::PACKAGE).context("open the verified OTA")?);
+    crate::block_preflight::inspect(source, &device)
+}
+
+fn run_block_install(ctx: &mut Context, size: u64, digest: [u8; 32]) -> Result<Done> {
+    let refused = |reason| Ok(Done::Decided(Outcome::Refused(reason)));
+    match verify_signature_at(ctx, size, signature::CERTIFICATES, Some(digest))? {
+        Verdict::Signed => {}
+        Verdict::Unsigned => return refused(Refusal::Unsigned),
+        Verdict::Unverified => return refused(Refusal::Unverified),
+        Verdict::Stopped => return Ok(Done::Decided(Outcome::Cancelled)),
+    }
+    let report = inspect_block_ota()?;
+    if let Some(reason) = battery()? {
+        return refused(reason);
+    }
+    if ctx.shared.cancelled() {
+        return Ok(Done::Decided(Outcome::Cancelled));
+    }
+    ctx.send(Event::BlockReady(report));
+    match ctx.commands.recv() {
+        Ok(Command::Install) if !ctx.shared.cancelled() => {}
+        Ok(Command::Install | Command::Cancel) | Err(_) => return Ok(Done::Decided(Outcome::Cancelled)),
+        Ok(other) => bail!("the BLOCK OTA waiting for confirmation was told {other:?}"),
+    }
+
+    if let Some(reason) = battery()? {
+        return refused(reason);
+    }
+    extract_script()?;
+    shell_at_sbin()?;
+    detach_once(ctx)?;
+    let mounts = skyward_block::mount::mount_ids()?;
+    // The BLOCK updater maps its own partitions and owns the super layout.
+    let ran = run_binary(ctx);
+    if let Err(error) = unmount_script_mounts(&mounts) {
+        let _ = kmsg(&format!("install: could not clean up updater mounts: {error:#}"));
+    }
+    let (code, _) = ran?;
+    Ok(Done::Script { code, wipe_cache: false })
+}
+
+fn run_block_preflight(ctx: &Context, size: u64, digest: Option<[u8; 32]>) -> Result<Done> {
+    let outcome = match verify_signature_at(ctx, size, signature::CERTIFICATES, digest)? {
+        Verdict::Signed if !ctx.shared.cancelled() => {
+            let report = inspect_block_ota()?;
+            kmsg(&format!("BLOCK OTA preflight passed for {} ({} logical, {} physical)",
+                report.device, report.logical.len(), report.physical.len()))?;
+            Outcome::BlockPreflight(report)
+        }
+        Verdict::Signed | Verdict::Stopped => Outcome::Cancelled,
+        Verdict::Unsigned => Outcome::Refused(Refusal::Unsigned),
+        Verdict::Unverified => Outcome::Refused(Refusal::Unverified),
+    };
+    Ok(Done::Decided(outcome))
+}
+
+fn run_sideload_test(ctx: &Context, size: u64) -> Result<Done> {
+    use crate::sideload_test::{self, CERTIFICATES, MAX_SIZE, SCRIPT};
+
+    let refused = |reason| Ok(Done::Decided(Outcome::Refused(reason)));
+    if size > MAX_SIZE {
+        return refused(Refusal::Unknown);
+    }
+    match verify_signature_with(ctx, size, CERTIFICATES)? {
+        Verdict::Signed => {}
+        Verdict::Unsigned => return refused(Refusal::Unsigned),
+        Verdict::Unverified => return refused(Refusal::Unverified),
+        Verdict::Stopped => return Ok(Done::Decided(Outcome::Cancelled)),
+    }
+    let source = BufReader::new(File::open(fuse::PACKAGE).context("open the test package")?);
+    if !sideload_test::accepts(source)? {
+        return refused(Refusal::Unknown);
+    }
+    if ctx.shared.cancelled() {
+        return Ok(Done::Decided(Outcome::Cancelled));
+    }
+    ctx.send(Event::Script);
+    match ctx.commands.recv() {
+        Ok(Command::Install) if !ctx.shared.cancelled() => {}
+        Ok(Command::Install | Command::Cancel) | Err(_) => return Ok(Done::Decided(Outcome::Cancelled)),
+        Ok(other) => bail!("the sideload test was told {other:?}"),
+    }
+    // Run the checked, built-in bytes rather than rereading code from USB.
+    write_script(&mut &SCRIPT[..])?;
+    let (code, _) = run_binary(ctx)?;
+    Ok(Done::Script { code, wipe_cache: false })
+}
+
 /// Check the zip being served, `size` bytes, was signed with one of the
 /// phone's update keys, telling the screen how much of it the check has
 /// read; the screen leaving the page stops it.
 fn verify_signature(ctx: &Context, size: u64) -> Result<Verdict> {
-    let certificates = File::open(signature::CERTIFICATES).with_context(|| format!("open {}", signature::CERTIFICATES))?;
-    let keys = signature::keys(BufReader::new(certificates)).with_context(|| format!("read {}", signature::CERTIFICATES))?;
+    verify_signature_with(ctx, size, signature::CERTIFICATES)
+}
+
+fn verify_signature_with(ctx: &Context, size: u64, path: &str) -> Result<Verdict> {
+    verify_signature_at(ctx, size, path, None)
+}
+
+fn verify_signature_at(ctx: &Context, size: u64, path: &str, digest: Option<[u8; 32]>) -> Result<Verdict> {
+    let certificates = File::open(path).with_context(|| format!("open {path}"))?;
+    let keys = signature::keys(BufReader::new(certificates)).with_context(|| format!("read {path}"))?;
     let package = File::open(fuse::PACKAGE).context("open the package")?;
     let mut told: Option<Instant> = None;
-    let verdict = signature::verify(package, size, &keys, |done, total| {
+    let read = |done, total| {
         if done == total || told.is_none_or(|t| t.elapsed() >= PROGRESS_EVERY) {
             ctx.send(Event::Progress(Stage::Signature { done, total }));
             told = Some(Instant::now());
         }
         !ctx.shared.cancelled()
-    })?;
+    };
+    let verdict = match digest {
+        Some(expected) => signature::verify_pinned(package, size, &keys, expected, read)?,
+        None => signature::verify(package, size, &keys, read)?,
+    };
     let _ = kmsg(&format!("install: the zip's signature: {verdict:?}"));
     Ok(verdict)
 }
@@ -914,13 +1056,17 @@ fn extract_script() -> Result<()> {
     let zip = File::open(fuse::PACKAGE).context("open the package")?;
     let mut zip = zip::ZipArchive::new(BufReader::new(zip)).context("read the zip directory")?;
     let mut script = zip.by_name(package::UPDATE_BINARY).context("open the install script")?;
+    write_script(&mut script)
+}
+
+fn write_script(script: &mut impl Read) -> Result<()> {
     match fs::remove_file(BINARY) {
         Ok(()) => {}
         Err(e) if e.kind() == ErrorKind::NotFound => {}
         Err(e) => return Err(e).with_context(|| format!("take away the {BINARY} an earlier install left")),
     }
     let mut out = OpenOptions::new().write(true).create_new(true).open(BINARY).with_context(|| format!("make {BINARY}"))?;
-    io::copy(&mut script, &mut out).with_context(|| format!("write {BINARY}"))?;
+    io::copy(script, &mut out).with_context(|| format!("write {BINARY}"))?;
     out.set_permissions(fs::Permissions::from_mode(0o755)).with_context(|| format!("make {BINARY} runnable"))
 }
 
@@ -961,7 +1107,12 @@ impl Drop for Group {
 /// whether it asked for the cache partition to be erased after. What it
 /// leaves running is ended with it.
 fn run_binary(ctx: &Context) -> Result<(i32, bool)> {
-    let mut log = File::create(SCRIPT_LOG).with_context(|| format!("create {SCRIPT_LOG}"))?;
+    let path = match ctx.origin {
+        Origin::SideloadTest => "/tmp/skyward-sideload-test.log",
+        Origin::BlockInstall(_) => "/tmp/skyward-block-ota.log",
+        _ => SCRIPT_LOG,
+    };
+    let mut log = File::create(path).with_context(|| format!("create {path}"))?;
     let (requests_read, requests_write) = pipe(0)?;
     let (output_read, output_write) = pipe(0)?;
     let fd = requests_write.as_raw_fd();
@@ -1081,12 +1232,17 @@ fn run_binary(ctx: &Context) -> Result<(i32, bool)> {
 /// /metadata again as the recovery keeps it, for a script that took it
 /// away.
 fn clean_up(before: &[(i32, PathBuf)], mapped: &SlotMaps) -> Result<()> {
+    unmount_script_mounts(before)?;
+    skyward_vab::unmap_slot(mapped)?;
+    remount_metadata()
+}
+
+fn unmount_script_mounts(before: &[(i32, PathBuf)]) -> Result<()> {
     let kept: HashSet<i32> = before.iter().map(|(id, _)| *id).collect();
     for (_, point) in skyward_block::mount::mount_ids()?.into_iter().rev().filter(|(id, _)| !kept.contains(id)) {
         skyward_block::mount::umount_detach(&point)?;
     }
-    skyward_vab::unmap_slot(mapped)?;
-    remount_metadata()
+    Ok(())
 }
 
 /// What the phone tells the computer it is.

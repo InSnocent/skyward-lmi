@@ -6,6 +6,7 @@
 pub mod adb;
 pub mod asked;
 pub mod blockmap;
+pub mod block_preflight;
 pub mod commands;
 pub mod fuse;
 pub mod image;
@@ -14,6 +15,7 @@ pub mod ota;
 pub mod package;
 pub mod script;
 pub mod signature;
+pub mod sideload_test;
 pub mod upgrade;
 pub mod wipe;
 
@@ -84,6 +86,8 @@ pub enum Event {
     /// system starts. One that erases always waits, and so does one from a
     /// file on the phone, which a single tap picks.
     Ready { version: Option<String>, wipe: bool },
+    /// The verified A-only OTA waits for confirmation before rewriting partitions.
+    BlockReady(block_preflight::BlockPreflight),
     /// An update package passed the checks and is being installed; the
     /// version it brings.
     Installing { version: Option<String> },
@@ -164,6 +168,8 @@ pub enum Stage {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
+    /// A verified non-A/B OTA inspected without running its updater.
+    BlockPreflight(block_preflight::BlockPreflight),
     /// The update is in `slot`, which starts next; `wipe` when all user data
     /// is to be erased before it does.
     Installed { slot: Slot, wipe: bool },

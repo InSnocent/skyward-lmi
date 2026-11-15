@@ -1,0 +1,54 @@
+[device]
+codename = "lmi"
+brand = "Xiaomi"
+model = "Redmi K30 Pro / POCO F2 Pro"
+ab = false
+os_version_prop = "ro.infinity.version"
+soc = { hans = "骁龙 865", hant = "驍龍 865", en = "Snapdragon 865" }
+
+[display]
+width = 1080
+height = 2400
+density = 440
+diagonal = 6.67
+use_backlight_max = true
+
+[haptics]
+backend = "aw8697"
+click = 0
+strength = { lightest = 0.5, strongest = 0.9 }
+
+# These services are used by the opt-in read-only decryption image.
+[[service]]
+path = "/mnt/system_ext/bin/hwservicemanager"
+libraries = ["/apex/com.android.runtime/lib64/bionic", "/mnt/system/system/lib64/bootstrap", "/mnt/system/system/lib64", "/mnt/system_ext/lib64"]
+ready_property = "hwservicemanager.ready"
+user = "system"
+groups = ["system", "readproc"]
+
+[[service]]
+path = "/vendor/bin/qseecomd"
+libraries = ["/vendor/lib64", "/mnt/system/system/lib64", "/mnt/system_ext/lib64"]
+ready_property = "vendor.sys.listeners.registered"
+
+[[service]]
+path = "/vendor/bin/hw/android.hardware.keymaster@4.0-service-qti"
+libraries = ["/vendor/lib64", "/mnt/system/system/lib64", "/mnt/system_ext/lib64"]
+ready_hardware_service = "android.hardware.keymaster@4.0::IKeymasterDevice/default"
+user = "system"
+groups = ["system", "drmrpc"]
+
+[[service]]
+path = "/vendor/bin/hw/android.hardware.gatekeeper@1.0-service-qti"
+libraries = ["/vendor/lib64", "/mnt/system/system/lib64", "/mnt/system_ext/lib64"]
+ready_hardware_service = "android.hardware.gatekeeper@1.0::IGatekeeper/default"
+user = "system"
+groups = ["system"]
+
+[[service]]
+path = "/mnt/system/system/bin/keystore2"
+args = ["/tmp/skyward-keystore"]
+libraries = ["/skyward/recovery-binder", "/mnt/system/system/lib64", "/mnt/system_ext/lib64", "/vendor/lib64", "/apex/com.android.i18n/lib64"]
+ready_service = "android.system.keystore2.IKeystoreService/default"
+user = "keystore"
+groups = ["keystore", "readproc", "log"]

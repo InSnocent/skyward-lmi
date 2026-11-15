@@ -81,7 +81,7 @@ const SCREENSHOTS: &str = "DCIM/Screenshots";
 const HELD_SCREENSHOTS: &str = "/skyward/run/screenshots";
 
 /// The panel backlight under /sys/class/backlight.
-struct Backlight {
+pub(crate) struct Backlight {
     path: PathBuf,
     /// The raw level at the top of the slider: the panel's normal maximum.
     top: u32,
@@ -90,7 +90,7 @@ struct Backlight {
 }
 
 impl Backlight {
-    fn open() -> Result<Self> {
+    pub(crate) fn open(display: &skyward_config::Display) -> Result<Self> {
         let mut dirs: Vec<PathBuf> = fs::read_dir("/sys/class/backlight")
             .context("read /sys/class/backlight")?
             .map(|e| e.map(|e| e.path()))
@@ -110,14 +110,17 @@ impl Backlight {
                 .parse()
                 .with_context(|| format!("parse {name}"))
         };
-        let top = normal_max(read("max_brightness")?)?;
+        let max = read("max_brightness")?;
+        ensure!(max > 0, "backlight reports a zero maximum");
+        let top = if display.use_backlight_max { max } else { normal_max(max)? };
+        let top = top.max(1);
         let level = read("brightness")?;
         Ok(Backlight { path: dir.join("brightness"), top, level })
     }
 
     /// Light the panel at `level` of its normal maximum, or turn it off
     /// with `None`. The file is written only when the raw level changes.
-    fn show(&mut self, level: Option<f32>) -> Result<()> {
+    pub(crate) fn show(&mut self, level: Option<f32>) -> Result<()> {
         let raw = level.map_or(0, |v| ((v.clamp(0.0, 1.0) * self.top as f32).round() as u32).max(1));
         if raw != self.level {
             fs::write(&self.path, raw.to_string()).with_context(|| format!("write {}", self.path.display()))?;
@@ -401,7 +404,7 @@ fn keep_held_screenshots() -> Result<()> {
 }
 
 /// The folder backups go in and are found in, in `place`.
-fn backups_in(place: Place) -> PathBuf {
+pub(crate) fn backups_in(place: Place) -> PathBuf {
     in_place(place, skyward_backup::FOLDER)
 }
 
@@ -442,7 +445,7 @@ fn held(m: &skyward_backup::Manifest) -> Held {
 
 /// Look for backups in the places asked, the restore page showing what is
 /// found and saying why a place could not be looked in.
-fn find_backups(app: &mut App, storage: bool, usb: bool, now: u64) {
+pub(crate) fn find_backups(app: &mut App, storage: bool, usb: bool, now: u64) {
     let mut found = Vec::new();
     for (place, look) in [(Place::Storage, storage), (Place::UsbDrive, usb)] {
         if look {
@@ -457,7 +460,7 @@ fn find_backups(app: &mut App, storage: bool, usb: bool, now: u64) {
 
 /// Delete the backup in `folder` of `place`; a USB drive, shown read-only,
 /// is made writable for it and read-only again after.
-fn delete_backup(place: Place, folder: &Path) -> Result<()> {
+pub(crate) fn delete_backup(place: Place, folder: &Path) -> Result<()> {
     let drive = Path::new(USB_DRIVE);
     if place == Place::UsbDrive {
         skyward_block::mount::remount_writable(drive, true)?;
@@ -472,7 +475,7 @@ fn delete_backup(place: Place, folder: &Path) -> Result<()> {
 }
 
 /// How backing up or restoring ended, as its page tells it.
-fn backup_end(end: backup::End) -> BackupEnd {
+pub(crate) fn backup_end(end: backup::End) -> BackupEnd {
     match end {
         backup::End::Saved(folder) => {
             BackupEnd::Saved(folder.file_name().expect("a backup's folder has a name").to_string_lossy().into_owned())
@@ -491,7 +494,7 @@ fn backup_end(end: backup::End) -> BackupEnd {
 }
 
 /// Now, in Unix seconds.
-fn unix_now() -> Result<i64> {
+pub(crate) fn unix_now() -> Result<i64> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH).context("the clock is before 1970")?.as_secs() as i64)
 }
 
@@ -566,7 +569,7 @@ fn clash_rule(choice: ClashChoice) -> skyward_files::Clash {
 /// On the data partition each takes the owner, group and label the folder
 /// gives its own, as the system makes them there; in shared storage, the
 /// folder's permissions as well. Elsewhere each keeps what it had.
-fn ownership(into: &Path) -> Result<Ownership> {
+pub(crate) fn ownership(into: &Path) -> Result<Ownership> {
     use skyward_crypto::data;
     let at = Path::new(data::MOUNT);
     if !skyward_block::mount::is_mount_point(at)? {
@@ -834,7 +837,7 @@ fn log_mounted(mounted: &Opened) -> Result<()> {
 /// that lock is answered with, or nothing. Users whose credential the phone
 /// made up open behind the owner and are never asked; one that did not
 /// open goes to the kernel log with why.
-fn show_closed(app: &mut App, closed: &[Closed]) -> Result<()> {
+pub(crate) fn show_closed(app: &mut App, closed: &[Closed]) -> Result<()> {
     use skyward_crypto::user::Lock;
     skyward_sys::kmsg(&format!("the users whose own files are still closed: {:?}", closed.iter().map(|c| c.user).collect::<Vec<_>>()))?;
     for c in closed {
@@ -1031,7 +1034,7 @@ fn have(app: &App, release: &Release) -> Have {
 
 /// Wait until a device, the installer or the recovery socket has something,
 /// or `timeout_ms` passes.
-fn wait(fds: &[i32], timeout_ms: i32) -> Result<()> {
+pub(crate) fn wait(fds: &[i32], timeout_ms: i32) -> Result<()> {
     let mut polls: Vec<libc::pollfd> = fds.iter().map(|&fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 }).collect();
     let n = unsafe { libc::poll(polls.as_mut_ptr(), polls.len() as libc::nfds_t, timeout_ms) };
     if n < 0 {
@@ -1060,7 +1063,7 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
     // adbd and fastbootd ask over it to go over to fastboot and back.
     let control = Control::open()?;
     let mut haptics = cfg.haptics.as_ref().map(Haptics::open).transpose()?;
-    let mut backlight = Backlight::open()?;
+    let mut backlight = Backlight::open(&cfg.display)?;
     let first = match &request.work {
         Work::Fastboot => Screen::Fastboot,
         Work::PromptWipeData => Screen::CantStart,
@@ -2029,6 +2032,7 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
         if let Some(ended) = decryptor.as_ref().and_then(Decryptor::ended) {
             decryptor = None;
             match ended {
+                decrypt::Ended::Fixture(_) => unreachable!("the fixture runs only in the lmi test image"),
                 decrypt::Ended::Opened(Ok(opening)) => {
                     if let Some(mounted) = &opening.mounted {
                         log_mounted(mounted)?;
@@ -2226,6 +2230,10 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         eprintln!("screenshot {saved:?} in {} ms", t0.elapsed().as_millis());
                         app.screenshot_saved(saved, now);
                     }
+                    Effect::SideloadPreflight => {
+                        let why = skyward_install::Failure::Error("BLOCK OTA preflight is only available on A-only devices".into());
+                        app.install(skyward_install::Event::Finished(skyward_install::Outcome::Failed(why)), now);
+                    }
                     Effect::Sideload => {
                         ensure!(installer.is_none(), "an installer is running already");
                         if !withhold(&mut transfer, &mut app, now)? {
@@ -2304,6 +2312,9 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                     }
                     Effect::ReadDir(folder) => list(&mut app, folder)?,
                     Effect::ReadPlace(place, folder) => list_place(&mut app, place, folder)?,
+                    Effect::ReadWallpaperFolder(_) | Effect::ImportWallpaper(_) | Effect::SaveWallpaperOpacity { .. } | Effect::SaveFrostedCards(_) | Effect::ResetWallpaper => {
+                        unreachable!("the lmi runtime handles wallpaper effects");
+                    }
                     // A name taken where an entry goes is the user's to
                     // decide on before anything is written.
                     Effect::Paste { op, path, into, clash } => {
@@ -2410,6 +2421,7 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         };
                         let made = unix_now()?;
                         let task = backup::BackupTask {
+                            data_scope: backup::DataScope::Partition,
                             parts,
                             stamp: skyward_ui::fmt::stamp(made, app.state.time_zone),
                             into,
@@ -2433,6 +2445,7 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                             continue;
                         }
                         let task = backup::RestoreTask {
+                            data_scope: backup::DataScope::Partition,
                             folder: backups_in(place).join(&name),
                             parts,
                             device: cfg.device.codename.clone(),

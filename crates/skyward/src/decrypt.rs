@@ -13,6 +13,8 @@ use std::thread::{self, JoinHandle};
 pub enum Job {
     /// Open the partition as far as it opens with nothing a user knows.
     Open,
+    OpenLmi { readonly: bool },
+    VerifyLmiAppRestore,
     /// Open the own files of `user` with what they entered at their screen
     /// lock; `closed` are the users whose own files are still closed.
     Unlock { closed: Vec<Closed>, user: u32, credential: Vec<u8> },
@@ -22,6 +24,7 @@ pub enum Job {
 pub enum Ended {
     Opened(Result<Opening, String>),
     Unlocked(Result<Vec<Closed>, String>),
+    Fixture(Result<(), String>),
 }
 
 pub struct Decryptor {
@@ -44,6 +47,11 @@ impl Decryptor {
             .spawn(move || {
                 let ended_as = match job {
                     Job::Open => Ended::Opened(with_key_service(data::open_without_credential)),
+                    Job::OpenLmi { readonly } => Ended::Opened(crate::legacy_data::prepare()
+                        .map_err(|error| format!("{error:#}"))
+                        .and_then(|()| with_key_service(|service| data::open_lmi(service, readonly)))),
+                    Job::VerifyLmiAppRestore => Ended::Fixture(crate::backup::verify_lmi_fixture()
+                        .map_err(|error| format!("{error:#}"))),
                     Job::Unlock { closed, user, credential } => {
                         Ended::Unlocked(with_key_service(|service| data::unlock(service, &closed, user, &credential)))
                     }

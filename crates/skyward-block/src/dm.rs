@@ -17,6 +17,8 @@ pub enum Target {
     /// storage hardware can unwrap, which is how a phone keeps the key its
     /// data partition is encrypted with out of the running system.
     DefaultKey { sectors: u64, device: String, cipher: String, key: String, wrapped: bool },
+    /// The Android 10 argument format of the default-key target.
+    DefaultKeyLegacy { sectors: u64, device: String, key: String, set_dun: bool },
     /// `sectors` sectors of block device `base` as changed by what block
     /// device `cow` keeps, both (major, minor), in chunks of
     /// [`SNAPSHOT_CHUNK`] sectors that last across restarts. Merging, the
@@ -34,6 +36,7 @@ impl Target {
             Target::Linear { sectors, .. }
             | Target::Zero { sectors }
             | Target::DefaultKey { sectors, .. }
+            | Target::DefaultKeyLegacy { sectors, .. }
             | Target::Snapshot { sectors, .. } => *sectors,
         }
     }
@@ -42,7 +45,7 @@ impl Target {
         match self {
             Target::Linear { .. } => "linear",
             Target::Zero { .. } => "zero",
-            Target::DefaultKey { .. } => "default-key",
+            Target::DefaultKey { .. } | Target::DefaultKeyLegacy { .. } => "default-key",
             Target::Snapshot { merge: false, .. } => "snapshot",
             Target::Snapshot { merge: true, .. } => "snapshot-merge",
         }
@@ -52,6 +55,10 @@ impl Target {
         match self {
             Target::Linear { device: (major, minor), offset, .. } => format!("{major}:{minor} {offset}"),
             Target::Zero { .. } => String::new(),
+            Target::DefaultKeyLegacy { device, key, set_dun, .. } => {
+                let extra = if *set_dun { " 1 set_dun" } else { "" };
+                format!("AES-256-XTS {key} {device} 0{extra}")
+            }
             Target::DefaultKey { device, cipher, key, wrapped, .. } => {
                 let mut extra = vec!["allow_discards", "sector_size:4096", "iv_large_sectors"];
                 if *wrapped {
@@ -439,6 +446,25 @@ pub use sys::{activate, create, readonly, reload, remove, status, table, table_s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_legacy_default_key_table_uses_android_10_arguments() {
+        let target = Target::DefaultKeyLegacy {
+            sectors: 4096,
+            device: "/dev/block/by-name/userdata".into(),
+            key: "ab01".into(),
+            set_dun: false,
+        };
+        assert_eq!(target.kind(), "default-key");
+        assert_eq!(target.params(), "AES-256-XTS ab01 /dev/block/by-name/userdata 0");
+        let enabled = Target::DefaultKeyLegacy {
+            sectors: 4096,
+            device: "/dev/block/by-name/userdata".into(),
+            key: "ab01".into(),
+            set_dun: true,
+        };
+        assert_eq!(enabled.params(), "AES-256-XTS ab01 /dev/block/by-name/userdata 0 1 set_dun");
+    }
 
     #[test]
     fn request_codes_match_the_kernel_header() {

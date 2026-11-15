@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use cpio::{NewcBuilder, NewcReader};
+use flate2::{read::MultiGzDecoder, write::GzEncoder, Compression};
 use std::ffi::{CString, OsStr};
 use std::fs;
 use std::io::{Cursor, Read, Write};
@@ -22,6 +23,8 @@ pub struct Entry {
     pub rdev: (u32, u32),
     pub data: Vec<u8>,
 }
+
+const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
 
 const S_IFMT: u32 = 0o170000;
 const S_IFDIR: u32 = 0o040000;
@@ -49,13 +52,35 @@ pub struct Ramdisk {
 }
 
 impl Ramdisk {
-    /// Unpack an LZ4 (legacy framing) compressed newc archive, as Android
-    /// boot images carry.
+    /// Unpack a gzip- or LZ4-compressed Android ramdisk.
     pub fn decode(compressed: &[u8]) -> Result<Self> {
+        if compressed.starts_with(&GZIP_MAGIC) {
+            return Self::from_archive(&gunzip(compressed)?);
+        }
         let mut cpio = Vec::new();
         lz4_flex::frame::FrameDecoder::new(compressed).read_to_end(&mut cpio).context("lz4 decode")?;
+        Self::from_archive(&cpio)
+    }
+
+    /// Recompress the ramdisk in its original format. For gzip, keep the
+    /// archive byte-for-byte so inode numbers, hard links and padding survive.
+    pub fn repack(compressed: &[u8]) -> Result<Vec<u8>> {
+        if !compressed.starts_with(&GZIP_MAGIC) {
+            return Self::decode(compressed)?.encode();
+        }
+        let cpio = gunzip(compressed)?;
+        Self::from_archive(&cpio)?;
+        gzip(&cpio)
+    }
+
+    /// Pack the current entries as a gzip-compressed newc archive.
+    pub fn encode_gzip(&self) -> Result<Vec<u8>> {
+        gzip(&self.archive()?)
+    }
+
+    fn from_archive(cpio: &[u8]) -> Result<Self> {
         let mut entries = Vec::new();
-        let mut rest = Cursor::new(cpio.as_slice());
+        let mut rest = Cursor::new(cpio);
         loop {
             let mut r = NewcReader::new(rest).context("cpio entry")?;
             if r.entry().is_trailer() {
@@ -185,6 +210,18 @@ impl Ramdisk {
         self.entries.push(root_entry(name, mode, data));
         Ok(())
     }
+}
+
+fn gzip(archive: &[u8]) -> Result<Vec<u8>> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
+    encoder.write_all(archive).context("gzip encode")?;
+    encoder.finish().context("gzip finish")
+}
+
+fn gunzip(compressed: &[u8]) -> Result<Vec<u8>> {
+    let mut cpio = Vec::new();
+    MultiGzDecoder::new(compressed).read_to_end(&mut cpio).context("gzip decode")?;
+    Ok(cpio)
 }
 
 fn root_entry(name: &str, mode: u32, data: Vec<u8>) -> Entry {

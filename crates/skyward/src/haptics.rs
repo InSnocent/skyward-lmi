@@ -1,6 +1,6 @@
 use anyhow::{anyhow, ensure, Context, Result};
 use evdev::raw_stream::RawDevice;
-use skyward_config::Strength;
+use skyward_config::{HapticsBackend, Strength};
 use std::f32::consts::{FRAC_PI_2, TAU};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -84,7 +84,19 @@ impl Haptics {
     /// fills the driver's queue with what it plays, so the click is loaded
     /// only as it is played.
     pub fn open(cfg: &skyward_config::Haptics) -> Result<Haptics> {
-        let (path, dev) = motor()?;
+        if cfg.backend == HapticsBackend::Aw8697 {
+            let (_, dev) = motor(Some("aw8697_haptic"))?;
+            let id = cfg.click.context("AW8697 requires a waveform number")?;
+            return Ok(Haptics {
+                dev,
+                click: Click::Kept(id),
+                ticks: Click::Kept(id),
+                strength: cfg.strength,
+                playing: Arc::new(Mutex::new(None)),
+                clicks: 0,
+            });
+        }
+        let (path, dev) = motor(None)?;
         let hz = resonance(&cfg.resonance)?;
         let click = match cfg.click {
             Some(id) => {
@@ -164,9 +176,9 @@ pub fn probe(cfg: &skyward_config::Haptics, position: f32, ticks: bool) -> Resul
 
 /// The first input device under /dev/input that takes periodic
 /// force-feedback effects, opened for writing.
-fn motor() -> Result<(PathBuf, File)> {
+fn motor(name: Option<&str>) -> Result<(PathBuf, File)> {
     for (path, dev) in evdev::raw_stream::enumerate() {
-        if takes_periodic(&dev) {
+        if name.is_none_or(|name| dev.name() == Some(name)) && takes_periodic(&dev) {
             let file = OpenOptions::new().read(true).write(true).open(&path).with_context(|| format!("open {}", path.display()))?;
             return Ok((path, file));
         }

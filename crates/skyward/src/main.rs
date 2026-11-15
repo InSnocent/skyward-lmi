@@ -10,15 +10,21 @@ mod backup;
 #[cfg(target_os = "android")]
 mod decrypt;
 #[cfg(target_os = "android")]
+mod display_probe;
+#[cfg(target_os = "android")]
 mod filework;
 #[cfg(target_os = "android")]
 mod haptics;
 #[cfg(target_os = "android")]
 mod input;
 #[cfg(target_os = "android")]
+mod legacy_data;
+#[cfg(target_os = "android")]
 mod merge;
 #[cfg(target_os = "android")]
 mod partwork;
+#[cfg(target_os = "android")]
+mod preview_ui;
 #[cfg(target_os = "android")]
 mod pty;
 #[cfg(target_os = "android")]
@@ -37,6 +43,8 @@ mod systems;
 mod ui;
 #[cfg(target_os = "android")]
 mod updates;
+#[cfg(any(target_os = "android", test))]
+mod wallpaper;
 #[cfg(target_os = "android")]
 mod wipe;
 #[cfg(target_os = "android")]
@@ -123,6 +131,17 @@ enum Cmd {
         #[arg(long, default_value = "/dev/dri/card0")]
         card: String,
     },
+    /// Test the recovery display and touch without starting the recovery service.
+    #[cfg(target_os = "android")]
+    DisplayProbe {
+        #[arg(long, default_value = "/dev/dri/card0")]
+        card: String,
+        #[arg(long, default_value_t = 45, value_parser = clap::value_parser!(u16).range(1..=300))]
+        seconds: u16,
+    },
+    /// Run the A-only UI preview with partition operations disabled.
+    #[cfg(target_os = "android")]
+    PreviewUi,
     /// Play the vibration motor's click once, or the ticks of the screen
     /// going off by the power key, saying how strongly and for how long.
     #[cfg(target_os = "android")]
@@ -215,11 +234,15 @@ fn main() -> Result<()> {
     // init starts the recovery service by path with no arguments.
     let started_as = std::env::args_os().next().unwrap_or_default();
     let name = Path::new(&started_as).file_name().unwrap_or_default();
-    if name == "recovery" {
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    #[cfg(target_os = "android")]
+    let probe = args.first().is_some_and(|arg| arg == "display-probe" || arg == "preview-ui");
+    #[cfg(not(target_os = "android"))]
+    let probe = false;
+    if name == "recovery" && !probe {
         return recovery();
     }
     // Install scripts run the commands linked to this binary by their names.
-    let args: Vec<_> = std::env::args_os().skip(1).collect();
     if let Some(code) = skyward_install::commands::run(name, &args) {
         std::process::exit(code);
     }
@@ -288,6 +311,10 @@ fn main() -> Result<()> {
             print!("{}", skyward_ui::surface::kms::report(&card)?);
             Ok(())
         }
+        #[cfg(target_os = "android")]
+        Cmd::DisplayProbe { card, seconds } => display_probe::run(&card, seconds),
+        #[cfg(target_os = "android")]
+        Cmd::PreviewUi => preview_ui::run(),
         #[cfg(target_os = "android")]
         Cmd::Haptic { config, position, ticks } => {
             let haptics = DeviceConfig::load(&config)?.haptics.context("the configuration describes no vibration motor")?;
@@ -666,6 +693,14 @@ fn adopt_installed_version(props: &std::collections::HashMap<String, String>) ->
     Ok(())
 }
 
+#[cfg(target_os = "android")]
+fn set_recovery_clock() -> Result<()> {
+    match skyward_sys::clock::set_from_rtc() {
+        Ok(ms) => skyward_sys::kmsg(&format!("clock set to {ms} ms from the RTC and persist")),
+        Err(error) => skyward_sys::kmsg(&format!("clock not set: {error:#}")),
+    }
+}
+
 /// The recovery service. Its own folder is made and its log kept there from
 /// the start, and adb comes up first so a failure later on can be
 /// inspected, file transfer joining it
@@ -676,6 +711,13 @@ fn adopt_installed_version(props: &std::collections::HashMap<String, String>) ->
 /// kernel log and still end the process, which init then starts again.
 fn recovery() -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
+    let root = Path::new("/");
+    let cfg = DeviceConfig::load(root.join(ramdisk::CONFIG))?;
+    #[cfg(target_os = "android")]
+    if !cfg.device.ab {
+        set_recovery_clock()?;
+        return preview_ui::inspect(&cfg);
+    }
     let run = || -> Result<()> {
         // Open to the programs the recovery runs as other users, the
         // supplicant among them, whatever the umask.
@@ -695,7 +737,6 @@ fn recovery() -> Result<()> {
         if !request.work.lasts() {
             bcb::clear(&misc)?;
         }
-        let cfg = DeviceConfig::load(Path::new("/").join(ramdisk::CONFIG))?;
         skyward_sys::kmsg(&format!(
             "{} {} recovery up, misc command {:?} args {:?}, asking for {:?}",
             cfg.device.codename,
@@ -724,10 +765,7 @@ fn recovery() -> Result<()> {
         // phones; the screen and the files written still work without the
         // real time, so a failure goes to the kernel log.
         #[cfg(target_os = "android")]
-        match skyward_sys::clock::set_from_rtc() {
-            Ok(ms) => skyward_sys::kmsg(&format!("clock set to {} ms from the RTC and persist", ms))?,
-            Err(e) => skyward_sys::kmsg(&format!("clock not set: {e:#}"))?,
-        }
+        set_recovery_clock()?;
         // The kernel starts every core at its top frequency, and keeps idle
         // ones from powering down, until the phone's own system boots and
         // changes that; left so, the phone drains its battery with the

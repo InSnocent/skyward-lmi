@@ -8,7 +8,7 @@ use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use skyward_files::Ownership;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Component, Path};
 
 /// The file in a backup's folder that records what the backup holds. It is
 /// written last, so a folder with one holds a whole backup.
@@ -38,6 +38,10 @@ pub enum Part {
 
 impl Part {
     pub const ALL: [Part; 4] = [Part::Boot, Part::System, Part::Data, Part::Efs];
+
+    pub fn uses_slot(self) -> bool {
+        matches!(self, Self::Boot | Self::System)
+    }
 }
 
 /// What a backup holds.
@@ -68,6 +72,31 @@ pub struct Item {
     pub name: String,
     #[serde(flatten)]
     pub stored: store::Stored,
+}
+
+impl Item {
+    /// The name that precedes the numbered files making up this part.
+    pub fn file_name(part: Part, name: &str, compressed: bool) -> String {
+        let ext = match part {
+            Part::Data => "tar",
+            _ => "img",
+        };
+        let compression = if compressed { ".lz4" } else { "" };
+        format!("{name}.{ext}{compression}")
+    }
+
+    /// A manifest may name only the numbered files created for its part.
+    pub fn verify_files(&self) -> Result<()> {
+        let mut components = Path::new(&self.name).components();
+        ensure!(matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none(),
+            "invalid backup part name");
+        ensure!(!self.stored.files.is_empty(), "missing files for backup part {}", self.name);
+        let name = Self::file_name(self.part, &self.name, self.stored.compressed);
+        for (index, file) in self.stored.files.iter().enumerate() {
+            ensure!(*file == format!("{name}.{index:03}"), "invalid file name for backup part {}", self.name);
+        }
+        Ok(())
+    }
 }
 
 impl Manifest {
@@ -104,6 +133,33 @@ impl Manifest {
 mod tests {
     use super::*;
     use store::Stored;
+
+    #[test]
+    fn file_based_data_and_efs_do_not_use_a_boot_slot() {
+        assert!(!Part::Data.uses_slot());
+        assert!(!Part::Efs.uses_slot());
+        assert!(Part::Boot.uses_slot());
+        assert!(Part::System.uses_slot());
+    }
+
+    #[test]
+    fn data_part_files_match_the_numbered_segments_for_their_compression() {
+        let mut stored = store::Stored {
+            files: vec!["data.tar.lz4.000".into(), "data.tar.lz4.001".into()],
+            size: 1024,
+            stored: 512,
+            compressed: true,
+            sha256: "ab".repeat(32),
+        };
+        let part = |stored| Item { part: Part::Data, name: "data".into(), stored };
+        assert!(part(stored.clone()).verify_files().is_ok());
+        stored.files[0] = "../data.tar.lz4.000".into();
+        assert!(part(stored.clone()).verify_files().is_err());
+        stored.files[0] = "data.tar.lz4.001".into();
+        assert!(part(stored.clone()).verify_files().is_err());
+        stored.files[0] = "data.tar.000".into();
+        assert!(part(stored).verify_files().is_err());
+    }
 
     #[test]
     fn a_manifest_reads_back_as_written() {

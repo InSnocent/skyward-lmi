@@ -47,7 +47,7 @@ pub fn set_from_rtc() -> Result<u64> {
         None => {
             let mount = Path::new(MOUNT);
             fs::create_dir_all(mount).with_context(|| format!("make {}", mount.display()))?;
-            skyward_block::mount::mount_ro(Path::new(PERSIST), mount)?;
+            skyward_block::mount::mount_ro_no_recovery(Path::new(PERSIST), mount)?;
             let read = fs::read(mount.join(OFFSET)).with_context(|| format!("read persist's {OFFSET}"));
             skyward_block::mount::umount(mount)?;
             read

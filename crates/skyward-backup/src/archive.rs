@@ -250,6 +250,9 @@ struct Records {
 /// begins in. Tells how many bytes of file contents are written so far.
 pub fn unpack(input: impl Read, root: &Path, skipped: &Skipped, cancel: &AtomicBool, progress: &mut dyn FnMut(u64)) -> Result<Unpacked> {
     let mut archive = Archive::new(input);
+    let root_meta = fs::symlink_metadata(root)?;
+    ensure!(root_meta.is_dir(), "restore root is not a directory");
+    let dev = root_meta.dev();
     let mut held: HashSet<PathBuf> = HashSet::new();
     let mut folders: Vec<(PathBuf, (i64, u32))> = Vec::new();
     let mut unpacked = Unpacked::default();
@@ -260,13 +263,18 @@ pub fn unpack(input: impl Read, root: &Path, skipped: &Skipped, cancel: &AtomicB
         }
         let mut entry = entry.context("read the archive")?;
         let rel = entry.path().context("read the archive")?.into_owned();
-        ensure!(rel.components().all(|c| matches!(c, Component::Normal(_))), "the archive names {} outside its folder", rel.display());
+        ensure!(is_relative_entry(&rel), "the archive names {} outside its folder", rel.display());
         if skipped.covers(&rel) || unpacked.unmade.iter().any(|u| rel.starts_with(u)) {
             continue;
         }
+        ensure!(!held.contains(&rel), "the archive repeats {}", rel.display());
         let records = records(&mut entry).with_context(|| format!("read what the archive holds of {}", rel.display()))?;
         let header = entry.header().clone();
+        check_parents(root, &rel, dev)?;
         let path = root.join(&rel);
+        if let Ok(existing) = fs::symlink_metadata(&path) {
+            ensure!(existing.dev() == dev, "{} is on another filesystem", rel.display());
+        }
         let mtime = records.mtime.unwrap_or((header.mtime()? as i64, 0));
         let made = (|| -> Result<bool> {
             match header.entry_type() {
@@ -325,8 +333,13 @@ pub fn unpack(input: impl Read, root: &Path, skipped: &Skipped, cancel: &AtomicB
                 }
                 EntryType::Link => {
                     let first = entry.link_name().context("read what it is another name of")?.context("it names no file")?.into_owned();
+                    ensure!(is_relative_entry(&first) && held.contains(&first) && first != rel, "invalid archive hard link");
+                    check_parents(root, &first, dev)?;
+                    let first = root.join(first);
+                    let existing = fs::symlink_metadata(&first)?;
+                    ensure!(existing.is_file() && existing.dev() == dev, "the hard link does not name a restored file");
                     remove_any(&path)?;
-                    fs::hard_link(root.join(first), &path).context("make it")?;
+                    fs::hard_link(first, &path).context("make it")?;
                 }
                 EntryType::Char | EntryType::Block | EntryType::Fifo => {
                     remove_any(&path)?;
@@ -357,14 +370,30 @@ pub fn unpack(input: impl Read, root: &Path, skipped: &Skipped, cancel: &AtomicB
         }
         held.insert(rel);
     }
-    let dev = fs::symlink_metadata(root).with_context(|| format!("look at {}", root.display()))?.dev();
     sweep(root, Path::new(""), dev, &held, skipped, key(root)?.as_deref())?;
     // A folder's time goes last, its contents having changed it, the
     // deepest first.
     for (rel, mtime) in folders.iter().rev() {
-        times(&root.join(rel), *mtime)?;
+        check_parents(root, rel, dev)?;
+        let dir = root.join(rel);
+        ensure!(fs::symlink_metadata(&dir)?.is_dir(), "{} is no longer a directory", rel.display());
+        times(&dir, *mtime)?;
     }
     Ok(unpacked)
+}
+
+fn is_relative_entry(path: &Path) -> bool {
+    !path.as_os_str().is_empty() && path.components().all(|component| matches!(component, Component::Normal(_)))
+}
+
+fn check_parents(root: &Path, entry: &Path, dev: u64) -> Result<()> {
+    let mut path = root.to_path_buf();
+    for name in entry.parent().context("the archive entry has no parent")?.components() {
+        path.push(name);
+        let meta = fs::symlink_metadata(&path).with_context(|| format!("read restore directory {}", path.display()))?;
+        ensure!(meta.is_dir() && meta.dev() == dev, "{} is not a directory on the restore filesystem", path.display());
+    }
+    Ok(())
 }
 
 /// Take away what the folder at `rel` in `root` holds that `held` does
@@ -732,6 +761,40 @@ mod tests {
             assert!(held(&now).iter().any(|(k, _)| k == "SCHILY.xattr.security.selinux"), "{rel} has a label");
         }
         fs::remove_dir_all(&at).unwrap();
+    }
+
+    #[test]
+    fn restore_refuses_to_write_through_an_existing_directory_symlink() {
+        let at = scratch("outside-root");
+        let (from, to, outside) = (at.join("from"), at.join("to"), at.join("outside"));
+        fs::create_dir_all(from.join("link")).unwrap();
+        fs::write(from.join("link/value"), b"backup").unwrap();
+        fs::create_dir_all(&to).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("value"), b"original").unwrap();
+        symlink(&outside, to.join("link")).unwrap();
+
+        let stop = AtomicBool::new(false);
+        let mut archive = Vec::new();
+        pack(&from, &skipped(), &mut archive, &stop, &mut |_| {}).unwrap();
+        // A backup of an existing directory safely replaces its symbolic link.
+        unpack(archive.as_slice(), &to, &skipped(), &stop, &mut |_| {}).unwrap();
+        assert_eq!(fs::read(outside.join("value")).unwrap(), b"original");
+        assert_eq!(fs::read(to.join("link/value")).unwrap(), b"backup");
+
+        // An entry can also arrive with no directory record before it.
+        fs::remove_file(to.join("link/value")).unwrap();
+        fs::remove_dir(to.join("link")).unwrap();
+        symlink(&outside, to.join("link")).unwrap();
+        let mut archive = Builder::new(Vec::new());
+        let mut header = Header::new_gnu();
+        header.set_mode(0o600);
+        header.set_size(7);
+        archive.append_data(&mut header, "link/value", &b"backup!"[..]).unwrap();
+        let archive = archive.into_inner().unwrap();
+        assert!(unpack(archive.as_slice(), &to, &skipped(), &stop, &mut |_| {}).is_err());
+        assert_eq!(fs::read(outside.join("value")).unwrap(), b"original");
+        fs::remove_dir_all(at).unwrap();
     }
 
     #[test]

@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 mod avb;
 
-use skyward_bootimg::{BootImage, Ramdisk};
+use skyward_bootimg::{BootImage, LegacyBootImage, Ramdisk};
 
 /// Builds Skyward recovery images from a device's own stock images.
 #[derive(Parser)]
@@ -26,7 +26,34 @@ enum Cmd {
     Cat { image: PathBuf, path: String },
     /// Unpack and pack an image's ramdisk unchanged, to check that a rebuilt
     /// archive keeps every entry.
-    Repack { image: PathBuf, out: PathBuf },
+    Repack {
+        image: PathBuf,
+        out: PathBuf,
+        /// Add a new unsigned recovery AVB footer at the original partition size.
+        #[arg(long)]
+        recovery_avb: bool,
+    },
+    /// Make a temporary v2/gzip recovery image that tests display and touch.
+    /// Keeps the base partition size and adds a fresh unsigned AVB footer.
+    DisplayProbe {
+        #[arg(long)]
+        base: PathBuf,
+        #[arg(long)]
+        binary: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Make a temporary image for testing the full UI on an A-only device.
+    PreviewUi {
+        #[arg(long)]
+        base: PathBuf,
+        #[arg(long)]
+        binary: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+        #[command(flatten)]
+        assets: PreviewAssets,
+    },
     /// Join a kernel and another image's ramdisk into one boot image.
     Boot {
         /// Image holding the kernel (the device's boot partition).
@@ -86,24 +113,73 @@ enum Cmd {
     },
 }
 
+#[derive(clap::Args)]
+struct PreviewAssets {
+    #[arg(long)]
+    config: PathBuf,
+    #[arg(long)]
+    font: PathBuf,
+    #[arg(long)]
+    mono: PathBuf,
+    #[arg(long)]
+    mono_license: PathBuf,
+    /// Start the A-only recovery service in read-only inspection mode.
+    #[arg(long)]
+    read_only: bool,
+    /// Public certificate archive used only by the log-only sideload test.
+    #[arg(long, requires = "read_only")]
+    sideload_test_certs: Option<PathBuf>,
+    /// Add the signed BLOCK OTA inspection entry to a read-only image.
+    #[arg(long, requires = "read_only", conflicts_with = "sideload_test_certs")]
+    block_ota_preflight: bool,
+    /// Allow installation of this exact signed A-only OTA by SHA-256.
+    #[arg(long, requires = "read_only", conflicts_with = "sideload_test_certs")]
+    block_ota_install: Option<String>,
+    /// Enable A-only data decryption with the matching ROM libraries.
+    #[arg(long, requires = "read_only", conflicts_with = "sideload_test_certs")]
+    data_readonly: bool,
+    /// Directory containing the Runtime and ICU APEX files extracted from the lmi ROM.
+    #[arg(long, requires = "data_readonly")]
+    lmi_apex_files: Option<PathBuf>,
+    /// Expected contents of the synthetic lmi backup sample.
+    #[arg(long, requires = "data_readonly", conflicts_with = "block_ota_install")]
+    lmi_data_sample: Option<PathBuf>,
+    /// Exercise backup and restore of the local lmi test app.
+    #[arg(long, requires = "data_readonly", conflicts_with_all = ["lmi_data_sample", "block_ota_install"])]
+    lmi_app_restore_test: bool,
+    /// Enable the lmi Data backup and restore pages with the matching ROM libraries.
+    #[arg(long, requires = "data_readonly", conflicts_with_all = ["lmi_data_sample", "lmi_app_restore_test"])]
+    lmi_data_backup: bool,
+    /// Directory with the AW8697 RAM and RTP firmware extracted from the ROM.
+    #[arg(long)]
+    aw8697_firmware: Option<PathBuf>,
+}
+
 fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::List { image } => list(&image),
         Cmd::Cat { image, path } => {
-            let rd = Ramdisk::decode(&BootImage::read(&image)?.ramdisk)?;
+            let rd = Ramdisk::decode(PackImage::read(&image)?.ramdisk())?;
             let e = rd.find(&path).with_context(|| format!("{path} is not in the ramdisk"))?;
             std::io::stdout().write_all(&e.data)?;
             Ok(())
         }
-        Cmd::Repack { image, out } => {
-            let mut img = BootImage::read(&image)?;
-            img.ramdisk = Ramdisk::decode(&img.ramdisk)?.encode()?;
-            write(&out, &img, &img.to_bytes()?)
+        Cmd::Repack { image, out, recovery_avb } => {
+            let size = recovery_avb.then(|| partition_size(&image)).transpose()?;
+            let mut img = PackImage::read(&image)?;
+            *img.ramdisk_mut() = Ramdisk::repack(img.ramdisk())?;
+            let mut bytes = img.to_bytes()?;
+            if let Some(size) = size {
+                bytes = avb::footed(&bytes, RECOVERY, size, &Sha256::digest(&bytes))?;
+            }
+            write(&out, img.kernel_len(), img.ramdisk().len(), &bytes)
         }
+        Cmd::DisplayProbe { base, binary, out } => build_probe(&base, &binary, &out, None),
+        Cmd::PreviewUi { base, binary, out, assets } => build_probe(&base, &binary, &out, Some(&assets)),
         Cmd::Boot { kernel, ramdisk, out } => {
             let mut img = BootImage::read(&ramdisk)?;
             img.kernel = BootImage::read(&kernel)?.kernel;
-            write(&out, &img, &img.to_bytes()?)
+            write(&out, img.kernel.len(), img.ramdisk.len(), &img.to_bytes()?)
         }
         Cmd::Recovery { stock, binary, system_init, config, font, mono, mono_license, out } => {
             let size = partition_size(&stock)?;
@@ -150,7 +226,7 @@ fn main() -> Result<()> {
             rd.replace(paths::PROP_DEFAULT, props)?;
             img.ramdisk = rd.encode()?;
             let bytes = img.to_bytes()?;
-            write(&out, &img, &avb::footed(&bytes, "recovery", size, &Sha256::digest(&bytes))?)
+            write(&out, img.kernel.len(), img.ramdisk.len(), &avb::footed(&bytes, RECOVERY, size, &Sha256::digest(&bytes))?)
         }
         Cmd::Stock { config, out } => {
             let stock = skyward_config::DeviceConfig::load(&config)?.stock.with_context(|| format!("{} names no stock build", config.display()))?;
@@ -161,6 +237,140 @@ fn main() -> Result<()> {
             }
         }
     }
+}
+
+/// Keep the base's init and policy. The explicit init arguments let the
+/// binary enter the probe without running any of the regular recovery tasks.
+fn build_probe(base: &Path, binary: &Path, out: &Path, assets: Option<&PreviewAssets>) -> Result<()> {
+    let size = partition_size(base)?;
+    const INIT: &str = "system/etc/init/hw/init.rc";
+    let image = std::fs::read(base).with_context(|| format!("read {}", base.display()))?;
+    let mut img = LegacyBootImage::parse(&image)?;
+    ensure!(img.ramdisk.starts_with(&[0x1f, 0x8b]), "the probe needs a gzip ramdisk");
+    let mut ramdisk = Ramdisk::decode(&img.ramdisk)?;
+    ensure!(
+        ramdisk.entries.iter().all(|e| e.is_dir() || e.nlink == 1),
+        "the probe needs a ramdisk without hard-linked entries"
+    );
+    let recovery = std::fs::read(binary).with_context(|| format!("read {}", binary.display()))?;
+    let command = if let Some(assets) = assets {
+        let cfg = skyward_config::DeviceConfig::load(&assets.config)?;
+        ensure!(!cfg.device.ab && cfg.display.density > 0, "an A-only device with a display is required");
+        for (entry, path) in [
+            (paths::CONFIG, &assets.config),
+            (paths::FONT, &assets.font),
+            (paths::MONO, &assets.mono),
+            (paths::MONO_LICENSE, &assets.mono_license),
+        ] {
+            let data = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+            ramdisk.add(entry, 0o644, data)?;
+        }
+        if cfg.haptics.as_ref().is_some_and(|h| h.backend == skyward_config::HapticsBackend::Aw8697) {
+            let firmware = assets.aw8697_firmware.as_deref().context("AW8697 requires --aw8697-firmware")?;
+            for name in ["aw8697_haptic.bin", "aw8697_rtp_1.bin"] {
+                let path = firmware.join(name);
+                let data = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+                ensure!(!data.is_empty(), "{} is empty", path.display());
+                ramdisk.add(&format!("vendor/firmware/{name}"), 0o644, data)?;
+            }
+        }
+        if let Some(certs) = &assets.sideload_test_certs {
+            let data = std::fs::read(certs).with_context(|| format!("read {}", certs.display()))?;
+            ensure!(!data.is_empty(), "the sideload test certificate archive is empty");
+            ramdisk.add("skyward/sideload-test-otacerts.zip", 0o644, data)?;
+        }
+        if assets.block_ota_preflight {
+            ensure!(ramdisk.find("system/etc/security/otacerts.zip").is_some(), "the base recovery has no OTA certificates");
+            ramdisk.add("skyward/block-ota-preflight", 0o644, Vec::new())?;
+        }
+        if let Some(sha256) = &assets.block_ota_install {
+            ensure!(ramdisk.find("system/etc/security/otacerts.zip").is_some(), "the base recovery has no OTA certificates");
+            ramdisk.add(paths::BLOCK_OTA_DIGEST, 0o644, parse_sha256(sha256)?.to_vec())?;
+        }
+        if assets.data_readonly {
+            ensure!(cfg.device.codename == "lmi", "the legacy decryption test is configured for lmi");
+            let apex = assets.lmi_apex_files.as_deref().context("the lmi decryption test requires --lmi-apex-files")?;
+            add_lmi_apex(&mut ramdisk, apex)?;
+            // The Recovery service manager caches its manifest at boot.
+            ramdisk.add(
+                "system/etc/vintf/manifest/android.system.keystore2-service.xml",
+                0o644,
+                LMI_KEYSTORE_MANIFEST.to_vec(),
+            )?;
+            ramdisk.add(paths::DATA_READONLY, 0o644, Vec::new())?;
+            if assets.lmi_app_restore_test {
+                ramdisk.add(paths::LMI_APP_RESTORE_TEST, 0o644, Vec::new())?;
+            }
+            if assets.lmi_data_backup {
+                ramdisk.add(paths::LMI_DATA_BACKUP, 0o644, Vec::new())?;
+            }
+            if let Some(sample) = &assets.lmi_data_sample {
+                let expected = std::fs::read(sample)?;
+                ensure!((1..=4096).contains(&expected.len()), "the sample must be between 1 and 4096 bytes");
+                ramdisk.add(paths::DATA_SAMPLE, 0o644, expected)?;
+            }
+        }
+        if assets.read_only { "" } else { "preview-ui" }
+    } else {
+        "display-probe --seconds 60"
+    };
+    let init = ramdisk.find(INIT).context("missing recovery init configuration")?;
+    let patched = probe_init(std::str::from_utf8(&init.data).context("read recovery init configuration as UTF-8")?, command)?;
+    ramdisk.replace(INIT, patched.into_bytes())?;
+    ramdisk.replace(paths::RECOVERY, recovery)?;
+    img.ramdisk = ramdisk.encode_gzip()?;
+    let payload = img.to_bytes()?;
+    let bytes = avb::footed(&payload, RECOVERY, size, &Sha256::digest(&payload))?;
+    write(out, img.kernel.len(), img.ramdisk.len(), &bytes)
+}
+
+// Infinity-X Android 16's Keystore2 AIDL service declaration.
+const LMI_KEYSTORE_MANIFEST: &[u8] = br#"<manifest version="9.0" type="framework">
+    <hal format="aidl">
+        <name>android.system.keystore2</name>
+        <version>5</version>
+        <fqname>IKeystoreService/default</fqname>
+    </hal>
+</manifest>
+"#;
+
+/// Pack the needed 64-bit files from the matching ROM's verified APEX inputs.
+fn add_lmi_apex(ramdisk: &mut Ramdisk, source: &Path) -> Result<()> {
+    for (file, mode) in [
+        ("com.android.runtime/bin/linker64", 0o755),
+        ("com.android.runtime/lib64/bionic/libc.so", 0o644),
+        ("com.android.runtime/lib64/bionic/libdl.so", 0o644),
+        ("com.android.runtime/lib64/bionic/libdl_android.so", 0o644),
+        ("com.android.runtime/lib64/bionic/libm.so", 0o644),
+        ("com.android.i18n/lib64/libandroidicu.so", 0o644),
+        ("com.android.i18n/lib64/libicuuc.so", 0o644),
+        ("com.android.i18n/lib64/libicui18n.so", 0o644),
+        ("com.android.i18n/etc/icu/icudt76l.dat", 0o644),
+    ] {
+        let path = source.join(file);
+        let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+        ensure!(!bytes.is_empty(), "{} is empty", path.display());
+        ramdisk.add(&format!("skyward/apex/{file}"), mode, bytes)?;
+    }
+    Ok(())
+}
+
+fn parse_sha256(value: &str) -> Result<[u8; 32]> {
+    ensure!(value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()), "expected 64 hexadecimal SHA-256 digits");
+    let mut digest = [0; 32];
+    for (index, byte) in digest.iter_mut().enumerate() {
+        let start = index * 2;
+        *byte = u8::from_str_radix(&value[start..start + 2], 16)?;
+    }
+    Ok(digest)
+}
+
+fn probe_init(init: &str, command: &str) -> Result<String> {
+    const SERVICE: &str = "service recovery /system/bin/recovery";
+    ensure!(init.lines().filter(|line| *line == SERVICE).count() == 1, "expected one recovery service in init");
+    let invocation = if command.is_empty() { SERVICE.to_owned() } else { format!("{SERVICE} {command}") };
+    let probe = format!("{invocation}\n    oneshot");
+    Ok(init.replacen(SERVICE, &probe, 1))
 }
 
 /// The partition a recovery is made on, as a full update package names it.
@@ -242,33 +452,76 @@ fn without(props: &[u8], names: &[&str]) -> Vec<u8> {
     out
 }
 
-/// Write `bytes`, the image `img` makes, to `out`.
-fn write(out: &Path, img: &BootImage, bytes: &[u8]) -> Result<()> {
+/// The image layouts supported by the host's inspection and repack commands.
+enum PackImage {
+    Legacy(LegacyBootImage),
+    Modern(BootImage),
+}
+
+impl PackImage {
+    fn read(path: &Path) -> Result<Self> {
+        let read = || {
+            let bytes = std::fs::read(path)?;
+            // All standard headers store the little-endian version at byte 40.
+            if bytes.get(40..44) == Some(&2u32.to_le_bytes()) {
+                LegacyBootImage::parse(&bytes).map(Self::Legacy)
+            } else {
+                BootImage::parse(&bytes).map(Self::Modern)
+            }
+        };
+        read().with_context(|| format!("read {}", path.display()))
+    }
+
+    fn ramdisk(&self) -> &[u8] {
+        match self {
+            Self::Legacy(img) => &img.ramdisk,
+            Self::Modern(img) => &img.ramdisk,
+        }
+    }
+
+    fn ramdisk_mut(&mut self) -> &mut Vec<u8> {
+        match self {
+            Self::Legacy(img) => &mut img.ramdisk,
+            Self::Modern(img) => &mut img.ramdisk,
+        }
+    }
+
+    fn kernel_len(&self) -> usize {
+        match self {
+            Self::Legacy(img) => img.kernel.len(),
+            Self::Modern(img) => img.kernel.len(),
+        }
+    }
+
+    fn to_bytes(&self) -> Result<Vec<u8>> {
+        match self {
+            Self::Legacy(img) => img.to_bytes(),
+            Self::Modern(img) => img.to_bytes(),
+        }
+    }
+}
+
+fn write(out: &Path, kernel_len: usize, ramdisk_len: usize, bytes: &[u8]) -> Result<()> {
     std::fs::write(out, bytes).with_context(|| format!("write {}", out.display()))?;
     println!(
-        "wrote {} ({} bytes kernel, {} bytes ramdisk, {} bytes in all)",
+        "wrote {} ({kernel_len} bytes kernel, {ramdisk_len} bytes ramdisk, {} bytes in all)",
         out.display(),
-        img.kernel.len(),
-        img.ramdisk.len(),
         bytes.len()
     );
     Ok(())
 }
 
 fn list(image: &Path) -> Result<()> {
-    let img = BootImage::read(image)?;
-    let h = &img.header;
-    println!(
-        "header v{}  kernel {} bytes  ramdisk {} bytes  {:?}",
-        h.header_version(),
-        img.kernel.len(),
-        img.ramdisk.len(),
-        h.osversionpatch
-    );
-    if img.ramdisk.is_empty() {
+    let img = PackImage::read(image)?;
+    let (version, os) = match &img {
+        PackImage::Legacy(img) => (img.header.header_version(), &img.header.osversionpatch),
+        PackImage::Modern(img) => (img.header.header_version(), &img.header.osversionpatch),
+    };
+    println!("header v{version}  kernel {} bytes  ramdisk {} bytes  {os:?}", img.kernel_len(), img.ramdisk().len());
+    if img.ramdisk().is_empty() {
         return Ok(());
     }
-    let rd = Ramdisk::decode(&img.ramdisk)?;
+    let rd = Ramdisk::decode(img.ramdisk())?;
     for e in &rd.entries {
         println!("{:06o} {:>5}:{:<5} {:>10}  {}", e.mode, e.uid, e.gid, e.data.len(), e.name);
     }
@@ -279,6 +532,16 @@ fn list(image: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ui_preview_starts_once_with_an_explicit_init_command() {
+        let init = "service recovery /system/bin/recovery\n    user root\n";
+        assert_eq!(
+            probe_init(init, "preview-ui").unwrap(),
+            "service recovery /system/bin/recovery preview-ui\n    oneshot\n    user root\n"
+        );
+        assert!(probe_init(&init.repeat(2), "preview-ui").is_err());
+    }
 
     #[test]
     fn the_lines_that_set_a_name_are_the_only_ones_left_out() {

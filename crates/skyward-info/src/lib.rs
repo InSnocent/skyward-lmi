@@ -134,6 +134,16 @@ pub struct Boot {
 }
 
 pub fn collect(cfg: &DeviceConfig) -> Result<DeviceInfo> {
+    collect_from(cfg, SystemProps::current()?)
+}
+
+/// The installed Android properties found during an A-only inspection.
+pub fn collect_unslotted(cfg: &DeviceConfig, parts: &[&skyward_vab::Mounted]) -> Result<DeviceInfo> {
+    let props = properties_from(parts.to_vec(), |m| m.partition.as_str(), true)?;
+    collect_from(cfg, SystemProps::Installed(props))
+}
+
+fn collect_from(cfg: &DeviceConfig, system: SystemProps) -> Result<DeviceInfo> {
     let d = &cfg.display;
     let unlocked = match skyward_block::boot_param("androidboot.vbmeta.device_state")?.as_deref() {
         None => None,
@@ -141,7 +151,6 @@ pub fn collect(cfg: &DeviceConfig) -> Result<DeviceInfo> {
         Some("unlocked") => Some(true),
         Some(other) => bail!("androidboot.vbmeta.device_state {other:?}"),
     };
-    let system = SystemProps::current()?;
     Ok(DeviceInfo {
         // The system names the exact edition; the configured model covers a
         // system whose partitions are not mounted.
@@ -208,16 +217,23 @@ const BOOT_PROPS: &str = "ro.boot.";
 /// after them, as Xiaomi's odm imports what each hardware version sets; so
 /// they come first here too, the same in a recovery as in the system.
 pub fn installed_props(slot: Slot) -> Result<HashMap<String, String>> {
-    let base = |m: &skyward_vab::Mounted| -> String {
-        m.partition.strip_suffix(slot.suffix()).expect("mounted partitions carry the slot suffix").to_string()
-    };
-    let mut parts = skyward_vab::mounted_partitions(slot)?;
+    let parts = skyward_vab::mounted_partitions(slot)?;
+    properties_from(parts.iter().collect(), |m| m.partition.strip_suffix(slot.suffix()).expect("mounted partitions carry the slot suffix"), false)
+}
+
+fn properties_from<'a>(
+    mut parts: Vec<&'a skyward_vab::Mounted>,
+    base: impl Fn(&'a skyward_vab::Mounted) -> &'a str,
+    unslotted: bool,
+) -> Result<HashMap<String, String>> {
     parts.sort_by_key(|m| PROP_ORDER.iter().position(|b| *b == base(m)).unwrap_or(PROP_ORDER.len()));
     let mut props: HashMap<String, String> = skyward_sys::props(BOOT_PROPS).into_iter().collect();
     for m in &parts {
-        let files: &[&str] = match base(m).as_str() {
+        let files: &[&str] = match base(m) {
+            "system" if unslotted => &["build.prop", "system/build.prop"],
             "system" => &["system/build.prop"],
             "vendor" => &["default.prop", "build.prop"],
+            _ if unslotted => &["build.prop", "etc/build.prop"],
             _ => &["etc/build.prop"],
         };
         for f in files {

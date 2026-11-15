@@ -2,41 +2,75 @@
 //! read. The kernel keeps the key for the filesystem, not for any one
 //! file, and names it by a hash it works out itself.
 
-use anyhow::{bail, Context, Result};
+#[cfg(target_os = "android")]
+use anyhow::bail;
+#[cfg(any(target_os = "android", test))]
+use anyhow::{Context, Result};
+#[cfg(any(target_os = "android", test))]
 use std::path::Path;
 
 /// How long the name the kernel gives a key is.
 pub const NAME_BYTES: usize = 16;
 
-/// Let `raw` into the filesystem mounted at `mount`, and give the name the
-/// kernel knows it by. Every file whose directory names that key can be
-/// read from then on.
-#[cfg(target_os = "android")]
-pub fn add_key(mount: &Path, raw: &[u8], wrapped: bool) -> Result<[u8; NAME_BYTES]> {
-    use std::os::fd::AsRawFd;
-    /// The request's fixed part, before the key itself.
-    const HEADER_BYTES: usize = 80;
-    /// The key is named by what the kernel makes of it rather than by
-    /// anything this side chooses.
-    const BY_IDENTIFIER: u32 = 2;
-    /// The key is one only the storage hardware can unwrap.
-    const HARDWARE_WRAPPED: u32 = 1;
-    const ADD_KEY: u32 = 0xc050_6617;
+/// Android's file encryption policy version.
+#[cfg(any(target_os = "android", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Policy {
+    V1,
+    V2,
+}
 
+#[cfg(any(target_os = "android", test))]
+impl Policy {
+    pub fn from_mode(mode: &str) -> Self {
+        if mode.split(['+', ':']).any(|part| part == "v1") { Self::V1 } else { Self::V2 }
+    }
+
+    fn reference_bytes(self) -> usize {
+        match self {
+            Self::V1 => 8,
+            Self::V2 => NAME_BYTES,
+        }
+    }
+}
+
+#[cfg(any(target_os = "android", test))]
+fn key_arg(raw: &[u8], wrapped: bool, policy: Policy) -> Vec<u8> {
+    const HEADER_BYTES: usize = 80;
     let mut arg = vec![0u8; HEADER_BYTES + raw.len()];
-    arg[0..4].copy_from_slice(&BY_IDENTIFIER.to_ne_bytes());
+    let kind = match policy {
+        Policy::V1 => {
+            use sha2::{Digest, Sha512};
+            // With a wrapped v1 key, Android derives the descriptor from
+            // the stable half. The second half changes across boots.
+            let descriptor_key = if wrapped { &raw[..raw.len() / 2] } else { raw };
+            let hash = Sha512::digest(Sha512::digest(descriptor_key));
+            arg[8..16].copy_from_slice(&hash[..8]);
+            1u32
+        }
+        Policy::V2 => 2u32,
+    };
+    arg[0..4].copy_from_slice(&kind.to_ne_bytes());
     arg[40..44].copy_from_slice(&(raw.len() as u32).to_ne_bytes());
     if wrapped {
-        arg[76..80].copy_from_slice(&HARDWARE_WRAPPED.to_ne_bytes());
+        arg[76..80].copy_from_slice(&1u32.to_ne_bytes());
     }
     arg[HEADER_BYTES..].copy_from_slice(raw);
+    arg
+}
+
+/// Let a key into the filesystem and return the key reference it uses.
+#[cfg(target_os = "android")]
+pub fn add_key(mount: &Path, raw: &[u8], wrapped: bool, policy: Policy) -> Result<Vec<u8>> {
+    use std::os::fd::AsRawFd;
+    const ADD_KEY: u32 = 0xc050_6617;
+
+    let mut arg = key_arg(raw, wrapped, policy);
     let dir = std::fs::File::open(mount).with_context(|| format!("open {}", mount.display()))?;
     if unsafe { libc::ioctl(dir.as_raw_fd(), ADD_KEY as libc::Ioctl, arg.as_mut_ptr()) } != 0 {
         return Err(std::io::Error::last_os_error()).with_context(|| format!("let a key into {}", mount.display()));
     }
-    let mut name = [0u8; NAME_BYTES];
-    name.copy_from_slice(&arg[8..8 + NAME_BYTES]);
-    Ok(name)
+    Ok(arg[8..8 + policy.reference_bytes()].to_vec())
 }
 
 /// Whether the names and contents under `dir` read as they are: it is not
@@ -91,17 +125,43 @@ pub fn hardware_wrapped(mode: &str) -> bool {
 
 /// Read the name the phone recorded for a key it let in, to check against
 /// the name the kernel works out now.
-pub fn recorded_name(path: &Path) -> Result<[u8; NAME_BYTES]> {
+#[cfg(any(target_os = "android", test))]
+pub fn recorded_name(path: &Path, policy: Policy) -> Result<Vec<u8>> {
     let raw = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    match <[u8; NAME_BYTES]>::try_from(&raw[..]) {
-        Ok(name) => Ok(name),
-        Err(_) => bail!("{} holds {} bytes, and a key's name is {NAME_BYTES}", path.display(), raw.len()),
-    }
+    let expected = policy.reference_bytes();
+    anyhow::ensure!(raw.len() == expected, "{} holds {} bytes, expected {expected}", path.display(), raw.len());
+    Ok(raw)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_v1_policy_uses_androids_eight_byte_descriptor() {
+        let arg = key_arg(b"test-only", false, Policy::V1);
+        assert_eq!(&arg[..4], &1u32.to_ne_bytes());
+        assert_eq!(&arg[8..16], &[0x80, 0x3a, 0x9e, 0x0b, 0x3a, 0x19, 0x58, 0x6b]);
+        assert_eq!(&arg[76..80], &0u32.to_ne_bytes());
+        assert_eq!(&arg[80..], b"test-only");
+        assert_eq!(Policy::from_mode("ice:aes-256-cts:v1+wrappedkey_v0"), Policy::V1);
+        assert_eq!(Policy::from_mode("aes-256-xts:aes-256-cts:v2"), Policy::V2);
+    }
+
+    #[test]
+    fn the_v1_wrapped_descriptor_ignores_the_per_boot_half() {
+        let mut first = [0x31u8; 64];
+        let mut second = first;
+        first[32..].fill(0x41);
+        second[32..].fill(0x42);
+        let known = [0x3c, 0x36, 0x26, 0x52, 0x9a, 0x7f, 0xcb, 0xf2];
+        let wrapped = key_arg(&first, true, Policy::V1);
+        assert_eq!(&wrapped[8..16], &known);
+        assert_eq!(&wrapped[76..80], &1u32.to_ne_bytes());
+        assert_eq!(&wrapped[80..], &first);
+        assert_eq!(&key_arg(&second, true, Policy::V1)[8..16], &known);
+        assert_ne!(&key_arg(&first, false, Policy::V1)[8..16], &key_arg(&second, false, Policy::V1)[8..16]);
+    }
 
     #[test]
     fn a_phone_says_whether_the_hardware_holds_the_keys() {
@@ -116,9 +176,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let good = dir.join("ref");
         std::fs::write(&good, [7u8; NAME_BYTES]).unwrap();
-        assert_eq!(recorded_name(&good).unwrap(), [7u8; NAME_BYTES]);
+        assert_eq!(recorded_name(&good, Policy::V2).unwrap(), [7u8; NAME_BYTES]);
         let short = dir.join("short");
         std::fs::write(&short, [7u8; 8]).unwrap();
-        assert!(recorded_name(&short).is_err());
+        assert!(recorded_name(&short, Policy::V2).is_err());
+        std::fs::write(&short, [3u8; 8]).unwrap();
+        assert_eq!(recorded_name(&short, Policy::V1).unwrap(), [3u8; 8]);
     }
 }

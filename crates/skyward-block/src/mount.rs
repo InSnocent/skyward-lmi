@@ -79,11 +79,39 @@ mod sys {
     /// the kernel accepts, and return its name. Only the kernel's answers for
     /// "not this filesystem" move on to the next one.
     pub fn mount_ro(device: &Path, target: &Path) -> Result<&'static str> {
+        mount_readonly(device, target, None)
+    }
+
+    /// Mount read-only without filesystem journal or roll-forward replay.
+    pub fn mount_ro_no_recovery(device: &Path, target: &Path) -> Result<&'static str> {
+        mount_readonly(device, target, Some(false))
+    }
+
+    /// Mount installed system libraries read-only, with filesystem replay disabled.
+    pub fn mount_ro_for_services(device: &Path, target: &Path) -> Result<&'static str> {
+        mount_readonly(device, target, Some(true))
+    }
+
+    fn mount_readonly(device: &Path, target: &Path, inspection: Option<bool>) -> Result<&'static str> {
         let (src, dst) = (cstr(device)?, cstr(target)?);
         let mut refused = Vec::new();
         for fs in FILESYSTEMS {
             let ty = CString::new(fs).expect("filesystem names hold no NUL");
-            if unsafe { libc::mount(src.as_ptr(), dst.as_ptr(), ty.as_ptr(), libc::MS_RDONLY, null()) } == 0 {
+            let (flags, options) = if let Some(executable) = inspection {
+                let options = match fs {
+                    "ext4" => c"noload".as_ptr().cast(),
+                    "f2fs" => c"norecovery".as_ptr().cast(),
+                    _ => null(),
+                };
+                let mut flags = libc::MS_RDONLY | libc::MS_NODEV | libc::MS_NOSUID;
+                if !executable {
+                    flags |= libc::MS_NOEXEC;
+                }
+                (flags, options)
+            } else {
+                (libc::MS_RDONLY, null())
+            };
+            if unsafe { libc::mount(src.as_ptr(), dst.as_ptr(), ty.as_ptr(), flags, options) } == 0 {
                 return Ok(fs);
             }
             let e = os_error();
@@ -408,6 +436,14 @@ mod sys {
         bail!("this host does not mount {}", device.display())
     }
 
+    pub fn mount_ro_no_recovery(device: &Path, target: &Path) -> Result<&'static str> {
+        mount_ro(device, target)
+    }
+
+    pub fn mount_ro_for_services(device: &Path, target: &Path) -> Result<&'static str> {
+        mount_ro(device, target)
+    }
+
     pub fn mount_ro_over(device: &Path, _target: &Path) -> Result<&'static str> {
         bail!("this host does not mount {}", device.display())
     }
@@ -466,7 +502,7 @@ mod sys {
 }
 
 pub use sys::{
-    bind, holders, holding, is_mount_point, mount, mount_ids, mount_ro, mount_ro_over, points_of, remount_writable, umount,
+    bind, holders, holding, is_mount_point, mount, mount_ids, mount_ro, mount_ro_no_recovery, mount_ro_for_services, mount_ro_over, points_of, remount_writable, umount,
     umount_detach, umount_detach_over, umount_over, visible,
 };
 

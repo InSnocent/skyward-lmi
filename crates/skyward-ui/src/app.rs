@@ -18,6 +18,7 @@ use crate::settings::Settings;
 use crate::term::{self, Term, TermKey};
 use crate::theme::Theme;
 use crate::tr;
+use crate::wallpaper::{opacity_level, opacity_percent, Wallpaper, DEFAULT_OPACITY, MIN_OPACITY};
 use crate::widgets::{self, Bar, Bolt, Cap, Layer, WlanMark};
 use skyward_info::DeviceInfo;
 use skyward_install::{Event, ImageKind, Outcome, Reflash, Refusal, Stage};
@@ -35,6 +36,8 @@ pub enum Screen {
     Decrypt,
     Home,
     Settings,
+    Wallpaper,
+    PickWallpaper,
     Reboot,
     Wipe,
     /// Mounting and unmounting the slot's partitions.
@@ -539,11 +542,13 @@ pub enum Slider {
     Brightness,
     /// How strongly the motor taps.
     Vibration,
+    WallpaperOpacity,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Switch {
     Vibrate,
+    FrostedCards,
     /// Offer internal storage to a computer over USB.
     FileTransfer,
     /// Compress a backup.
@@ -1185,6 +1190,8 @@ pub enum Action {
     Pattern,
     /// Start receiving a package over USB.
     Sideload,
+    /// Inspect a signed non-A/B OTA over USB.
+    SideloadPreflight,
     /// Send the image to one of the partitions it fits.
     FlashPartition(usize),
     /// Send the image to these slots.
@@ -1243,6 +1250,8 @@ pub enum Action {
     /// Open the entry at this place in a place's folder: a folder to look
     /// in, or the file to install.
     ChooseEntry(usize),
+    WallpaperEntry(usize),
+    ResetWallpaper,
     /// Go up to the folder this many levels below the top of the list
     /// shown, by its place in the path shown over the list.
     OpenAncestor(usize),
@@ -1345,6 +1354,8 @@ pub struct Frame {
     pub pattern: Option<(f32, f32, f32)>,
     /// The colour of the page itself, past the canvas and under the bar.
     pub bg: Rgba,
+    /// Rounded cards that draw over the blurred wallpaper, in page coordinates.
+    pub(crate) frosted_cards: Vec<Rect>,
     /// A list too long to draw whole: its rows are drawn as they scroll
     /// into view, below the canvas's content and past its end.
     pub rows: Option<Rows>,
@@ -1520,6 +1531,7 @@ impl Frame {
             hero: None,
             pattern: None,
             bg: t.pal.bg,
+            frosted_cards: Vec::new(),
             rows: None,
             pinned: None,
             fold: None,
@@ -1581,6 +1593,13 @@ pub struct State {
     /// start, where otherwise it is the one the system names.
     pub language_chosen: bool,
     pub dark: bool,
+    pub(crate) wallpaper_enabled: bool,
+    pub(crate) frosted_cards: bool,
+    pub(crate) wallpaper_image: Option<Wallpaper>,
+    pub(crate) wallpaper_opacity: u8,
+    pub(crate) wallpaper_importing: bool,
+    pub(crate) wallpaper_unreadable: bool,
+    pub(crate) wallpaper_folder: Folder,
     pub brightness: f32,
     /// How long the screen stays on with nothing touched, by its place in
     /// [`SCREEN_OFF`].
@@ -1627,9 +1646,16 @@ pub struct State {
     /// The mount page's partitions, as the runtime last read them, or why
     /// it could not.
     pub mounts: Result<Vec<MountRow>, String>,
+    pub inspect_mounts: bool,
+    pub sideload_test: bool,
+    pub block_ota_preflight: bool,
+    pub block_ota_install: bool,
+    pub sideload_preflight: bool,
+    pub block_ota_targets: Option<skyward_install::block_preflight::BlockPreflight>,
     pub mount_failure: Option<MountFailure>,
     /// Which of [`BACKUP_PARTS`] a backup takes.
     pub backup: [bool; 4],
+    pub data_backup_only: bool,
     /// Where a backup goes.
     pub backup_to: Place,
     pub compress: bool,
@@ -1758,6 +1784,13 @@ impl Default for State {
             lang: Lang::Hans,
             language_chosen: false,
             dark: false,
+            wallpaper_enabled: false,
+            frosted_cards: false,
+            wallpaper_image: None,
+            wallpaper_opacity: DEFAULT_OPACITY,
+            wallpaper_importing: false,
+            wallpaper_unreadable: false,
+            wallpaper_folder: Folder::new(""),
             brightness: SLIDER_START,
             // Two minutes.
             screen_off: 3,
@@ -1780,8 +1813,15 @@ impl Default for State {
             keep_recovery: true,
             reflash: None,
             mounts: Ok(Vec::new()),
+            inspect_mounts: false,
+            sideload_test: false,
+            block_ota_preflight: false,
+            block_ota_install: false,
+            sideload_preflight: false,
+            block_ota_targets: None,
             mount_failure: None,
             backup: [true, true, false, true],
+            data_backup_only: false,
             backup_to: Place::Storage,
             compress: false,
             verify: true,
@@ -1840,6 +1880,10 @@ impl Default for State {
 }
 
 impl State {
+    pub(crate) fn wallpaper(&self) -> Option<&Wallpaper> {
+        self.wallpaper_image.as_ref().filter(|_| self.wallpaper_enabled && self.data.storage_open())
+    }
+
     /// The key of the on-screen keyboard a finger holds down.
     pub fn key_held(&self) -> Option<Cap> {
         match self.held {
@@ -1855,6 +1899,7 @@ impl State {
             Screen::Files => &self.files,
             Screen::Choose(Place::Storage) => &self.storage,
             Screen::Choose(Place::UsbDrive) => &self.drive,
+            Screen::PickWallpaper => &self.wallpaper_folder,
             other => unreachable!("{other:?} lists no folder"),
         }
     }
@@ -1864,6 +1909,7 @@ impl State {
             Screen::Files => &mut self.files,
             Screen::Choose(Place::Storage) => &mut self.storage,
             Screen::Choose(Place::UsbDrive) => &mut self.drive,
+            Screen::PickWallpaper => &mut self.wallpaper_folder,
             other => unreachable!("{other:?} lists no folder"),
         }
     }
@@ -1916,6 +1962,7 @@ impl State {
             Screen::Wlan => self.wlan.is_some(),
             Screen::SkywardUpdate => self.wlan.is_some() && self.recovery_partitions,
             Screen::Systems => self.dual_boot,
+            Screen::Wallpaper | Screen::PickWallpaper => self.wallpaper_enabled,
             _ => true,
         }
     }
@@ -1966,6 +2013,8 @@ pub enum Effect {
     FileTransfer(bool),
     /// Start receiving a package over USB.
     Sideload,
+    /// Inspect a signed non-A/B OTA over USB.
+    SideloadPreflight,
     /// Start installing the file at this path from the top of a place,
     /// telling how it goes as [`Effect::Sideload`] does.
     InstallFile(Place, String),
@@ -2004,6 +2053,11 @@ pub enum Effect {
     Unmount(String),
     /// List the folder at this path for the file manager.
     ReadDir(String),
+    ReadWallpaperFolder(String),
+    ImportWallpaper(String),
+    SaveWallpaperOpacity { before: u8, after: u8 },
+    SaveFrostedCards(bool),
+    ResetWallpaper,
     /// List the folder at this path from the top of a place, to choose a
     /// file to install in, telling what it holds with [`App::set_place`].
     ReadPlace(Place, String),
@@ -2614,6 +2668,7 @@ pub struct App {
     /// The slider lit takes the volume keys, until the power key lets it
     /// go.
     adjusting: bool,
+    wallpaper_opacity_before: Option<u8>,
     /// How tall the page was when last drawn: one being drawn again, as
     /// work under way tells how far it has come, scrolls as far meanwhile.
     height: f32,
@@ -2745,6 +2800,7 @@ impl App {
             seek: None,
             knob: None,
             adjusting: false,
+            wallpaper_opacity_before: None,
             height: 0.0,
             drawn: Vec::new(),
             spare: Vec::new(),
@@ -2804,10 +2860,17 @@ impl App {
     }
 
     pub fn theme(&self) -> Theme {
-        if self.state.dark {
+        let theme = if self.state.dark {
             Theme::dark(self.w, self.h, self.px_per_dp)
         } else {
             Theme::light(self.w, self.h, self.px_per_dp)
+        };
+        if matches!(self.screen(), Screen::Home | Screen::Settings)
+            && self.state.frosted_cards && self.state.wallpaper().is_some()
+        {
+            theme.frosted()
+        } else {
+            theme
         }
     }
 
@@ -3291,7 +3354,8 @@ impl App {
     /// The data partition did not open, and why.
     pub fn data_failed(&mut self, why: String) {
         self.state.data = Data::Failed(why);
-        self.refresh();
+        self.state.wallpaper_importing = false;
+        self.set_wallpaper(None);
     }
 
     /// What the user entered did not open their own files: the page asks
@@ -3803,6 +3867,8 @@ impl App {
         let s = &mut self.state;
         (s.install, s.source, s.package_name) = (install, source, name);
         s.script_output.clear();
+        s.block_ota_targets = None;
+        s.sideload_preflight = false;
         s.reflash = None;
     }
 
@@ -3911,6 +3977,82 @@ impl App {
     pub fn switch_asked(&mut self, to: Who) {
         self.state.systems_work = Some(SystemsWork::Switching(to));
         self.open(Screen::Systems);
+    }
+
+    pub fn enable_wallpaper(&mut self) {
+        self.state.wallpaper_enabled = true;
+        self.refresh();
+    }
+
+    pub fn set_frosted_cards(&mut self, on: bool) {
+        if self.state.frosted_cards != on {
+            self.state.frosted_cards = on;
+            self.refresh();
+        }
+    }
+
+    pub fn set_wallpaper(&mut self, saved: Option<(Wallpaper, u8)>) {
+        let (image, opacity) = saved.map_or((None, DEFAULT_OPACITY), |(image, opacity)| (Some(image), opacity.clamp(MIN_OPACITY, 100)));
+        self.state.wallpaper_image = image;
+        self.state.wallpaper_unreadable = false;
+        self.state.wallpaper_opacity = opacity;
+        self.wallpaper_opacity_before = None;
+        self.refresh();
+    }
+
+    pub fn wallpaper_unreadable(&mut self, why: &str, now: u64) {
+        self.set_wallpaper(None);
+        self.state.wallpaper_unreadable = true;
+        self.report(why, now);
+    }
+
+    pub fn wallpaper_opacity(&self) -> u8 {
+        self.state.wallpaper_opacity
+    }
+
+    pub fn wallpaper_imported(&mut self, result: Result<Wallpaper, String>, now: u64) {
+        self.state.wallpaper_importing = false;
+        if self.screen() != Screen::PickWallpaper || !self.state.data.storage_open() {
+            return;
+        }
+        match result {
+            Ok(image) => {
+                self.leave(true);
+                self.stack.pop();
+                self.settle_page();
+                self.set_wallpaper(Some((image, self.state.wallpaper_opacity)));
+            }
+            Err(why) => {
+                self.refresh();
+                self.report(&why, now);
+            }
+        }
+    }
+
+    pub fn set_wallpaper_folder(&mut self, folder: String, files: Result<Vec<FileRow>, String>, listed: i64) {
+        if self.screen() == Screen::PickWallpaper && self.state.data.storage_open() {
+            self.show_folder(Screen::PickWallpaper, folder, files, listed);
+        }
+    }
+
+    fn save_wallpaper_opacity(&mut self) -> Option<Effect> {
+        let before = self.wallpaper_opacity_before.take()?;
+        let after = self.state.wallpaper_opacity;
+        (before != after).then_some(Effect::SaveWallpaperOpacity { before, after })
+    }
+
+    pub fn wallpaper_opacity_not_saved(&mut self, before: u8, why: &str, now: u64) {
+        self.state.wallpaper_opacity = before;
+        self.refresh();
+        self.report(why, now);
+    }
+
+    pub fn use_lmi_backup(&mut self) {
+        self.state.data_backup_only = true;
+        self.state.backup = [false, false, true, false];
+        self.state.backup_to = Place::Storage;
+        self.state.compress = true;
+        self.refresh();
     }
 
     /// What was found in the places looked in for backups: the newest
@@ -4055,7 +4197,11 @@ impl App {
             let came_from = std::path::Path::new(left).strip_prefix(&folder).ok().and_then(|rest| rest.components().next());
             let name = came_from.map(|c| c.as_os_str().to_string_lossy().into_owned());
             let k = name.and_then(|name| files.as_ref().ok()?.iter().position(|e| e.name == name));
-            let row = if screen == Screen::Files { Action::OpenEntry } else { Action::ChooseEntry };
+            let row = match screen {
+                Screen::Files => Action::OpenEntry,
+                Screen::PickWallpaper => Action::WallpaperEntry,
+                _ => Action::ChooseEntry,
+            };
             self.top_mut().2 = match k {
                 Some(k) => Focus::On(Spot { stop: Stop::Hit(row(k)), group: Group::Page, rect: Rect::new(0.0, 0.0, 0.0, 0.0) }),
                 None => Focus::Unset,
@@ -4378,7 +4524,12 @@ impl App {
         }
         self.shown = Some(view);
 
-        widgets::status_bar(out, &t, f, &self.bar(clock, info), t.pal.status);
+        let bar = self.bar(clock, info);
+        if self.state.wallpaper().is_some() && (matches!(screen, Screen::Home | Screen::Settings) || slide.is_some()) {
+            widgets::wallpaper_status_bar(out, &t, f, &bar);
+        } else {
+            widgets::status_bar(out, &t, f, &bar, t.pal.status);
+        }
         if let Some((text, _)) = &self.toast {
             widgets::toast(out, &t, f, text);
         }
@@ -4453,10 +4604,18 @@ impl App {
                 let from = offset as i32 + first as i32;
                 out.put_rows(&frame.canvas, from, from + (last - first) as i32, first as i32);
             }
-            out.fill_rect(0.0, 0.0, out.w as f32, first as f32, frame.bg);
-            out.fill_rect(0.0, last as f32, out.w as f32, list_top - last as f32, frame.bg);
+            let wallpaper = match screen {
+                Screen::Home | Screen::Settings => self.state.wallpaper(),
+                _ => None,
+            };
+            let bg = if wallpaper.is_some() { frame.bg.with_alpha(0) } else { frame.bg };
+            out.fill_rect(0.0, 0.0, out.w as f32, first as f32, bg);
+            out.fill_rect(0.0, last as f32, out.w as f32, list_top - last as f32, bg);
             let below = list_end.max(last as f32);
-            out.fill_rect(0.0, below, out.w as f32, h - below, frame.bg);
+            out.fill_rect(0.0, below, out.w as f32, h - below, bg);
+            if let Some(image) = wallpaper {
+                image.show_behind(out, t, self.state.wallpaper_opacity, &frame.frosted_cards, offset as i32);
+            }
             if let Some(rows) = &frame.rows {
                 // A long list's rows on screen, each drawn when it first
                 // shows. Those more than half a screen away are let go, and
@@ -4609,7 +4768,9 @@ impl App {
             self.draw_rows(f, info, morph.scroll - rise, morph.scroll - rise + m.h as f32);
         }
         let frame = self.frame.as_ref().expect("rendered above");
-        out.fill_rect(0.0, 0.0, out.w as f32, out.h as f32, frame.bg);
+        let wallpaper = if morph.into { None } else { self.state.wallpaper() };
+        let bg = if wallpaper.is_some() { frame.bg.with_alpha(0) } else { frame.bg };
+        out.clear(bg);
         if morph.into {
             // The search page's keyboard and what it shows under its
             // field, from its frame; that comes in once the bar is nearly
@@ -4626,7 +4787,12 @@ impl App {
         } else {
             // The home page under its bar comes down with it.
             let below = m.content_top + m.search_h;
-            out.put_rows(&frame.canvas, below.floor() as i32, frame.canvas.h as i32, (below - morph.scroll + rise).floor() as i32);
+            let from = below.floor() as i32;
+            let at = (below - morph.scroll + rise).floor() as i32;
+            out.put_rows(&frame.canvas, from, frame.canvas.h as i32, at);
+            if let Some(image) = wallpaper {
+                image.show_behind(out, &t, self.state.wallpaper_opacity, &frame.frosted_cards, from - at);
+            }
         }
         let title = morph.title.get_or_insert_with(|| Blurs::new(widgets::big_title(&t, f, pages::HOME_TITLE)));
         let level = (1.0 - q / MORPH_TITLE_GONE).clamp(0.0, 1.0);
@@ -4648,7 +4814,12 @@ impl App {
         draw_faded(out, disc, 0.0, 0.0, t.pal.search, shown, blur);
         draw_faded(out, cross, 0.0, 0.0, t.pal.text, shown, blur);
         self.morph = Some(morph);
-        widgets::status_bar(out, &t, f, &self.bar(clock, info), t.pal.status);
+        let bar = self.bar(clock, info);
+        if wallpaper.is_some() {
+            widgets::wallpaper_status_bar(out, &t, f, &bar);
+        } else {
+            widgets::status_bar(out, &t, f, &bar, t.pal.status);
+        }
         if let Some((text, _)) = &self.toast {
             widgets::toast(out, &t, f, text);
         }
@@ -4813,6 +4984,15 @@ impl App {
                 // Leaving the file manager puts a picked entry down.
                 self.state.clip = None;
             }
+            Screen::PickWallpaper => {
+                if self.state.wallpaper_importing {
+                    return fx;
+                }
+                if let Some(up) = self.state.wallpaper_folder.up() {
+                    return vec![Effect::ReadWallpaperFolder(up)];
+                }
+            }
+            Screen::Wallpaper => fx.extend(self.save_wallpaper_opacity()),
             Screen::Choose(place) => {
                 if let Some(up) = self.state.folder(Screen::Choose(place)).up() {
                     return vec![Effect::ReadPlace(place, up)];
@@ -4994,7 +5174,7 @@ impl App {
         if matches!(ev, Event::Wipe | Event::Reboot(_)) {
             return;
         }
-        if matches!(ev, Event::Image { .. } | Event::Ready { .. } | Event::Script | Event::System { .. } | Event::Done(_) | Event::Finished(_)) {
+        if matches!(ev, Event::Image { .. } | Event::Ready { .. } | Event::BlockReady(_) | Event::Script | Event::System { .. } | Event::Done(_) | Event::Finished(_)) {
             self.wake(now);
         }
         let install = &mut self.state.install;
@@ -5012,6 +5192,10 @@ impl App {
                 *install = Install::Choosing(Choice { kind, size, partitions, partition: 0, pick: Pick::Current })
             }
             Event::Script => *install = Install::ConfirmingScript,
+            Event::BlockReady(report) => {
+                self.state.block_ota_targets = Some(report);
+                *install = Install::ConfirmingScript;
+            }
             Event::System { name, version, sizes } => *install = Install::SystemChoosing(SystemChoice { name, version, sizes, size: 0 }),
             Event::Running => {
                 *install = Install::Scripting { stage: None, running: true };
@@ -5067,6 +5251,10 @@ impl App {
             Screen::Systems => vec![Effect::ReadSystems],
             Screen::Restore => vec![self.find_backups()],
             Screen::Files => vec![Effect::ReadDir(self.state.files.path.clone())],
+            Screen::PickWallpaper if self.state.data.storage_open() => {
+                self.state.wallpaper_folder = Folder::new("");
+                vec![Effect::ReadWallpaperFolder(String::new())]
+            }
             Screen::Choose(place) if self.state.place_open(place) => vec![Effect::ReadPlace(place, self.state.folder(s).path.clone())],
             Screen::Search => {
                 self.state.search.clear();
@@ -5123,6 +5311,9 @@ impl App {
         let l = self.state.lang;
         match action {
             Action::Open(s) => {
+                if matches!(s, Screen::Wallpaper | Screen::PickWallpaper) && !self.state.offers(s) {
+                    return Vec::new();
+                }
                 if s == Screen::Search && self.screen() == Screen::Home {
                     // The bar moves up from where it stands unfolded: a
                     // page easing there for the keys gets there at once.
@@ -5163,6 +5354,11 @@ impl App {
                 self.refresh();
                 return vec![Effect::Wlan(on)];
             }
+            Action::Toggle(Switch::FrostedCards) => {
+                if self.state.wallpaper_enabled && self.state.data.storage_open() {
+                    return vec![Effect::SaveFrostedCards(!self.state.frosted_cards)];
+                }
+            }
             Action::Toggle(switch) => {
                 let on = match switch {
                     Switch::Vibrate => &mut self.state.vibrate,
@@ -5172,7 +5368,7 @@ impl App {
                     Switch::Signature => &mut self.state.check_signature,
                     Switch::KeepRecovery => &mut self.state.keep_recovery,
                     Switch::ShowPassword => &mut self.state.show_password,
-                    Switch::Wlan => unreachable!("the WLAN switch is turned above"),
+                    Switch::Wlan | Switch::FrostedCards => unreachable!("these switches have their own actions"),
                 };
                 *on = !*on;
                 let now_on = *on;
@@ -5213,15 +5409,17 @@ impl App {
             }
             Action::Confirm(_) => self.say(l.pick(["请按住圆形按钮向右滑动", "請按住圓形按鈕向右滑動", "Hold the round button and slide it right"]), now),
             Action::Slider(_) | Action::Pattern => {}
-            Action::Sideload => match self.state.install {
+            Action::Sideload | Action::SideloadPreflight => match self.state.install {
                 Install::Idle | Install::Finished { .. } => {
+                    let preflight = action == Action::SideloadPreflight || (self.state.block_ota_preflight && !self.state.block_ota_install);
                     self.begin_install(Install::Starting, Source::Computer, None);
+                    self.state.sideload_preflight = preflight;
                     if self.screen() == Screen::Installing {
                         self.refresh();
                     } else {
                         self.open(Screen::Installing);
                     }
-                    return vec![Effect::Sideload];
+                    return vec![if preflight { Effect::SideloadPreflight } else { Effect::Sideload }];
                 }
                 _ => self.say(l.pick(INSTALL_UNFINISHED), now),
             },
@@ -5494,11 +5692,32 @@ impl App {
                     FileKind::Special => unreachable!("a place lists no special files"),
                 }
             }
+            Action::WallpaperEntry(i) => {
+                if !self.state.data.storage_open() || self.state.wallpaper_importing {
+                    return Vec::new();
+                }
+                let folder = &self.state.wallpaper_folder;
+                let entry = folder.entry(i);
+                let path = folder.inside(&entry.name);
+                if matches!(entry.kind, FileKind::Folder { .. }) {
+                    let scroll = self.top().1;
+                    self.state.wallpaper_folder.leave(scroll);
+                    return vec![Effect::ReadWallpaperFolder(path)];
+                }
+                self.state.wallpaper_importing = true;
+                self.refresh();
+                return vec![Effect::ImportWallpaper(path)];
+            }
+            Action::ResetWallpaper => return vec![Effect::ResetWallpaper],
             Action::OpenAncestor(depth) => {
                 let screen = self.screen();
+                if screen == Screen::PickWallpaper && self.state.wallpaper_importing {
+                    return Vec::new();
+                }
                 if let Some(path) = self.state.folder(screen).ancestor(depth) {
                     return vec![match screen {
                         Screen::Choose(place) => Effect::ReadPlace(place, path),
+                        Screen::PickWallpaper => Effect::ReadWallpaperFolder(path),
                         _ => Effect::ReadDir(path),
                     }];
                 }
@@ -5996,7 +6215,11 @@ impl App {
         let m = t.m;
         let (slop, edge) = (m.dp(8.0), m.dp(20.0));
         let scroll = self.top().1;
-        let mut fx = Vec::new();
+        let mut fx: Vec<_> = if matches!(ev, Touch::Down(..)) {
+            self.save_wallpaper_opacity().into_iter().collect()
+        } else {
+            Vec::new()
+        };
         let pressing = self.pressing();
         match ev {
             Touch::Down(x, y) => {
@@ -6216,6 +6439,7 @@ impl App {
                 // Let go, the strength slider taps the motor as strongly as
                 // it was left at.
                 Drag::Slider(Slider::Vibration, _) if self.state.vibrate => fx.push(Effect::Haptic),
+                Drag::Slider(Slider::WallpaperOpacity, _) => fx.extend(self.save_wallpaper_opacity()),
                 _ => {}
             },
         }
@@ -6588,11 +6812,18 @@ impl App {
                 if self.adjusting {
                     let said = match which {
                         Slider::Brightness => ["按音量键调节亮度，按电源键完成", "按音量鍵調整亮度，按電源鍵完成", "Set the brightness with the volume keys, then press the power key"],
+                        Slider::WallpaperOpacity => [
+                            "按音量键调节壁纸不透明度，按电源键完成",
+                            "按音量鍵調整桌布不透明度，按電源鍵完成",
+                            "Set wallpaper opacity with the volume keys, then press the power key",
+                        ],
                         Slider::Vibration => {
                             ["按音量键调节振动强度，按电源键完成", "按音量鍵調整震動強度，按電源鍵完成", "Set the vibration with the volume keys, then press the power key"]
                         }
                     };
                     self.say(l.pick(said), now);
+                } else if which == Slider::WallpaperOpacity {
+                    return self.save_wallpaper_opacity().into_iter().collect();
                 }
                 Vec::new()
             }
@@ -6953,6 +7184,7 @@ impl App {
         match which {
             Slider::Brightness => self.state.brightness,
             Slider::Vibration => self.state.vibration,
+            Slider::WallpaperOpacity => opacity_level(self.state.wallpaper_opacity),
         }
     }
 
@@ -6960,6 +7192,15 @@ impl App {
     /// its floor, and draw the slider at `track` on the page again.
     fn set_level(&mut self, t: &Theme, which: Slider, track: Rect, level: f32) {
         let value = match which {
+            Slider::WallpaperOpacity => {
+                let percent = opacity_percent(level);
+                if self.state.wallpaper_opacity != percent {
+                    self.wallpaper_opacity_before.get_or_insert(self.state.wallpaper_opacity);
+                    self.state.wallpaper_opacity = percent;
+                    self.refresh();
+                }
+                return;
+            }
             Slider::Brightness => &mut self.state.brightness,
             Slider::Vibration => &mut self.state.vibration,
         };
@@ -7185,6 +7426,162 @@ mod tests {
             assert_eq!(drawn.hits.iter().map(|h| h.action).collect::<Vec<_>>(), fresh.hits.iter().map(|h| h.action).collect::<Vec<_>>(), "{cap:?} typed");
         }
         assert_eq!(app.state.search, "bfQ");
+    }
+
+    #[test]
+    fn lmi_settings_offer_a_wallpaper_page() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Settings, W, H, PPD);
+        app.enable_wallpaper();
+        let frame = app.frame(&f, &i);
+        assert!(
+            frame.hits.iter().any(|h| h.action == Action::Open(Screen::Wallpaper)),
+            "lmi appearance settings should open the wallpaper page"
+        );
+    }
+
+    #[test]
+    fn wallpaper_appearance_offers_a_frosted_cards_switch() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Settings, W, H, PPD);
+        app.enable_wallpaper();
+        app.data_waiting(None);
+        let toggle = Action::Toggle(Switch::FrostedCards);
+        assert!(!app.state.frosted_cards);
+        assert_eq!(tap(&mut app, &f, &i, toggle), vec![Effect::SaveFrostedCards(true)]);
+        app.set_frosted_cards(true);
+        assert_eq!(tap(&mut app, &f, &i, toggle), vec![Effect::SaveFrostedCards(false)]);
+    }
+
+    #[test]
+    fn frosted_cards_apply_in_both_themes_only_to_preview_pages_with_unlocked_wallpaper() {
+        let (f, i) = (fonts(), info());
+        let (w, h, ppd) = (1080, 2400, 2.75);
+        let image = test_wallpaper(w, h);
+        for dark in [false, true] {
+            let mut app = App::new(Screen::Home, w, h, ppd);
+            app.enable_wallpaper();
+            app.state.dark = dark;
+            app.set_frosted_cards(true);
+            app.set_wallpaper(Some((image.clone(), 65)));
+            assert!(app.frame(&f, &i).frosted_cards.is_empty());
+            app.data_waiting(None);
+            let rect = app.frame(&f, &i).frosted_cards[0];
+            let mut screen = Canvas::new(w, h);
+            app.compose(&mut screen, &f, &i, "12:00", 0);
+            let at = ((rect.y as usize + 16) * w as usize + rect.w as usize / 2) * 4;
+            let frosted = screen.data[at..at + 4].to_vec();
+
+            app.set_frosted_cards(false);
+            app.compose(&mut screen, &f, &i, "12:00", 1);
+            assert_ne!(frosted, screen.data[at..at + 4]);
+            app.set_frosted_cards(true);
+            app.set_wallpaper(Some((image.clone(), 0)));
+            assert_eq!(app.wallpaper_opacity(), 5, "an older 0% setting loads at the new minimum");
+            assert!(!app.frame(&f, &i).frosted_cards.is_empty());
+            app.set_wallpaper(None);
+            assert!(app.frame(&f, &i).frosted_cards.is_empty());
+
+            app.set_wallpaper(Some((image.clone(), 65)));
+            app.open(Screen::Install);
+            assert!(app.frame(&f, &i).frosted_cards.is_empty());
+            assert_eq!(app.theme().pal.card.a, 255);
+            app.open(Screen::Settings);
+            assert_eq!(app.frame(&f, &i).frosted_cards.len(), 7);
+        }
+    }
+
+    #[test]
+    fn wallpaper_browses_only_after_owner_unlock_and_never_requests_installation() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Settings, W, H, PPD);
+        app.enable_wallpaper();
+        let wallpaper = Action::Open(Screen::Wallpaper);
+        let choose = Action::Open(Screen::PickWallpaper);
+        assert!(tap(&mut app, &f, &i, wallpaper).is_empty());
+        assert!(!app.frame(&f, &i).hits.iter().any(|hit| hit.action == choose));
+        assert_eq!(tap(&mut app, &f, &i, Action::Open(Screen::Decrypt)), vec![Effect::OpenData]);
+        app.data_waiting(Some((0, Keys::Digits)));
+        assert!(app.back(0).is_empty());
+        assert!(!app.frame(&f, &i).hits.iter().any(|hit| hit.action == choose));
+        app.data_waiting(None);
+        assert_eq!(tap(&mut app, &f, &i, choose), vec![Effect::ReadWallpaperFolder("".into())]);
+
+        let row = |name: &str, kind| FileRow { name: name.into(), kind, size: 0, modified: 0, mode: 0, uid: 0, gid: 0 };
+        app.set_wallpaper_folder("".into(), Ok(vec![row("DCIM", FileKind::Folder { items: None })]), 0);
+        assert_eq!(tap(&mut app, &f, &i, Action::WallpaperEntry(0)), vec![Effect::ReadWallpaperFolder("DCIM".into())]);
+        app.set_wallpaper_folder("DCIM".into(), Ok(vec![row("photo.jpg", FileKind::File)]), 0);
+        assert_eq!(app.back(0), vec![Effect::ReadWallpaperFolder("".into())]);
+        app.set_wallpaper_folder("DCIM".into(), Ok(vec![row("photo.jpg", FileKind::File)]), 0);
+        assert_eq!(tap(&mut app, &f, &i, Action::WallpaperEntry(0)), vec![Effect::ImportWallpaper("DCIM/photo.jpg".into())]);
+        app.wallpaper_imported(Err("unable to open picture".into()), 0);
+        assert_eq!(app.screen(), Screen::PickWallpaper);
+        assert!(app.state.wallpaper().is_none());
+        assert_eq!(tap(&mut app, &f, &i, Action::WallpaperEntry(0)), vec![Effect::ImportWallpaper("DCIM/photo.jpg".into())]);
+        app.wallpaper_imported(Ok(test_wallpaper(W, H)), 0);
+        assert_eq!(app.screen(), Screen::Wallpaper);
+        assert_eq!(app.wallpaper_opacity(), DEFAULT_OPACITY);
+        assert_eq!(tap(&mut app, &f, &i, Action::ResetWallpaper), vec![Effect::ResetWallpaper]);
+    }
+
+    fn test_wallpaper(w: u32, h: u32) -> Wallpaper {
+        let canvas = Canvas::filled(2, 2, Rgba::rgb(230, 60, 130));
+        let mut png = Vec::new();
+        canvas.write_png(&mut png).unwrap();
+        Wallpaper::decode(std::io::Cursor::new(png), w, h).unwrap()
+    }
+
+    #[test]
+    fn wallpaper_slider_previews_during_a_drag_and_saves_once_on_release() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Wallpaper, W, H, PPD);
+        app.enable_wallpaper();
+        app.data_waiting(None);
+        app.set_wallpaper(Some((test_wallpaper(W, H), DEFAULT_OPACITY)));
+        let mut screen = Canvas::new(W, H);
+        app.compose(&mut screen, &f, &i, "12:00", 0);
+        let before = screen.data.clone();
+        let track = app.frame(&f, &i).hits.iter().find(|h| h.action == Action::Slider(Slider::WallpaperOpacity)).unwrap().rect;
+        let (_, y) = track.centre();
+        assert!(app.touch(Touch::Down(track.x + 1.0, y), &f, 0).is_empty());
+        app.compose(&mut screen, &f, &i, "12:00", 1);
+        assert_eq!(app.wallpaper_opacity(), 5);
+        let theme = app.theme();
+        let x = (W / 2) as usize;
+        let y_sample = (theme.m.content_top + theme.m.dp(55.0)).round() as usize;
+        let at = (y_sample * W as usize + x) * 4;
+        assert_ne!(&screen.data[at..at + 4], &before[at..at + 4]);
+        assert!(app.touch(Touch::Move(track.x + track.w - 1.0, y), &f, 2).is_empty());
+        assert_eq!(app.touch(Touch::Up, &f, 3), vec![Effect::SaveWallpaperOpacity { before: DEFAULT_OPACITY, after: 100 }]);
+        assert_eq!(app.wallpaper_opacity(), 100);
+        let _ = app.frame(&f, &i);
+        assert!(app.touch(Touch::Down(track.x + 1.0, y), &f, 4).is_empty());
+        assert_eq!(app.touch(Touch::Up, &f, 5), vec![Effect::SaveWallpaperOpacity { before: 100, after: 5 }]);
+    }
+
+    #[test]
+    fn wallpaper_background_follows_the_theme_and_disappears_while_locked() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        app.enable_wallpaper();
+        let mut screen = Canvas::new(W, H);
+        let bg = |canvas: &Canvas| canvas.data[..4].to_vec();
+        app.set_wallpaper(Some((test_wallpaper(W, H), 100)));
+        app.compose(&mut screen, &f, &i, "12:00", 0);
+        let plain_light = bg(&screen);
+        app.data_waiting(None);
+        app.compose(&mut screen, &f, &i, "12:00", 1);
+        let wallpaper_light = bg(&screen);
+        assert_ne!(wallpaper_light, plain_light);
+        assert_eq!(wallpaper_light[3], 255);
+        app.state.dark = true;
+        app.refresh();
+        app.compose(&mut screen, &f, &i, "12:00", 2);
+        let wallpaper_dark = bg(&screen);
+        assert!(wallpaper_dark[0] < wallpaper_light[0]);
+        app.data_failed("closed".into());
+        app.compose(&mut screen, &f, &i, "12:00", 3);
+        assert_eq!(bg(&screen), vec![0, 0, 0, 255]);
     }
 
     /// Where on screen the first control doing `action` sits.
@@ -8522,6 +8919,26 @@ mod tests {
     }
 
     #[test]
+    fn the_lmi_install_page_can_preflight_and_resend_without_starting_install() {
+        let (f, i) = (fonts(), info());
+        let mut app = opened(Screen::Install, &f, &i);
+        app.state.block_ota_preflight = true;
+        app.state.block_ota_install = true;
+        app.refresh();
+        let page = app.frame(&f, &i);
+        assert!(page.hits.iter().any(|hit| hit.action == Action::Sideload));
+        assert!(page.hits.iter().any(|hit| hit.action == Action::SideloadPreflight));
+        assert_eq!(tap(&mut app, &f, &i, Action::SideloadPreflight), vec![Effect::SideloadPreflight]);
+        app.install(Event::Finished(Outcome::BlockPreflight(skyward_install::block_preflight::BlockPreflight {
+            device: "lmi".to_string(),
+            logical: vec!["system".to_string()],
+            physical: vec!["boot".to_string()],
+        })), 0);
+        assert!(!app.frame(&f, &i).hits.iter().any(|hit| matches!(hit.action, Action::Confirm(_))));
+        assert_eq!(tap_at(&mut app, &f, &i, Action::SideloadPreflight, 1000), vec![Effect::SideloadPreflight]);
+    }
+
+    #[test]
     fn leaving_while_waiting_cancels_and_the_end_clears_it() {
         let (f, i) = (fonts(), info());
         let mut app = sideloading(&f, &i);
@@ -9394,6 +9811,21 @@ mod tests {
         assert_eq!(app.state.time_zone, london);
         tap(&mut app, &f, &i, Action::TimeZone(0));
         assert_eq!(app.state.time_zone, 0, "and China again");
+    }
+
+    #[test]
+    fn the_lmi_backup_page_only_offers_data_and_internal_storage() {
+        let (f, i) = (fonts(), info());
+        let mut app = opened(Screen::Backup, &f, &i);
+        app.use_lmi_backup();
+        app.data_waiting(None);
+        let actions: Vec<_> = app.frame(&f, &i).hits.iter().map(|hit| hit.action).collect();
+        assert!(actions.contains(&Action::BackupPart(2)));
+        assert!(![0, 1, 3].iter().any(|&k| actions.contains(&Action::BackupPart(k))));
+        assert!(!actions.contains(&Action::BackupTo(Place::UsbDrive)));
+        assert_eq!(swipe(&mut app, &f, &i, Confirm::Backup), vec![Effect::Backup {
+            parts: [false, false, true, false], place: Place::Storage, compress: true, verify: true,
+        }]);
     }
 
     #[test]

@@ -97,6 +97,95 @@ fn base(p: &Partition, slot: Slot) -> &str {
     &p.name[..p.name.len() - slot.suffix().len()]
 }
 
+/// The installed system partitions supported by the A-only inspection mode.
+fn inspection_partitions(partitions: &[Partition]) -> impl Iterator<Item = &Partition> {
+    partitions.iter().filter(|p| {
+        matches!(p.name.as_str(), "system" | "vendor" | "odm" | "product" | "system_ext" | "vendor_dlkm" | "odm_dlkm" | "system_dlkm")
+            && p.attributes & ATTR_DISABLED == 0
+            && p.sectors() > 0
+    })
+}
+
+#[derive(Debug)]
+pub struct InspectedPartition {
+    pub name: String,
+    pub point: PathBuf,
+    pub mounted: Result<Mounted>,
+}
+
+/// Read the first metadata copy for the A-only layout and expose the system
+/// partitions through read-only devices. Those needed by the security
+/// services go to the paths their binaries and libraries expect.
+pub fn inspect_unslotted(for_services: bool) -> Result<Vec<InspectedPartition>> {
+    ensure!(crate::current_slot()?.is_none(), "expected a device without boot slots");
+    let super_dev = super_device();
+    let md = skyward_lp::read(&super_dev, 0)?;
+    let devices = block_devices(&md, &super_dev)?;
+    Ok(inspection_partitions(&md.partitions).map(|p| {
+        let (point, executable) = inspection_mount(&p.name, for_services);
+        let mounted = mount_inspected(p, &devices, &point, executable);
+        InspectedPartition { name: p.name.clone(), point, mounted }
+    }).collect())
+}
+
+fn mount_inspected(p: &Partition, devices: &[(u32, u32)], point: &Path, executable: bool) -> Result<Mounted> {
+    let name = inspection_name(&p.name);
+    fs::create_dir_all(point).with_context(|| format!("create {}", point.display()))?;
+    ensure!(mount::visible(point)?.is_none(), "{} is already mounted", point.display());
+    let device = dm::create(&name, &targets(p, devices), true)?;
+    let mounted = if executable { mount::mount_ro_for_services(&device, point) } else { mount::mount_ro_no_recovery(&device, point) };
+    match mounted {
+        Ok(filesystem) => Ok(Mounted { partition: p.name.clone(), device, mount_point: point.to_path_buf(), filesystem: filesystem.into() }),
+        Err(e) => Err(match dm::remove(&name) {
+            Ok(()) => e,
+            Err(r) => e.context(format!("removing {name} afterwards failed too: {r:#}")),
+        }),
+    }
+}
+
+fn inspection_mount(name: &str, for_services: bool) -> (PathBuf, bool) {
+    if !for_services {
+        return (inspection_point(name), false);
+    }
+    match name {
+        "system" | "system_ext" => (Path::new("/mnt").join(name), true),
+        "vendor" | "odm" => (mount_point(name), true),
+        _ => (inspection_point(name), false),
+    }
+}
+
+fn inspection_point(name: &str) -> PathBuf {
+    Path::new("/mnt/skyward-installed").join(name)
+}
+
+fn inspection_name(name: &str) -> String {
+    format!("skyward-{name}")
+}
+
+/// Release the read-only inspection mappings before an A-only updater
+/// rewrites super. A busy mapping or an unexpected mount aborts the update.
+pub fn release_inspected(for_services: bool) -> Result<()> {
+    ensure!(crate::current_slot()?.is_none(), "expected a device without boot slots");
+    let md = skyward_lp::read(&super_device(), 0)?;
+    for p in inspection_partitions(&md.partitions).collect::<Vec<_>>().into_iter().rev() {
+        let name = inspection_name(&p.name);
+        let (point, _) = inspection_mount(&p.name, for_services);
+        let device = dm::status(&name)?;
+        if let Some(shown) = mount::visible(&point)? {
+            ensure!(Some(shown.device) == device, "unexpected mount at {}", point.display());
+        }
+        let Some(device) = device else { continue };
+        ensure!(dm::readonly(&name)?, "{name} is not a read-only inspection mapping");
+        let points = mount::points_of(device)?;
+        ensure!(points.len() <= 1 && points.iter().all(|p| p == &point), "{name} is mounted elsewhere: {points:?}");
+        if !points.is_empty() {
+            mount::umount(&point)?;
+        }
+        dm::remove(&name)?;
+    }
+    Ok(())
+}
+
 /// Partitions are mapped only while no update snapshot is outstanding,
 /// since a snapshotted partition reads correctly only through its snapshot.
 fn ensure_no_snapshot() -> Result<()> {
@@ -420,4 +509,36 @@ pub fn unmount_partitions(slot: Slot) -> Result<()> {
         mount::umount(metadata)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod single_slot_tests {
+    use super::*;
+
+    #[test]
+    fn lmi_inspection_uses_the_same_mounts_for_services_and_release() {
+        assert_eq!(inspection_mount("system", true), (PathBuf::from("/mnt/system"), true));
+        assert_eq!(inspection_mount("system_ext", true), (PathBuf::from("/mnt/system_ext"), true));
+        assert_eq!(inspection_mount("vendor", true), (mount_point("vendor"), true));
+        assert_eq!(inspection_mount("odm", true), (mount_point("odm"), true));
+        assert_eq!(inspection_mount("product", true), (inspection_point("product"), false));
+        assert_eq!(inspection_mount("system", false), (inspection_point("system"), false));
+    }
+
+    #[test]
+    fn inspection_selects_only_active_unsuffixed_system_partitions() {
+        let make = |name: &str, attributes, extents| Partition { name: name.into(), attributes, group: 0, extents };
+        let linear = vec![Extent::Linear { sectors: 8, device: 0, sector: 64 }];
+        let partitions = [
+            make("system", 0, linear.clone()),
+            make("vendor", ATTR_DISABLED, linear.clone()),
+            make("odm", 0, Vec::new()),
+            make("product", 0, linear.clone()),
+            make("system_a", 0, linear.clone()),
+            make("system-cow", 0, linear.clone()),
+            make("userdata", 0, linear),
+        ];
+        let actual: Vec<_> = inspection_partitions(&partitions).map(|p| p.name.as_str()).collect();
+        assert_eq!(actual, ["system", "product"]);
+    }
 }

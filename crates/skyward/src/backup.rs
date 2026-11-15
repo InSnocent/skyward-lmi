@@ -13,6 +13,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
@@ -52,7 +53,7 @@ const RESTORE_ORDER: [Part; 4] = [Part::Boot, Part::System, Part::Efs, Part::Dat
 /// what the system makes again, its caches, compiled code and the updates
 /// it downloaded; and the second system, which lies where /metadata keeps
 /// it.
-const DATA_SKIPPED: [&str; 21] = [
+const DATA_SKIPPED: [&str; 22] = [
     "media",
     "lost+found",
     "per_boot",
@@ -60,6 +61,7 @@ const DATA_SKIPPED: [&str; 21] = [
     "misc/vold",
     "misc/keystore",
     "misc/gatekeeper",
+    "misc/keystore2",
     "system/locksettings.db",
     "system/locksettings.db-wal",
     "system/locksettings.db-shm",
@@ -82,7 +84,37 @@ pub fn data_skipped(phone: &[String]) -> Vec<String> {
     DATA_SKIPPED.iter().map(|s| s.to_string()).chain(phone.iter().cloned()).collect()
 }
 
+#[derive(Clone, Copy)]
+pub enum DataScope {
+    Partition,
+    LmiFixture,
+}
+
+impl DataScope {
+    fn root(self) -> &'static Path {
+        Path::new(match self {
+            Self::Partition => DATA,
+            Self::LmiFixture => "/data/data/org.skyward.lmi.backupfixture",
+        })
+    }
+
+    fn validate_parts(self, parts: [bool; 4]) -> Result<()> {
+        if matches!(self, Self::LmiFixture) {
+            ensure!(parts == [false, false, true, false], "the fixture can only use its data directory");
+        }
+        Ok(())
+    }
+
+    fn item_name(self) -> &'static str {
+        match self {
+            Self::Partition => "data",
+            Self::LmiFixture => "lmi-app-fixture",
+        }
+    }
+}
+
 pub struct BackupTask {
+    pub data_scope: DataScope,
     /// Which of [`Part::ALL`] to take.
     pub parts: [bool; 4],
     /// The folder of backups at the place chosen; this one goes into a
@@ -107,6 +139,7 @@ pub struct BackupTask {
 }
 
 pub struct RestoreTask {
+    pub data_scope: DataScope,
     pub folder: PathBuf,
     /// Which of [`Part::ALL`] to restore.
     pub parts: [bool; 4],
@@ -324,7 +357,7 @@ fn data_key() -> Result<String> {
 }
 
 /// The bytes free where `path` is, or would be made.
-fn free_bytes(path: &Path) -> Result<u64> {
+pub(crate) fn free_bytes(path: &Path) -> Result<u64> {
     let there = path.ancestors().find(|p| p.exists()).context("the root is always there")?;
     let c = std::ffi::CString::new(there.as_os_str().as_bytes()).with_context(|| format!("{} holds a NUL", there.display()))?;
     let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
@@ -345,8 +378,11 @@ fn no_update() -> Result<()> {
 }
 
 fn backup(t: BackupTask, tell: &dyn Fn(Event), cancel: &AtomicBool) -> Result<PathBuf> {
-    let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
+    let slot = skyward_vab::current_slot()?;
+    t.data_scope.validate_parts(t.parts)?;
     let [boot, system, data, efs] = t.parts;
+    ensure!(slot.is_some() || !(boot || system), "boot and system backup require a slot");
+    let data_root = t.data_scope.root();
     if system {
         no_update()?;
     }
@@ -356,6 +392,7 @@ fn backup(t: BackupTask, tell: &dyn Fn(Event), cancel: &AtomicBool) -> Result<Pa
     // the data partition's archive headers.
     let mut needed = 0;
     if boot {
+        let slot = slot.context("boot backup requires a slot")?;
         // The boot partitions are backed up as the installed system's,
         // whose boot set goes back into them first.
         skyward_systems::install::ensure_installed()?;
@@ -368,14 +405,15 @@ fn backup(t: BackupTask, tell: &dyn Fn(Event), cancel: &AtomicBool) -> Result<Pa
         }
     }
     if system {
+        let slot = slot.context("system backup requires a slot")?;
         // A partition of the slot that holds nothing has nothing to keep.
         for (base, size) in skyward_vab::slot_sizes(slot)?.into_iter().filter(|(_, size)| *size > 0) {
             plan.push((Part::System, base.clone(), Source::Logical(base), size));
         }
     }
     if data {
-        let (bytes, entries) = archive::measure(Path::new(DATA), &skipped, cancel).context("measure the data partition's files")?;
-        plan.push((Part::Data, "data".into(), Source::Data, bytes));
+        let (bytes, entries) = archive::measure(data_root, &skipped, cancel).context("measure the data files")?;
+        plan.push((Part::Data, t.data_scope.item_name().into(), Source::Data, bytes));
         needed += entries * ENTRY_BYTES;
     }
     if efs {
@@ -397,16 +435,14 @@ fn backup(t: BackupTask, tell: &dyn Fn(Event), cancel: &AtomicBool) -> Result<Pa
         mount::remount_writable(at, true)?;
     }
     let folder = t.into.join(&t.stamp);
+    let mut created = false;
     let made = (|| -> Result<()> {
-        skyward_files::make_folders(&folder, t.ownership)?;
+        skyward_files::make_folders(&t.into, t.ownership)?;
+        skyward_files::make_folder(&folder, t.ownership)?;
+        created = true;
         let mut items = Vec::new();
         for (k, (part, name, source, size)) in plan.iter().enumerate() {
-            let file = match (part, t.compress) {
-                (Part::Data, false) => format!("{name}.tar"),
-                (Part::Data, true) => format!("{name}.tar.lz4"),
-                (_, false) => format!("{name}.img"),
-                (_, true) => format!("{name}.img.lz4"),
-            };
+            let file = Item::file_name(*part, name, t.compress);
             let mut writer = Writer::create(&folder, &file, t.compress, t.ownership);
             let mut telling = Telling::new(tell, k, *size, false);
             match source {
@@ -415,6 +451,7 @@ fn backup(t: BackupTask, tell: &dyn Fn(Event), cancel: &AtomicBool) -> Result<Pa
                     copy(&mut from, &mut writer, *size, cancel, &mut telling).with_context(|| format!("back up {name}"))?;
                 }
                 Source::Logical(base) => {
+                    let slot = slot.context("system backup requires a slot")?;
                     let whole = skyward_vab::map_whole(slot, base, &format!("skyward-backup-{base}{}", slot.suffix()), true)?;
                     let copied = File::open(&whole.device)
                         .with_context(|| format!("open {}", whole.device.display()))
@@ -423,7 +460,7 @@ fn backup(t: BackupTask, tell: &dyn Fn(Event), cancel: &AtomicBool) -> Result<Pa
                     copied.with_context(|| format!("back up {name}"))?;
                 }
                 Source::Data => {
-                    archive::pack(Path::new(DATA), &skipped, &mut writer, cancel, &mut |done| telling.done(done))
+                    archive::pack(data_root, &skipped, &mut writer, cancel, &mut |done| telling.done(done))
                         .context("back up the data partition's files")?;
                 }
             }
@@ -435,16 +472,19 @@ fn backup(t: BackupTask, tell: &dyn Fn(Event), cancel: &AtomicBool) -> Result<Pa
                 check(&folder, &item.stored, cancel, &mut telling).with_context(|| format!("check {}", item.name))?;
             }
         }
+        if cancel.load(Ordering::Relaxed) {
+            return Err(Cancelled.into());
+        }
         let data_key = if data { Some(data_key()?) } else { None };
         let manifest =
-            Manifest { format: FORMAT, device: t.device.clone(), made: t.made, slot: slot.suffix().into(), system: t.system.clone(), data_key, items };
+            Manifest { format: FORMAT, device: t.device.clone(), made: t.made, slot: slot.map_or("", Slot::suffix).into(), system: t.system.clone(), data_key, items };
         manifest.write(&folder, t.ownership)?;
         unsafe { libc::sync() };
         Ok(())
     })();
     // A backup that did not finish is not left half made.
     let made = match made {
-        Err(e) if folder.exists() => match fs::remove_dir_all(&folder) {
+        Err(e) if created => match fs::remove_dir_all(&folder) {
             Ok(()) => Err(e),
             Err(r) => Err(e.context(format!("taking away {} afterwards failed too: {r}", folder.display()))),
         },
@@ -465,9 +505,8 @@ fn backup(t: BackupTask, tell: &dyn Fn(Event), cancel: &AtomicBool) -> Result<Pa
 fn check(folder: &Path, stored: &Stored, cancel: &AtomicBool, telling: &mut Telling) -> Result<()> {
     let mut reader = Reader::open(folder, stored);
     copy(&mut reader, &mut io::sink(), stored.size, cancel, telling)?;
-    let mut rest = Vec::new();
-    reader.read_to_end(&mut rest).context("read")?;
-    ensure!(rest.is_empty(), "the backup holds more than was stored");
+    let mut extra = [0];
+    ensure!(reader.read(&mut extra).context("finish reading the backup")? == 0, "the backup holds more than was stored");
     reader.check(stored)
 }
 
@@ -492,24 +531,32 @@ impl<R: Read> Read for Counted<'_, R> {
 }
 
 fn restore(t: RestoreTask, tell: &dyn Fn(Event), cancel: &AtomicBool) -> Result<Vec<PathBuf>> {
+    t.data_scope.validate_parts(t.parts)?;
     let manifest = Manifest::read(&t.folder)?;
     if manifest.device != t.device {
         return Err(Refusal::OtherPhone(manifest.device).into());
     }
-    let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
+    let slot = skyward_vab::current_slot()?;
+    let data_root = t.data_scope.root();
     let mut items: Vec<&Item> = manifest.items.iter().filter(|i| t.parts[index(i.part)]).collect();
     ensure!(!items.is_empty(), "nothing chosen to restore is in the backup");
     items.sort_by_key(|i| RESTORE_ORDER.iter().position(|&p| p == i.part));
     // All that can be seen before anything is written.
+    ensure!(slot.is_some() || !items.iter().any(|item| item.part.uses_slot()), "boot and system restore require a slot");
     let system = items.iter().any(|i| i.part == Part::System);
     if system || items.iter().any(|i| i.part == Part::Boot) {
         no_update()?;
     }
-    let sizes = if system { skyward_vab::slot_sizes(slot)? } else { Vec::new() };
+    let sizes = if system { skyward_vab::slot_sizes(slot.context("system restore requires a slot")?)? } else { Vec::new() };
     for item in &items {
+        item.verify_files()?;
+        for name in &item.stored.files {
+            let file = t.folder.join(name);
+            ensure!(fs::symlink_metadata(&file)?.is_file(), "{} is not a backup file", file.display());
+        }
         match item.part {
             Part::Boot | Part::Efs => {
-                let device = target(item, slot);
+                let device = target(item, slot)?;
                 ensure!(device.exists(), "the phone has no partition {}", device.display());
                 let size = skyward_block::size_bytes(&device)?;
                 ensure!(size == item.stored.size, "{} holds {size} bytes, and its backup {}", device.display(), item.stored.size);
@@ -521,6 +568,7 @@ fn restore(t: RestoreTask, tell: &dyn Fn(Event), cancel: &AtomicBool) -> Result<
                 }
             }
             Part::Data => {
+                ensure!(item.name == t.data_scope.item_name(), "the backup's data scope does not match the restore");
                 if manifest.data_key.as_deref() != Some(data_key()?.as_str()) {
                     return Err(Refusal::DataReset.into());
                 }
@@ -534,7 +582,7 @@ fn restore(t: RestoreTask, tell: &dyn Fn(Event), cancel: &AtomicBool) -> Result<
         check(&t.folder, &item.stored, cancel, &mut telling).with_context(|| format!("check {}", item.name))?;
     }
     for item in items.iter().filter(|i| matches!(i.part, Part::Boot | Part::Efs)) {
-        let device = target(item, slot);
+        let device = target(item, slot)?;
         for point in mount::points_of(skyward_block::devnum(&device)?)? {
             mount::umount(&point).with_context(|| format!("{} is in use at {}", device.display(), point.display()))?;
         }
@@ -556,9 +604,10 @@ fn restore(t: RestoreTask, tell: &dyn Fn(Event), cancel: &AtomicBool) -> Result<
         match item.part {
             Part::Boot | Part::Efs => {
                 let mut telling = Telling::new(tell, k, item.stored.size * 2, false);
-                write_image(&target(item, slot), &t.folder, &item.stored, &mut telling)?;
+                write_image(&target(item, slot)?, &t.folder, &item.stored, &mut telling)?;
             }
             Part::System => {
+                let slot = slot.context("system restore requires a slot")?;
                 let mut telling = Telling::new(tell, k, item.stored.size * 2, false);
                 let whole = skyward_vab::map_whole(slot, &item.name, &format!("skyward-restore-{}{}", item.name, slot.suffix()), false)?;
                 let written = write_image(&whole.device, &t.folder, &item.stored, &mut telling);
@@ -570,11 +619,11 @@ fn restore(t: RestoreTask, tell: &dyn Fn(Event), cancel: &AtomicBool) -> Result<
                 let read = Cell::new(0);
                 let mut reader = Reader::open(&t.folder, &item.stored);
                 let from = Counted { inner: &mut reader, read: &read };
-                let unpacked = archive::unpack(from, Path::new(DATA), &skipped, &go_on, &mut |_| telling.done(read.get()))
+                let unpacked = archive::unpack(from, data_root, &skipped, &go_on, &mut |_| telling.done(read.get()))
                     .context("restore the data partition's files")?;
                 io::copy(&mut reader, &mut io::sink()).context("read the rest of the backup")?;
                 reader.check(&item.stored)?;
-                unmade = unpacked.unmade.iter().map(|u| Path::new(DATA).join(u)).collect();
+                unmade = unpacked.unmade.iter().map(|u| data_root.join(u)).collect();
             }
         }
         skyward_sys::kmsg(&format!("restored {}", item.name))?;
@@ -583,12 +632,81 @@ fn restore(t: RestoreTask, tell: &dyn Fn(Event), cancel: &AtomicBool) -> Result<
     Ok(unmade)
 }
 
-/// The partition a part of a backup goes back to.
-fn target(item: &Item, slot: Slot) -> PathBuf {
-    match item.part {
-        Part::Efs => partition(&item.name),
-        _ => partition(&format!("{}{}", item.name, slot.suffix())),
+/// Exercise the normal backup and restore path with an independently
+/// installed app containing only disposable test data.
+pub fn verify_lmi_fixture() -> Result<()> {
+    const PARTS: [bool; 4] = [false, false, true, false];
+    const FILES: [&str; 3] = ["files/skyward-fixture-state.txt", "shared_prefs/fixture.xml", "databases/fixture.db"];
+    let scope = DataScope::LmiFixture;
+    let root = scope.root();
+    let data = mount::visible(Path::new(DATA))?.context("data is not mounted")?;
+    ensure!(data.filesystem == "f2fs" && root.canonicalize()? == root, "unexpected fixture path or filesystem");
+    ensure!(skyward_crypto::fscrypt::unlocked(root)?, "the test app data is still locked");
+    let meta = fs::metadata(root)?;
+    ensure!(meta.is_dir() && (10000..20000).contains(&meta.uid()), "the sample directory does not belong to an app");
+    ensure!(fs::read(root.join(FILES[0]))? == b"skyward-lmi-fixture-v2\n", "the fixture marker differs");
+    let snapshots = FILES.map(|relative| -> Result<_> {
+        let path = root.join(relative);
+        let file = fs::symlink_metadata(&path)?;
+        ensure!(path.canonicalize()? == path && file.is_file() && file.uid() == meta.uid() && file.dev() == meta.dev(),
+            "the fixture entry does not belong to the sample");
+        ensure!(file.len() <= 1 << 20, "the fixture entry is too large");
+        Ok((path.clone(), fs::read(path)?, file.mode(), file.uid(), file.gid()))
+    }).into_iter().collect::<Result<Vec<_>>>()?;
+    let skipped = Skipped::new(&[]);
+    let cancel = AtomicBool::new(false);
+    let (bytes, entries) = archive::measure(root, &skipped, &cancel)?;
+    ensure!(bytes <= 4 << 20 && entries <= 100, "unexpected contents in the test app directory");
+    ensure!(mount::visible(Path::new("/dev"))?.is_some_and(|m| m.filesystem == "tmpfs"), "the fixture archive must stay in RAM");
+    let scratch = tempfile::tempdir_in("/dev").context("create the fixture archive directory")?;
+    let folder = backup(BackupTask {
+        data_scope: scope,
+        parts: PARTS,
+        into: scratch.path().to_path_buf(),
+        stamp: "backup".into(),
+        ownership: Ownership::Kept,
+        compress: true,
+        verify: true,
+        remount: None,
+        made: 0,
+        device: "lmi".into(),
+        system: None,
+        efs: Vec::new(),
+        skipped: Vec::new(),
+    }, &|_| {}, &cancel)?;
+    skyward_sys::kmsg("lmi app fixture: compressed backup verified")?;
+
+    for (path, _, _, _, _) in &snapshots {
+        fs::remove_file(path)?;
+        ensure!(!path.try_exists()?, "the sample entry is still present");
     }
+    skyward_sys::kmsg("lmi app fixture: three original test files removed before restore")?;
+    let unmade = restore(RestoreTask {
+        data_scope: scope,
+        folder,
+        parts: PARTS,
+        device: "lmi".into(),
+        skipped: Vec::new(),
+        detach: Box::new(|| Ok(())),
+    }, &|_| {}, &cancel)?;
+    ensure!(unmade.is_empty(), "some fixture entries were skipped");
+    for (path, bytes, mode, uid, gid) in snapshots {
+        let back = fs::symlink_metadata(&path)?;
+        ensure!(back.is_file() && back.mode() == mode && back.uid() == uid && back.gid() == gid,
+            "the restored fixture entry lost its file type or permissions");
+        ensure!(fs::read(&path)? == bytes, "a restored fixture entry differs");
+    }
+    scratch.close()?;
+    skyward_sys::kmsg("lmi app fixture: private file, preferences and database restored on F2FS")
+}
+
+/// The partition a part of a backup goes back to.
+fn target(item: &Item, slot: Option<Slot>) -> Result<PathBuf> {
+    if item.part == Part::Efs {
+        return Ok(partition(&item.name));
+    }
+    let slot = slot.context("boot restore requires a slot")?;
+    Ok(partition(&format!("{}{}", item.name, slot.suffix())))
 }
 
 /// Write a part's image to the partition at `device`, then read it back
