@@ -1288,15 +1288,15 @@ const RAMDISK_TIME: i64 = 1_230_768_000;
 
 fn link(name: &str, target: &str, folder: bool) -> FileRow {
     let kind = FileKind::Link { target: target.into(), folder };
-    FileRow { name: name.into(), kind, size: target.len() as u64, modified: RAMDISK_TIME, mode: 0o120_777, uid: 0, gid: 0 }
+    FileRow { name: name.into(), name_utf8: true, kind, size: target.len() as u64, modified: RAMDISK_TIME, modified_known: true, mode: 0o120_777, uid: 0, gid: 0 }
 }
 
 fn folder(name: &str, items: usize, modified: i64) -> FileRow {
-    FileRow { name: name.into(), kind: FileKind::Folder { items: Some(items) }, size: 4096, modified, mode: 0o040_755, uid: 0, gid: 0 }
+    FileRow { name: name.into(), name_utf8: true, kind: FileKind::Folder { items: Some(items) }, size: 4096, modified, modified_known: true, mode: 0o040_755, uid: 0, gid: 0 }
 }
 
 fn file(name: &str, size: u64, modified: i64) -> FileRow {
-    FileRow { name: name.into(), kind: FileKind::File, size, modified, mode: 0o100_644, uid: 0, gid: 0 }
+    FileRow { name: name.into(), name_utf8: true, kind: FileKind::File, size, modified, modified_known: true, mode: 0o100_644, uid: 0, gid: 0 }
 }
 
 /// Part of the root folder of a Xiaomi 13 Ultra, as `ls -la /` lists it,
@@ -1319,7 +1319,7 @@ fn sample_root() -> Vec<FileRow> {
         folder("system", 9, made),
         folder("vendor", 11, made),
         link("init", "/system/bin/init", false),
-        FileRow { name: "init.environ.rc".into(), kind: FileKind::File, size: 621, modified: made, mode: 0o100_750, uid: 0, gid: 2000 },
+        FileRow { name: "init.environ.rc".into(), name_utf8: true, kind: FileKind::File, size: 621, modified: made, modified_known: true, mode: 0o100_750, uid: 0, gid: 2000 },
     ]
 }
 

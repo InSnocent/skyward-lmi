@@ -265,6 +265,13 @@ fn build_probe(base: &Path, binary: &Path, out: &Path, assets: Option<&PreviewAs
             let data = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
             ramdisk.add(entry, 0o644, data)?;
         }
+        if cfg.device.codename == "lmi" {
+            // The lmi base does not set sys.usb.config_disable. Its normal
+            // adb rule starts adbd whenever the requested function needs it.
+            let rules = std::str::from_utf8(MTP_RC)?
+                .replace(" && property:sys.usb.config_disable=0", "");
+            ramdisk.add(paths::MTP_RC, 0o644, rules.into_bytes())?;
+        }
         if cfg.haptics.as_ref().is_some_and(|h| h.backend == skyward_config::HapticsBackend::Aw8697) {
             let firmware = assets.aw8697_firmware.as_deref().context("AW8697 requires --aw8697-firmware")?;
             for name in ["aw8697_haptic.bin", "aw8697_rtp_1.bin"] {

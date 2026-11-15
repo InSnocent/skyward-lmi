@@ -21,6 +21,7 @@ skyward-sys = { path = "../skyward-sys" }
 skyward-lp = { path = "../skyward-lp" }
 
 [dev-dependencies]
+libc = { workspace = true }
 rustix = { version = "1.1.5", features = ["fs"] }
 skyward-files = { path = "../skyward-files" }
 skyward-ui = { path = "../skyward-ui" }

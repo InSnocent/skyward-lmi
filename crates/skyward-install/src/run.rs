@@ -99,6 +99,14 @@ impl Installer {
         Installer::spawn(Origin::BlockInstall(digest), detach, Options::default(), run)
     }
 
+    /// Read the pinned A-only BLOCK OTA from a file on the phone.
+    pub fn open_block_install(path: PathBuf, detach: Detach) -> Result<Installer> {
+        ensure!(skyward_vab::current_slot()?.is_none(), "BLOCK installation expects an A-only device");
+        let digest_path = Path::new("/").join(skyward_config::ramdisk::BLOCK_OTA_DIGEST);
+        let digest = read_block_digest(&digest_path)?;
+        Installer::spawn(Origin::BlockFileInstall(digest), detach, Options::default(), move |ctx| run_file(ctx, &path))
+    }
+
     /// Install the file at `path`, from a thread of its own; `detach` and
     /// `options` as for [`Installer::start`].
     pub fn open(path: PathBuf, detach: Detach, options: Options) -> Result<Installer> {
@@ -218,6 +226,7 @@ enum Origin {
     SideloadTest,
     BlockPreflight(Option<[u8; 32]>),
     BlockInstall([u8; 32]),
+    BlockFileInstall([u8; 32]),
     /// A file on the phone.
     File,
     /// The system, which asked before the recovery started for a package
@@ -468,7 +477,7 @@ fn conclude(done: Done, served: Result<Option<Fault>>, origin: Origin) -> Outcom
         (_, Err(e)) => failed(e.context("serve the package")),
         (_, Ok(Some(Fault::Transfer(why)))) => Outcome::Failed(match origin {
             Origin::Computer | Origin::SideloadTest | Origin::BlockPreflight(_) | Origin::BlockInstall(_) => Failure::Disconnected,
-            Origin::File | Origin::Asked { .. } => Failure::Unreadable(why),
+            Origin::File | Origin::BlockFileInstall(_) | Origin::Asked { .. } => Failure::Unreadable(why),
         }),
         (_, Ok(Some(Fault::Changed(_)))) => Outcome::Failed(Failure::Changed),
         (Done::Engine(code), Ok(None)) => Outcome::Failed(Failure::Engine(code)),
@@ -478,7 +487,7 @@ fn conclude(done: Done, served: Result<Option<Fault>>, origin: Origin) -> Outcom
 }
 
 fn install<S>(ctx: &mut Context, mount: &Mount<S>, size: u64) -> Result<Done> {
-    if let Origin::BlockInstall(digest) = ctx.origin {
+    if let Origin::BlockInstall(digest) | Origin::BlockFileInstall(digest) = ctx.origin {
         return run_block_install(ctx, size, digest);
     }
     if let Origin::BlockPreflight(digest) = ctx.origin {
@@ -569,7 +578,7 @@ fn install_system(ctx: &Context, contents: &skyward_systems::package::Contents) 
 /// to itself, as with Android's own recovery.
 fn waits(origin: Origin, wipe: bool) -> bool {
     match origin {
-        Origin::File => true,
+        Origin::File | Origin::BlockFileInstall(_) => true,
         Origin::Computer | Origin::SideloadTest | Origin::BlockPreflight(_) | Origin::BlockInstall(_) => wipe,
         Origin::Asked { .. } => false,
     }
@@ -1109,7 +1118,7 @@ impl Drop for Group {
 fn run_binary(ctx: &Context) -> Result<(i32, bool)> {
     let path = match ctx.origin {
         Origin::SideloadTest => "/tmp/skyward-sideload-test.log",
-        Origin::BlockInstall(_) => "/tmp/skyward-block-ota.log",
+        Origin::BlockInstall(_) | Origin::BlockFileInstall(_) => "/tmp/skyward-block-ota.log",
         _ => SCRIPT_LOG,
     };
     let mut log = File::create(path).with_context(|| format!("create {path}"))?;

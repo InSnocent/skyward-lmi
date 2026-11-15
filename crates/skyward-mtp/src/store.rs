@@ -167,7 +167,10 @@ impl Store {
         let mut on_disk = BTreeMap::new();
         for entry in fs::read_dir(&path).map_err(Error::Io)? {
             let entry = entry.map_err(Error::Io)?;
-            on_disk.insert(entry.file_name(), is_dir(&entry.path()));
+            let name = entry.file_name();
+            if representable(&name) {
+                on_disk.insert(name, is_dir(&entry.path()));
+            }
         }
         let known: Vec<(OsString, u32)> = self.folder(folder)?.entries.iter().map(|(n, &h)| (n.clone(), h)).collect();
         for (name, h) in known {
@@ -275,6 +278,9 @@ impl Store {
                 }
             }
             Raw::Appeared(wd, name) => {
+                if !representable(&name) {
+                    return;
+                }
                 let Some(folder) = self.watch.folder(wd) else { return };
                 if self.child(folder, &name).is_some() {
                     return;
@@ -464,6 +470,11 @@ impl Watch {
     }
 }
 
+/// MTP names must fit its UTF-16 field without a lossy conversion or truncation.
+fn representable(name: &OsStr) -> bool {
+    name.to_str().is_some_and(|name| name.encode_utf16().count() < crate::dataset::STRING_MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -482,6 +493,36 @@ mod tests {
         let mut out: Vec<String> = handles.iter().map(|&h| store.name(h).unwrap().to_string_lossy().into_owned()).collect();
         out.sort();
         out
+    }
+
+    #[test]
+    fn non_utf8_names_are_not_exposed_as_colliding_mtp_names() {
+        use std::os::unix::ffi::OsStringExt;
+        let at = scratch("non-utf8");
+        let invalid = OsString::from_vec(b"ambiguous-\xff.txt".to_vec());
+        let valid = format!("ambiguous-{}.txt", char::REPLACEMENT_CHARACTER);
+        fs::write(at.join(&invalid), b"invalid").unwrap();
+        fs::write(at.join(&valid), b"valid").unwrap();
+        let fits = "b".repeat(254);
+        let too_long_a = format!("{}x", "a".repeat(254));
+        let too_long_b = format!("{}y", "a".repeat(254));
+        for name in [&fits, &too_long_a, &too_long_b] {
+            fs::write(at.join(name), b"length").unwrap();
+        }
+        let mut store = Store::new(at.clone()).unwrap();
+        let children = store.children(TOP).unwrap();
+        assert_eq!(names(&store, &children), [valid.clone(), fits], "lossy and truncated collisions are hidden");
+        assert!(store.child(TOP, &invalid).is_none());
+        assert!(store.child(TOP, OsStr::new(&valid)).is_some());
+
+        let later = OsString::from_vec(b"later-\xff.txt".to_vec());
+        fs::write(at.join(&later), b"later").unwrap();
+        let later_long = "c".repeat(255);
+        fs::write(at.join(&later_long), b"later long").unwrap();
+        let _ = store.changes();
+        assert!(store.child(TOP, &later).is_none(), "an inotify arrival is hidden too");
+        assert!(store.child(TOP, OsStr::new(&later_long)).is_none(), "a truncated inotify arrival is hidden too");
+        fs::remove_dir_all(&at).unwrap();
     }
 
     #[test]

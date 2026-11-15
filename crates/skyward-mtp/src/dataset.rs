@@ -8,7 +8,7 @@ use crate::codes::container;
 pub const HEADER: usize = 12;
 
 /// The most code units a string holds, its terminating zero among them.
-const STRING_MAX: usize = 255;
+pub(crate) const STRING_MAX: usize = 255;
 
 /// What a container's header says: how long the container is with the
 /// header, what it holds, its operation, response or event, and the

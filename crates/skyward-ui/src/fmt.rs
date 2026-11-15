@@ -876,17 +876,24 @@ pub fn mode(mode: u32) -> String {
 /// file manager lays it out, with dates told against `now`, when the folder
 /// was read, in the zone at `zone` in [`TIME_ZONES`].
 pub fn file_line(l: Lang, f: &FileRow, now: i64, zone: usize) -> String {
+    if !f.name_utf8 {
+        return l.pick(["文件名编码不支持", "檔名編碼不支援", "Unsupported filename encoding"]).to_string();
+    }
     const DIVIDER: &str = "  |  ";
+    let time = |folder| match f.modified_known {
+        true => file_time(f.modified, folder, now, zone),
+        false => l.pick(["时间未知", "時間未知", "Time unknown"]).to_string(),
+    };
     match &f.kind {
         FileKind::Folder { items: Some(n) } => {
             let items = match (l, n) {
                 (Lang::En, 1) => "1 item".to_string(),
                 _ => tr!(l, "{n} 项", "{n} 項", "{n} items"),
             };
-            format!("{}{DIVIDER}{items}", file_time(f.modified, true, now, zone))
+            format!("{}{DIVIDER}{items}", time(true))
         }
         FileKind::Folder { items: None } => l.pick(["无法读取", "無法讀取", "Unreadable"]).to_string(),
-        FileKind::File => format!("{}{DIVIDER}{}", file_time(f.modified, false, now, zone), file_size(f.size)),
+        FileKind::File => format!("{}{DIVIDER}{}", time(false), file_size(f.size)),
         FileKind::Link { target, .. } => tr!(l, "链接到 {target}", "連結到 {target}", "Link to {target}"),
         FileKind::Special => {
             let what = l.pick(match f.mode & 0o170_000 {
@@ -895,9 +902,18 @@ pub fn file_line(l: Lang, f: &FileRow, now: i64, zone: usize) -> String {
                 0o010_000 => ["管道", "管道", "Pipe"],
                 _ => ["套接字", "通訊端", "Socket"],
             });
-            format!("{}{DIVIDER}{what}", file_time(f.modified, false, now, zone))
+            format!("{}{DIVIDER}{what}", time(false))
         }
     }
+}
+
+/// A recorded modification time, preserving the raw value when unknown.
+pub fn file_modified(l: Lang, file: &FileRow, zone: usize) -> String {
+    if file.modified_known {
+        return datetime(l, file.modified, zone);
+    }
+    let unix = file.modified;
+    tr!(l, "时间未知（原始时间戳：{unix}）", "時間未知（原始時間戳：{unix}）", "Time unknown (raw timestamp: {unix})")
 }
 
 /// The parts a backup holds: `启动分区、系统分区`.
@@ -1675,7 +1691,7 @@ mod tests {
     #[test]
     fn entries_say_what_they_are() {
         // Changed at 2026-10-19 02:31 in Beijing; listed a week later.
-        let row = |kind, size, mode| FileRow { name: "x".into(), kind, size, modified: 1_792_348_260, mode, uid: 0, gid: 0 };
+        let row = |kind, size, mode| FileRow { name: "x".into(), name_utf8: true, kind, size, modified: 1_792_348_260, modified_known: true, mode, uid: 0, gid: 0 };
         let later = 1_792_348_260 + 7 * 86_400;
         assert_eq!(file_line(HANS, &row(FileKind::Folder { items: Some(6) }, 4096, 0o040_755), later, 0), "2026/10/19  |  6 项");
         assert_eq!(file_line(Lang::Hant, &row(FileKind::Folder { items: Some(6) }, 4096, 0o040_755), later, 0), "2026/10/19  |  6 項");
@@ -1687,6 +1703,20 @@ mod tests {
         assert_eq!(file_line(HANS, &row(link, 21, 0o120_777), later, 0), "链接到 /storage/self/primary");
         assert_eq!(file_line(HANS, &row(FileKind::Special, 0, 0o060_600), later, 0), "10/19  |  块设备");
         assert_eq!(file_line(Lang::En, &row(FileKind::Special, 0, 0o060_600), later, 0), "10/19  |  Block device");
+    }
+
+    #[test]
+    fn uninitialised_virtual_time_is_not_presented_as_a_real_date() {
+        let virtual_dir = FileRow {
+            name: "config".into(), name_utf8: true, kind: FileKind::Folder { items: Some(2) },
+            size: 0, modified: 1, modified_known: false, mode: 0o040_755, uid: 0, gid: 0,
+        };
+        assert_eq!(file_line(HANS, &virtual_dir, 1_792_348_260, 0), "时间未知  |  2 项");
+        assert_eq!(file_modified(HANS, &virtual_dir, 0), "时间未知（原始时间戳：1）");
+
+        let ordinary_dir = FileRow { name: "photo".into(), modified_known: true, ..virtual_dir };
+        assert_eq!(file_line(HANS, &ordinary_dir, 1_792_348_260, 0), "1970/01/01  |  2 项");
+        assert_eq!(file_modified(HANS, &ordinary_dir, 0), "1970年1月1日 08:00");
     }
 
     #[test]

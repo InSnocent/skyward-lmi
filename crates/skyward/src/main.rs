@@ -11,6 +11,10 @@ mod backup;
 mod decrypt;
 #[cfg(target_os = "android")]
 mod display_probe;
+#[cfg(any(target_os = "android", test))]
+mod entry_name;
+#[cfg(any(target_os = "android", test))]
+mod filetime;
 #[cfg(target_os = "android")]
 mod filework;
 #[cfg(target_os = "android")]
@@ -25,7 +29,8 @@ mod merge;
 mod partwork;
 #[cfg(target_os = "android")]
 mod preview_ui;
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", test))]
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
 mod pty;
 #[cfg(target_os = "android")]
 mod readings;
@@ -715,6 +720,11 @@ fn recovery() -> Result<()> {
     let cfg = DeviceConfig::load(root.join(ramdisk::CONFIG))?;
     #[cfg(target_os = "android")]
     if !cfg.device.ab {
+        std::fs::create_dir_all(skyward_sys::RUN)
+            .with_context(|| format!("make {}", skyward_sys::RUN))?;
+        std::fs::set_permissions(skyward_sys::RUN, std::fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("open {} to the recovery's other users", skyward_sys::RUN))?;
+        skyward_sys::keep_log(Path::new(skyward_sys::LOG))?;
         set_recovery_clock()?;
         return preview_ui::inspect(&cfg);
     }

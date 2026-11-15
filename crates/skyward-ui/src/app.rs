@@ -670,11 +670,15 @@ pub enum BackupRefusal {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileRow {
     pub name: String,
+    /// Whether the displayed name preserves the filesystem's bytes.
+    pub name_utf8: bool,
     pub kind: FileKind,
     /// Bytes; for a link, the link's own.
     pub size: u64,
     /// Last changed, in Unix seconds.
     pub modified: i64,
+    /// Whether this timestamp is meaningful rather than an early-boot placeholder.
+    pub modified_known: bool,
     /// Type and permission bits, as `st_mode` holds them.
     pub mode: u32,
     pub uid: u32,
@@ -1521,6 +1525,7 @@ impl Frame {
     /// A page of cards on the grey page colour that opens with its title in
     /// large type and goes back with `<`.
     pub fn new(t: &Theme, canvas: Canvas, hits: Vec<Hit>, title: &'static str, content_top: f32) -> Frame {
+        let frosted_cards = canvas.card_regions().to_vec();
         Frame {
             canvas,
             hits,
@@ -1531,7 +1536,7 @@ impl Frame {
             hero: None,
             pattern: None,
             bg: t.pal.bg,
-            frosted_cards: Vec::new(),
+            frosted_cards,
             rows: None,
             pinned: None,
             fold: None,
@@ -1724,6 +1729,8 @@ pub struct State {
     pub clip: Option<Clip>,
     /// What is typed as an entry's new name.
     pub new_name: String,
+    /// The cursor's UTF-8 byte position in the new name.
+    pub new_name_cursor: usize,
     /// The text file the editor page shows, as typed so far.
     pub editor: Option<Editor>,
     /// Deleting the entry the file page shows, or the backup the restore
@@ -1852,6 +1859,7 @@ impl Default for State {
             asked: Asked::default(),
             clip: None,
             new_name: String::new(),
+            new_name_cursor: 0,
             editor: None,
             asking_delete: false,
             clash: None,
@@ -2865,8 +2873,7 @@ impl App {
         } else {
             Theme::light(self.w, self.h, self.px_per_dp)
         };
-        if matches!(self.screen(), Screen::Home | Screen::Settings)
-            && self.state.frosted_cards && self.state.wallpaper().is_some()
+        if self.state.frosted_cards && self.state.wallpaper().is_some()
         {
             theme.frosted()
         } else {
@@ -2952,8 +2959,12 @@ impl App {
 
     /// Open what can be done with entry `i` of the folder shown, held long
     /// enough to, with a tap of the motor.
-    fn held_entry(&mut self, i: usize) -> Vec<Effect> {
+    fn held_entry(&mut self, i: usize, now: u64) -> Vec<Effect> {
         let entry = self.state.files.entry(i).clone();
+        if !entry.name_utf8 {
+            self.unsupported_filename(now);
+            return Vec::new();
+        }
         self.state.file = Some(entry);
         self.state.asking_delete = false;
         self.open(Screen::FileInfo);
@@ -2962,6 +2973,14 @@ impl App {
         } else {
             Vec::new()
         }
+    }
+
+    fn unsupported_filename(&mut self, now: u64) {
+        self.say(self.state.lang.pick([
+            "文件名含非 UTF-8 字节，暂不支持操作",
+            "檔名含非 UTF-8 位元組，暫不支援操作",
+            "This filename contains non-UTF-8 bytes and cannot be opened",
+        ]), now);
     }
 
     /// Let time pass: the panel dims and goes off once left alone long
@@ -2981,13 +3000,13 @@ impl App {
         if let Drag::Press { action: Some(Action::OpenEntry(i)), at, .. } = self.drag {
             if now >= at + LONG_PRESS_MS {
                 self.drag = Drag::Held;
-                fx.extend(self.held_entry(i));
+                fx.extend(self.held_entry(i, now));
             }
         }
         if let Some((key, Press::Power { spot: Spot { stop: Stop::Hit(Action::OpenEntry(i)), .. }, at })) = self.button {
             if now >= at + LONG_PRESS_MS {
                 self.button = Some((key, Press::Spent));
-                fx.extend(self.held_entry(i));
+                fx.extend(self.held_entry(i, now));
             }
         }
         let active = *self.active.get_or_insert(now);
@@ -4196,7 +4215,7 @@ impl App {
             // folder starts them at its top.
             let came_from = std::path::Path::new(left).strip_prefix(&folder).ok().and_then(|rest| rest.components().next());
             let name = came_from.map(|c| c.as_os_str().to_string_lossy().into_owned());
-            let k = name.and_then(|name| files.as_ref().ok()?.iter().position(|e| e.name == name));
+            let k = name.and_then(|name| files.as_ref().ok()?.iter().position(|e| e.name_utf8 && e.name == name));
             let row = match screen {
                 Screen::Files => Action::OpenEntry,
                 Screen::PickWallpaper => Action::WallpaperEntry,
@@ -4217,7 +4236,7 @@ impl App {
         // lists it again, as after its file is saved.
         if screen == Screen::Files && folder == self.state.files.path {
             if let (Some(file), Ok(entries)) = (self.state.file.as_mut(), &files) {
-                if let Some(listed) = entries.iter().find(|e| e.name == file.name) {
+                if let Some(listed) = entries.iter().find(|e| e.name_utf8 == file.name_utf8 && e.name == file.name) {
                     *file = listed.clone();
                 }
             }
@@ -4525,7 +4544,7 @@ impl App {
         self.shown = Some(view);
 
         let bar = self.bar(clock, info);
-        if self.state.wallpaper().is_some() && (matches!(screen, Screen::Home | Screen::Settings) || slide.is_some()) {
+        if self.state.wallpaper().is_some() {
             widgets::wallpaper_status_bar(out, &t, f, &bar);
         } else {
             widgets::status_bar(out, &t, f, &bar, t.pal.status);
@@ -4574,7 +4593,18 @@ impl App {
             }
         };
 
-        if let Some(art) = &frame.hero {
+        if let (Some(art), Some(image)) = (&frame.hero, self.state.wallpaper()) {
+            out.clear(frame.bg.with_alpha(0));
+            out.put_rows(&frame.canvas, offset as i32, offset as i32 + out.h as i32, 0);
+            image.show_behind(out, t, self.state.wallpaper_opacity, &frame.frosted_cards, offset as i32);
+            press_row(out);
+            let range = m.dp(ABOUT_LOGO_DP) - widgets::bar_bottom(t);
+            let v = (scroll / range).clamp(0.0, 1.0);
+            art.version.draw_scaled(out, 0.0, 0.0, 1.0 - 0.1 * v, t.hero.version, 1.0 - v);
+            art.author.draw_scaled(out, 0.0, 0.0, 1.0 - 0.1 * v, t.hero.version, 1.0 - v);
+            let l = ((scroll - range) / m.dp(ABOUT_LOGO_FADE_DP)).clamp(0.0, 1.0);
+            art.wordmark.draw_scaled(out, 0.0, 0.0, 1.0 - 0.1 * l, t.pal.text, 1.0 - l);
+        } else if let Some(art) = &frame.hero {
             // The field fills the screen and fades as the page scrolls; the
             // cards scroll over it. The version and the author's line fade
             // and shrink away first, then the wordmark.
@@ -4604,18 +4634,14 @@ impl App {
                 let from = offset as i32 + first as i32;
                 out.put_rows(&frame.canvas, from, from + (last - first) as i32, first as i32);
             }
-            let wallpaper = match screen {
-                Screen::Home | Screen::Settings => self.state.wallpaper(),
-                _ => None,
-            };
+            let wallpaper = self.state.wallpaper();
+            let mut glass = frame.frosted_cards.clone();
             let bg = if wallpaper.is_some() { frame.bg.with_alpha(0) } else { frame.bg };
             out.fill_rect(0.0, 0.0, out.w as f32, first as f32, bg);
             out.fill_rect(0.0, last as f32, out.w as f32, list_top - last as f32, bg);
             let below = list_end.max(last as f32);
             out.fill_rect(0.0, below, out.w as f32, h - below, bg);
-            if let Some(image) = wallpaper {
-                image.show_behind(out, t, self.state.wallpaper_opacity, &frame.frosted_cards, offset as i32);
-            }
+            out.fill_rect(0.0, list_top, out.w as f32, list_end - list_top, bg);
             if let Some(rows) = &frame.rows {
                 // A long list's rows on screen, each drawn when it first
                 // shows. Those more than half a screen away are let go, and
@@ -4630,17 +4656,29 @@ impl App {
                             let (f, info) = fresh.expect("a page drawn again as it last showed has its rows in view drawn");
                             let mut c = self.spare.pop().unwrap_or_else(|| Canvas::new(out.w, 0));
                             c.resize((rows.edges[i + 1] - rows.edges[i]) as u32);
+                            if wallpaper.is_some() && self.state.frosted_cards {
+                                c.track_cards(t.pal.card);
+                            }
                             let cx = Ctx { t, f, info, state: &self.state, term: self.term.as_ref(), band: None };
                             pages::row(screen, &cx, i, &mut c);
                             self.drawn.push((i, c));
                             self.drawn.len() - 1
                         }
                     };
+                    if wallpaper.is_some() && self.state.frosted_cards {
+                        glass.extend(self.drawn[k].1.card_regions().iter().map(|r| Rect {
+                            y: r.y + rows.edges[i],
+                            ..*r
+                        }));
+                    }
                     out.put(&self.drawn[k].1, (rows.edges[i] - offset) as i32);
                 }
             } else {
                 // Off a long list, its rows' canvases are not kept.
                 self.spare.clear();
+            }
+            if let Some(image) = wallpaper {
+                image.show_behind(out, t, self.state.wallpaper_opacity, &glass, offset as i32);
             }
             press_row(out);
             if let Some(fold) = &frame.fold {
@@ -4680,7 +4718,11 @@ impl App {
             }
         }
         if let Some((p, top)) = strip {
-            out.put(&p.canvas, top.round() as i32);
+            if self.state.wallpaper().is_some() {
+                out.lay(&p.canvas, 0, top.round() as i32, 1.0);
+            } else {
+                out.put(&p.canvas, top.round() as i32);
+            }
             shine(out, Group::Strip);
         }
         if let Some(d) = &frame.dock {
@@ -4768,10 +4810,13 @@ impl App {
             self.draw_rows(f, info, morph.scroll - rise, morph.scroll - rise + m.h as f32);
         }
         let frame = self.frame.as_ref().expect("rendered above");
-        let wallpaper = if morph.into { None } else { self.state.wallpaper() };
+        let wallpaper = self.state.wallpaper();
         let bg = if wallpaper.is_some() { frame.bg.with_alpha(0) } else { frame.bg };
         out.clear(bg);
         if morph.into {
+            if let Some(image) = wallpaper {
+                image.show_behind(out, &t, self.state.wallpaper_opacity, &[], 0);
+            }
             // The search page's keyboard and what it shows under its
             // field, from its frame; that comes in once the bar is nearly
             // there.
@@ -5329,12 +5374,13 @@ impl App {
             }
             Action::OpenData => return self.open_data(),
             Action::Skip => {
-                self.leave(true);
                 if self.stack.len() > 1 {
-                    self.stack.pop();
-                } else {
-                    *self.top_mut() = (Screen::Home, 0.0, Focus::Unset);
+                    // Leaving decrypt must also run the destination's return
+                    // effects, such as looking for backups after unlocking.
+                    return self.back(now);
                 }
+                self.leave(true);
+                *self.top_mut() = (Screen::Home, 0.0, Focus::Unset);
                 self.settle_page();
                 self.refresh();
             }
@@ -5483,6 +5529,7 @@ impl App {
             }
             Action::RenameEntry => {
                 self.state.new_name = self.state.file.as_ref().expect("the file page shows an entry").name.clone();
+                self.state.new_name_cursor = self.state.new_name.len();
                 self.state.layer = Layer::Letters;
                 self.open(Screen::Rename);
             }
@@ -5644,6 +5691,10 @@ impl App {
             }
             Action::OpenEntry(i) => {
                 let entry = self.state.files.entry(i).clone();
+                if !entry.name_utf8 {
+                    self.unsupported_filename(now);
+                    return Vec::new();
+                }
                 match entry.kind {
                     FileKind::Folder { .. } | FileKind::Link { folder: true, .. } => {
                         let scroll = self.top().1;
@@ -5681,7 +5732,11 @@ impl App {
                 let Screen::Choose(place) = screen else { unreachable!("only a place's folder is chosen in") };
                 let folder = self.state.folder(screen);
                 let entry = folder.entry(i).clone();
-                let path = folder.inside(&entry.name);
+                if !entry.name_utf8 {
+                    self.unsupported_filename(now);
+                    return Vec::new();
+                }
+                let path = self.state.folder(screen).inside(&entry.name);
                 match entry.kind {
                     FileKind::Folder { .. } | FileKind::Link { folder: true, .. } => {
                         let scroll = self.top().1;
@@ -5696,9 +5751,12 @@ impl App {
                 if !self.state.data.storage_open() || self.state.wallpaper_importing {
                     return Vec::new();
                 }
-                let folder = &self.state.wallpaper_folder;
-                let entry = folder.entry(i);
-                let path = folder.inside(&entry.name);
+                let entry = self.state.wallpaper_folder.entry(i).clone();
+                if !entry.name_utf8 {
+                    self.unsupported_filename(now);
+                    return Vec::new();
+                }
+                let path = self.state.wallpaper_folder.inside(&entry.name);
                 if matches!(entry.kind, FileKind::Folder { .. }) {
                     let scroll = self.top().1;
                     self.state.wallpaper_folder.leave(scroll);
@@ -5918,6 +5976,33 @@ impl App {
         }
     }
 
+    /// Type inside a new name; other single-line fields still type at the end.
+    fn type_character(&mut self, ch: char) {
+        if self.screen() != Screen::Rename {
+            self.typing().push(ch);
+            return;
+        }
+        let s = &mut self.state;
+        let at = widgets::text_boundary(&s.new_name, s.new_name_cursor);
+        s.new_name.insert(at, ch);
+        s.new_name_cursor = at + ch.len_utf8();
+    }
+
+    fn backspace_character(&mut self) {
+        if self.screen() != Screen::Rename {
+            self.typing().pop();
+            return;
+        }
+        let s = &mut self.state;
+        let at = widgets::text_boundary(&s.new_name, s.new_name_cursor);
+        if let Some((before, _)) = s.new_name[..at].char_indices().next_back() {
+            s.new_name.drain(before..at);
+            s.new_name_cursor = before;
+        } else {
+            s.new_name_cursor = 0;
+        }
+    }
+
     /// Where the entry the file page shows is.
     fn entry_path(&self) -> String {
         let entry = self.state.file.as_ref().expect("the file page shows an entry");
@@ -6040,6 +6125,18 @@ impl App {
         self.refresh_text();
     }
 
+    /// A tap on the rename field places its cursor between nearby characters.
+    fn place_rename_caret(&mut self, f: &Fonts, x: f32, y: f32) {
+        let t = self.theme();
+        if let Some(at) = widgets::editable_text_position(
+            &t, f, t.m.content_top, &self.state.new_name, self.state.new_name_cursor, x, y,
+        ) {
+            self.state.new_name_cursor = at;
+            self.edits += 1;
+            self.refresh_text();
+        }
+    }
+
     /// Scroll the terminal's screen or the editor's text as a finger goes
     /// from `last` to `y`: a row for each row's height.
     fn scroll_history(&mut self, last: f32, y: f32, carry: f32, pitch: f32) -> Drag {
@@ -6071,18 +6168,18 @@ impl App {
         match cap {
             Cap::Char(ch) => {
                 let shifted = self.state.layer == Layer::Shifted;
-                self.typing().push(if shifted { ch.to_ascii_uppercase() } else { ch });
+                self.type_character(if shifted { ch.to_ascii_uppercase() } else { ch });
                 self.edits += 1;
                 if shifted {
                     self.state.layer = Layer::Letters;
                 }
             }
             Cap::Space => {
-                self.typing().push(' ');
+                self.type_character(' ');
                 self.edits += 1;
             }
             Cap::Backspace => {
-                self.typing().pop();
+                self.backspace_character();
                 self.edits += 1;
             }
             Cap::Shift => {
@@ -6387,6 +6484,7 @@ impl App {
                     fx.extend(self.act(a, now));
                 }
                 Drag::Press { x, y, action: None, .. } if self.screen() == Screen::Editor => self.place_caret(f, x, y + scroll),
+                Drag::Press { x, y, action: None, .. } if self.screen() == Screen::Rename => self.place_rename_caret(f, x, y + scroll),
                 Drag::History { pitch, .. } => {
                     // A finger lifted while still moving sends the rows
                     // gliding on.
@@ -7454,7 +7552,7 @@ mod tests {
     }
 
     #[test]
-    fn frosted_cards_apply_in_both_themes_only_to_preview_pages_with_unlocked_wallpaper() {
+    fn frosted_cards_apply_in_both_themes_with_unlocked_wallpaper() {
         let (f, i) = (fonts(), info());
         let (w, h, ppd) = (1080, 2400, 2.75);
         let image = test_wallpaper(w, h);
@@ -7484,10 +7582,71 @@ mod tests {
 
             app.set_wallpaper(Some((image.clone(), 65)));
             app.open(Screen::Install);
-            assert!(app.frame(&f, &i).frosted_cards.is_empty());
-            assert_eq!(app.theme().pal.card.a, 255);
+            assert!(!app.frame(&f, &i).frosted_cards.is_empty());
+            assert!(app.theme().pal.card.a < 255);
             app.open(Screen::Settings);
             assert_eq!(app.frame(&f, &i).frosted_cards.len(), 7);
+        }
+    }
+
+    #[test]
+    fn wallpaper_and_glass_follow_the_user_across_recovery_pages() {
+        let (f, i) = (fonts(), info());
+        let pages = [
+            Screen::Home, Screen::Settings, Screen::Advanced, Screen::Install,
+            Screen::Reboot, Screen::Backup, Screen::Mount, Screen::Wallpaper,
+            Screen::Files, Screen::Search, Screen::Terminal, Screen::About, Screen::Rename,
+        ];
+        let card_pages = [
+            Screen::Home, Screen::Settings, Screen::Advanced, Screen::Install,
+            Screen::Reboot, Screen::Backup, Screen::Mount, Screen::Wallpaper, Screen::Rename,
+        ];
+        let image = test_wallpaper(W, H);
+        for dark in [false, true] {
+            for page in pages {
+                let mut app = App::new(page, W, H, PPD);
+                app.enable_wallpaper();
+                app.data_waiting(None);
+                if page == Screen::Files {
+                    app.set_files("/".into(), Ok(vec![entry("example.txt", FileKind::File)]), 0);
+                }
+                app.state.dark = dark;
+                app.set_frosted_cards(true);
+                app.set_wallpaper(Some((image.clone(), 100)));
+                if card_pages.contains(&page) {
+                    assert!(!app.frame(&f, &i).frosted_cards.is_empty(), "{page:?} should have glass cards");
+                }
+                let mut screen = Canvas::new(W, H);
+                app.tick(0);
+                app.compose(&mut screen, &f, &i, "12:00", 0);
+                assert!(screen.data.iter().skip(3).step_by(4).all(|alpha| *alpha == 255), "{page:?} has transparent pixels");
+                let at = (((H / 2) * W + 2) * 4) as usize;
+                let wallpaper = screen.data[at..at + 4].to_vec();
+                app.set_wallpaper(None);
+                app.compose(&mut screen, &f, &i, "12:00", 0);
+                assert_ne!(wallpaper, screen.data[at..at + 4], "{page:?} should show the wallpaper");
+            }
+        }
+    }
+
+    #[test]
+    fn wallpaper_keeps_every_pixel_opaque_during_search_transitions() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        app.enable_wallpaper();
+        app.data_waiting(None);
+        app.set_wallpaper(Some((test_wallpaper(W, H), 80)));
+        app.set_frosted_cards(true);
+        let mut screen = Canvas::new(W, H);
+        app.tick(0);
+        app.compose(&mut screen, &f, &i, "12:00", 0);
+        let (x, y) = spot(&mut app, &f, &i, Action::Open(Screen::Search));
+        app.touch(Touch::Down(x, y), &f, 10);
+        app.touch(Touch::Up, &f, 20);
+        for now in [20, 40, 80, 160, 320, 620] {
+            app.tick(now);
+            app.compose(&mut screen, &f, &i, "12:00", now);
+            assert!(screen.data.iter().skip(3).step_by(4).all(|alpha| *alpha == 255), "search at {now} ms");
         }
     }
 
@@ -7507,7 +7666,7 @@ mod tests {
         app.data_waiting(None);
         assert_eq!(tap(&mut app, &f, &i, choose), vec![Effect::ReadWallpaperFolder("".into())]);
 
-        let row = |name: &str, kind| FileRow { name: name.into(), kind, size: 0, modified: 0, mode: 0, uid: 0, gid: 0 };
+        let row = |name: &str, kind| FileRow { name: name.into(), name_utf8: true, kind, size: 0, modified: 0, modified_known: true, mode: 0, uid: 0, gid: 0 };
         app.set_wallpaper_folder("".into(), Ok(vec![row("DCIM", FileKind::Folder { items: None })]), 0);
         assert_eq!(tap(&mut app, &f, &i, Action::WallpaperEntry(0)), vec![Effect::ReadWallpaperFolder("DCIM".into())]);
         app.set_wallpaper_folder("DCIM".into(), Ok(vec![row("photo.jpg", FileKind::File)]), 0);
@@ -8919,6 +9078,16 @@ mod tests {
     }
 
     #[test]
+    fn the_lmi_install_page_offers_the_decrypted_internal_storage() {
+        let (f, i) = (fonts(), info());
+        let mut app = opened(Screen::Install, &f, &i);
+        app.state.block_ota_install = true;
+        app.data_waiting(None);
+        app.refresh();
+        assert!(app.frame(&f, &i).hits.iter().any(|hit| hit.action == Action::Open(Screen::Choose(Place::Storage))));
+    }
+
+    #[test]
     fn the_lmi_install_page_can_preflight_and_resend_without_starting_install() {
         let (f, i) = (fonts(), info());
         let mut app = opened(Screen::Install, &f, &i);
@@ -9871,6 +10040,47 @@ mod tests {
     }
 
     #[test]
+    fn restore_offers_decryption_before_saying_backups_are_absent() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Restore, W, H, PPD);
+        app.use_lmi_backup();
+        assert!(!app.state.data.storage_open());
+        assert!(app.frame(&f, &i).hits.iter().any(|h| h.action == Action::Open(Screen::Decrypt)));
+        assert_eq!(tap(&mut app, &f, &i, Action::Open(Screen::Decrypt)), vec![Effect::OpenData]);
+        app.data_waiting(None);
+        assert_eq!(app.back(0), vec![Effect::FindBackups { storage: true, usb: false }]);
+        assert!(!app.frame(&f, &i).hits.iter().any(|h| h.action == Action::Open(Screen::Decrypt)));
+
+        let mut with_usb = App::new(Screen::Restore, W, H, PPD);
+        with_usb.set_backups(vec![found(Place::UsbDrive, 1_792_348_260, [true; 4])]);
+        let hits = &with_usb.frame(&f, &i).hits;
+        assert!(hits.iter().any(|h| h.action == Action::Open(Screen::Decrypt)));
+        assert!(hits.iter().any(|h| h.action == Action::OpenBackup(0)), "a USB backup stays accessible");
+        with_usb.state.data = Data::Erased;
+        with_usb.refresh();
+        let hits = &with_usb.frame(&f, &i).hits;
+        assert!(!hits.iter().any(|h| h.action == Action::Open(Screen::Decrypt)), "erased data cannot be decrypted");
+        assert!(hits.iter().any(|h| h.action == Action::OpenBackup(0)));
+    }
+
+    #[test]
+    fn completing_decryption_from_restore_refreshes_its_backups() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Restore, W, H, PPD);
+        app.use_lmi_backup();
+        assert_eq!(tap(&mut app, &f, &i, Action::Open(Screen::Decrypt)), vec![Effect::OpenData]);
+        app.data_waiting(None);
+        assert_eq!(
+            tap(&mut app, &f, &i, Action::Skip),
+            vec![Effect::FindBackups { storage: true, usb: false }],
+            "the actual Done button refreshes the list when it returns to Restore"
+        );
+        assert_eq!(app.screen(), Screen::Restore);
+        app.set_backups(vec![found(Place::Storage, 1_792_348_260, [false, false, true, false])]);
+        assert!(app.frame(&f, &i).hits.iter().any(|h| h.action == Action::OpenBackup(0)));
+    }
+
+    #[test]
     fn backups_found_are_listed_newest_first_and_those_unread_last() {
         let (f, i) = (fonts(), info());
         let mut app = App::new(Screen::Home, W, H, PPD);
@@ -9887,7 +10097,7 @@ mod tests {
     fn a_backup_found_opens_to_choose_what_to_restore() {
         let (f, i) = (fonts(), info());
         let mut app = opened(Screen::Restore, &f, &i);
-        assert!(app.frame(&f, &i).hits.is_empty(), "nothing found, nothing to open");
+        assert!(!app.frame(&f, &i).hits.iter().any(|h| matches!(h.action, Action::OpenBackup(_))), "nothing found, no backup to open");
         app.set_backups(vec![found(Place::Storage, 1_792_348_260, [true, true, false, true])]);
         tap(&mut app, &f, &i, Action::OpenBackup(0));
         assert_eq!(app.screen(), Screen::RestoreBackup);
@@ -10435,7 +10645,7 @@ mod tests {
     }
 
     fn entry(name: &str, kind: FileKind) -> FileRow {
-        FileRow { name: name.into(), kind, size: 4096, modified: 1_792_348_260, mode: 0o040_755, uid: 0, gid: 0 }
+        FileRow { name: name.into(), name_utf8: true, kind, size: 4096, modified: 1_792_348_260, modified_known: true, mode: 0o040_755, uid: 0, gid: 0 }
     }
 
     /// When the tests list folders: a day after the entries changed.
@@ -10645,6 +10855,90 @@ mod tests {
     }
 
     #[test]
+    fn rename_tap_places_the_cursor_for_unicode_insert_and_backspace() {
+        let (f, i) = (fonts(), info());
+        let mut app = in_sdcard(&f, &i);
+        app.state.files.entries.as_mut().unwrap()[1].name = "猫a.zip".into();
+        hold_entry(&mut app, &f, &i, 1);
+        tap(&mut app, &f, &i, Action::RenameEntry);
+        app.frame(&f, &i);
+        let t = app.theme();
+        let x = t.m.margin + t.m.inner + Canvas::new(0, 0).text_width(&f.heading, "猫", t.m.row_title_px);
+        let y = t.m.content_top + t.m.dp(28.0);
+        app.touch(Touch::Down(x, y), &f, 3000);
+        app.touch(Touch::Up, &f, 3010);
+
+        type_text(&mut app, &f, &i, "b");
+        assert_eq!(app.state.new_name, "猫ba.zip", "typing inserts at the tapped boundary");
+        tap(&mut app, &f, &i, Action::Type(Cap::Backspace));
+        assert_eq!(app.state.new_name, "猫a.zip", "backspace removes the inserted character");
+        tap(&mut app, &f, &i, Action::Type(Cap::Backspace));
+        assert_eq!(app.state.new_name, "a.zip", "backspace removes a complete UTF-8 character");
+        assert_eq!(
+            tap(&mut app, &f, &i, Action::Type(Cap::Enter)),
+            vec![Effect::Rename { path: "/sdcard/猫a.zip".into(), name: "a.zip".into() }]
+        );
+    }
+
+    #[test]
+    fn a_long_rename_can_reach_its_start_without_splitting_utf8() {
+        let (f, i) = (fonts(), info());
+        let mut app = in_sdcard(&f, &i);
+        let name = format!("{}.zip", "猫abcdefghijklmnop".repeat(8));
+        app.state.files.entries.as_mut().unwrap()[1].name = name.clone();
+        hold_entry(&mut app, &f, &i, 1);
+        tap(&mut app, &f, &i, Action::RenameEntry);
+        let t = app.theme();
+        let x = t.m.margin + t.m.inner;
+        let y = t.m.content_top + t.m.dp(28.0);
+        for step in 0..16 {
+            app.frame(&f, &i);
+            app.touch(Touch::Down(x, y), &f, 4000 + step * 20);
+            app.touch(Touch::Up, &f, 4010 + step * 20);
+        }
+        type_text(&mut app, &f, &i, "z");
+        assert_eq!(app.state.new_name, format!("z{name}"));
+        tap(&mut app, &f, &i, Action::Type(Cap::Backspace));
+        assert_eq!(app.state.new_name, name);
+    }
+
+    #[test]
+    fn a_lossy_filename_cannot_act_on_a_valid_name_that_looks_the_same() {
+        let (f, i) = (fonts(), info());
+        let mut app = in_sdcard(&f, &i);
+        let replacement = char::from_u32(0xfffd).unwrap();
+        let filename = format!("a{replacement}.txt");
+        let valid = entry(&filename, FileKind::File);
+        let invalid = FileRow { name_utf8: false, ..valid.clone() };
+        app.set_files("/sdcard".into(), Ok(vec![invalid.clone(), valid.clone()]), LISTED);
+
+        assert!(tap(&mut app, &f, &i, Action::OpenEntry(0)).is_empty());
+        assert_eq!(app.screen(), Screen::Files, "a lossy name is not opened");
+        let (x, y) = spot(&mut app, &f, &i, Action::OpenEntry(0));
+        app.touch(Touch::Down(x, y), &f, 1000);
+        app.tick(1000 + LONG_PRESS_MS);
+        app.touch(Touch::Up, &f, 1000 + LONG_PRESS_MS);
+        assert_eq!(app.screen(), Screen::Files, "a lossy name cannot reach delete or rename");
+        assert!(app.state.file.is_none());
+        assert_eq!(
+            tap(&mut app, &f, &i, Action::OpenEntry(1)),
+            vec![Effect::OpenText(format!("/sdcard/{filename}"))],
+            "the distinct valid UTF-8 filename remains usable",
+        );
+        hold_entry(&mut app, &f, &i, 1);
+        app.set_files("/sdcard".into(), Ok(vec![invalid.clone(), valid.clone()]), LISTED + 1);
+        assert!(app.state.file.as_ref().unwrap().name_utf8, "refresh must keep the valid entry selected");
+
+        let mut picker = App::new(Screen::Choose(Place::Storage), W, H, PPD);
+        picker.data_waiting(None);
+        let picker_valid = entry(&format!("a{replacement}.zip"), FileKind::File);
+        let picker_invalid = FileRow { name_utf8: false, ..picker_valid.clone() };
+        picker.set_place(Place::Storage, String::new(), Ok(vec![picker_invalid, picker_valid]), LISTED);
+        assert!(tap(&mut picker, &f, &i, Action::ChooseEntry(0)).is_empty());
+        assert_eq!(picker.screen(), Screen::Choose(Place::Storage), "a lossy name is not installed");
+    }
+
+    #[test]
     fn renaming_takes_the_name_typed() {
         let (f, i) = (fonts(), info());
         let mut app = in_sdcard(&f, &i);
@@ -10818,6 +11112,17 @@ mod tests {
         app.set_files(drive.clone(), Ok(vec![entry("boot.img", FileKind::File)]), LISTED);
         assert_eq!(tap_at(&mut app, &f, &i, Action::OpenEntry(0), 2000), vec![Effect::InstallPath(format!("{drive}/boot.img"))]);
         assert_eq!(app.state.source, Source::Opened { drive: true }, "the page warns about pulling the drive out");
+    }
+
+    #[test]
+    fn a_local_install_error_ends_the_wait_and_returns_to_the_file_manager() {
+        let (f, i) = (fonts(), info());
+        let mut app = in_sdcard(&f, &i);
+        assert_eq!(tap(&mut app, &f, &i, Action::OpenEntry(1)), vec![Effect::InstallPath("/sdcard/a.zip".into())]);
+        let error = skyward_install::Failure::Error("Local installation is unavailable".into());
+        app.install(Event::Finished(Outcome::Failed(error)), 0);
+        tap_at(&mut app, &f, &i, Action::Back, 1000);
+        assert_eq!((app.screen(), &app.state.install), (Screen::Files, &Install::Idle));
     }
 
     #[test]

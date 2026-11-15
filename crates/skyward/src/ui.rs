@@ -54,7 +54,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// How long init may take to hand the USB port to another function: the
 /// program behind the new one has to start and get ready first.
-const USB_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const USB_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long the page shows that the work the system asked for is done
 /// before the phone starts the system or powers off.
@@ -71,8 +71,8 @@ const REST: Duration = Duration::from_secs(5);
 
 /// Where logs saved to the temporary folder go, in the recovery service's
 /// own folder, and where in internal storage the others do.
-const TMP_LOGS: &str = "/skyward/run/logs";
-const STORAGE_LOGS: &str = "Skyward/logs";
+pub(crate) const TMP_LOGS: &str = "/skyward/run/logs";
+pub(crate) const STORAGE_LOGS: &str = "Skyward/logs";
 
 /// The folder of internal storage the system saves its own screenshots in,
 /// which the gallery shows as its screenshots, and where in the recovery
@@ -181,7 +181,7 @@ fn normal_max(max: u32) -> Result<u32> {
 }
 
 /// Leave recovery for the chosen target.
-fn power(target: Target) -> Result<()> {
+pub(crate) fn power(target: Target) -> Result<()> {
     skyward_sys::power(match target {
         Target::System => Power::System,
         Target::Recovery => Power::Recovery,
@@ -195,15 +195,15 @@ fn power(target: Target) -> Result<()> {
 /// File transfer: the service offering internal storage to a computer over
 /// USB, whether it offers the storage now, and the zone, by its place in
 /// the settings, it tells the times of files in.
-struct Transfer {
-    service: skyward_mtp::Service,
+pub(crate) struct Transfer {
+    pub(crate) service: skyward_mtp::Service,
     offered: bool,
-    zone: usize,
+    pub(crate) zone: usize,
 }
 
 impl Transfer {
     /// Serve file transfer; the port offers it from when it next rests.
-    fn start(cfg: &DeviceConfig, info: &skyward_info::DeviceInfo, zone: usize) -> Result<Transfer> {
+    pub(crate) fn start(cfg: &DeviceConfig, info: &skyward_info::DeviceInfo, zone: usize) -> Result<Transfer> {
         let device = skyward_mtp::Device {
             manufacturer: cfg.device.brand.clone(),
             model: info.model.clone(),
@@ -220,7 +220,7 @@ impl Transfer {
     /// Offer internal storage, named for the computer in `lang`, or take it
     /// back. Once this returns, nothing the computer had under way in it
     /// goes on.
-    fn offer(&mut self, offer: bool, lang: Lang) -> Result<()> {
+    pub(crate) fn offer(&mut self, offer: bool, lang: Lang) -> Result<()> {
         if offer != self.offered {
             let description = skyward_ui::fmt::storage_name(lang).into();
             let storage = offer.then(|| skyward_mtp::Storage { top: PathBuf::from(skyward_crypto::data::SDCARD), description });
@@ -231,7 +231,7 @@ impl Transfer {
     }
 
     /// Stop serving: a port at rest goes back to adb alone first.
-    fn stop(self, rests: bool) -> Result<()> {
+    pub(crate) fn stop(self, rests: bool) -> Result<()> {
         skyward_sys::usb::set_mtp(false);
         let switched = if rests { skyward_sys::usb::switch("adb", USB_TIMEOUT) } else { Ok(()) };
         let stopped = self.service.stop();
@@ -242,7 +242,7 @@ impl Transfer {
 /// Take internal storage back from file transfer, if it is on, before work
 /// that erases or rewrites the data partition, or installs; whether that
 /// work can start, which the page is told otherwise.
-fn withhold(transfer: &mut Option<Transfer>, app: &mut App, now: u64) -> Result<bool> {
+pub(crate) fn withhold(transfer: &mut Option<Transfer>, app: &mut App, now: u64) -> Result<bool> {
     let Some(t) = transfer else { return Ok(true) };
     match t.offer(false, app.state.lang) {
         Ok(()) => Ok(true),
@@ -298,7 +298,7 @@ fn asked(request: &bcb::Request) -> Asked {
 }
 
 /// Read a folder for the file manager, as it is now.
-fn list(app: &mut App, folder: String) -> Result<()> {
+pub(crate) fn list(app: &mut App, folder: String) -> Result<()> {
     let files = read_folder(Path::new(&folder)).map_err(|e| format!("{e:#}"));
     app.set_files(folder, files, unix_now()?);
     Ok(())
@@ -306,7 +306,7 @@ fn list(app: &mut App, folder: String) -> Result<()> {
 
 /// Read a folder of `place` to choose a file to install in, as it is now;
 /// `folder` is its path from the place's top.
-fn list_place(app: &mut App, place: Place, folder: String) -> Result<()> {
+pub(crate) fn list_place(app: &mut App, place: Place, folder: String) -> Result<()> {
     let files = read_folder(&in_place(place, &folder)).map_err(|e| format!("{e:#}"));
     app.set_place(place, folder, files, unix_now()?);
     Ok(())
@@ -314,7 +314,7 @@ fn list_place(app: &mut App, place: Place, folder: String) -> Result<()> {
 
 /// Where `path`, from the top of `place`, is: internal storage is the
 /// owner's shared storage, where the data partition shows it.
-fn in_place(place: Place, path: &str) -> PathBuf {
+pub(crate) fn in_place(place: Place, path: &str) -> PathBuf {
     let top = match place {
         Place::Storage => Path::new(skyward_crypto::data::SDCARD),
         Place::UsbDrive => Path::new(USB_DRIVE),
@@ -331,7 +331,7 @@ fn in_place(place: Place, path: &str) -> PathBuf {
 /// what update_engine wrote while it last installed an update and what the
 /// last install script wrote, and the kernel's. Each file is owned as a
 /// copy into the folder would be. Gives the folder.
-fn export_logs(recovery: bool, kernel: bool, into: &Path, zone: usize) -> Result<PathBuf> {
+pub(crate) fn export_logs(recovery: bool, kernel: bool, into: &Path, zone: usize) -> Result<PathBuf> {
     let there = into.ancestors().find(|p| p.exists()).context("the root is always there")?;
     let ownership = ownership(there)?;
     let folder = into.join(skyward_ui::fmt::stamp(unix_now()?, zone));
@@ -362,7 +362,7 @@ fn export_logs(recovery: bool, kernel: bool, into: &Path, zone: usize) -> Result
 /// taken: into the gallery's screenshots where internal storage is open, as
 /// `storage` says, and otherwise into the recovery's own memory until it
 /// opens. Each is made as the system makes what it saves there.
-fn save_screenshot(frame: &Canvas, storage: bool, zone: usize) -> Result<Shot> {
+pub(crate) fn save_screenshot(frame: &Canvas, storage: bool, zone: usize) -> Result<Shot> {
     let (folder, shot) = match storage {
         true => (Path::new(skyward_crypto::data::SDCARD).join(SCREENSHOTS), Shot::Album),
         false => (PathBuf::from(HELD_SCREENSHOTS), Shot::Held),
@@ -384,7 +384,7 @@ fn save_screenshot(frame: &Canvas, storage: bool, zone: usize) -> Result<Shot> {
 /// Move the screenshots held while internal storage was closed into the
 /// gallery's, now that it is open: each keeps its name, and is made there
 /// as the system makes what it saves.
-fn keep_held_screenshots() -> Result<()> {
+pub(crate) fn keep_held_screenshots() -> Result<()> {
     let held = Path::new(HELD_SCREENSHOTS);
     let shots = match fs::read_dir(held) {
         Ok(entries) => entries.map(|e| e.map(|e| e.path())).collect::<std::io::Result<Vec<_>>>().with_context(|| format!("read {}", held.display()))?,
@@ -421,12 +421,13 @@ fn backups_at(place: Place) -> Result<Vec<BackupEntry>> {
     let mut found = Vec::new();
     for entry in entries {
         let entry = entry.with_context(|| format!("read {}", folder.display()))?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') || !entry.file_type().with_context(|| format!("look at {}", entry.path().display()))?.is_dir() {
+        let raw_name = entry.file_name();
+        let Some(name) = crate::entry_name::backup_name(&raw_name) else { continue };
+        if !entry.file_type().with_context(|| format!("look at {}", entry.path().display()))?.is_dir() {
             continue;
         }
         let held = skyward_backup::Manifest::read(&entry.path()).map(|m| held(&m)).map_err(|e| format!("{e:#}"));
-        found.push(BackupEntry { place, name, held });
+        found.push(BackupEntry { place, name: name.to_owned(), held });
     }
     Ok(found)
 }
@@ -557,7 +558,7 @@ fn look_for_drive(plugged: &mut Option<Plugged>, seen: &mut Option<String>) -> R
 }
 
 /// What a choice on the clash page asks of the work on files.
-fn clash_rule(choice: ClashChoice) -> skyward_files::Clash {
+pub(crate) fn clash_rule(choice: ClashChoice) -> skyward_files::Clash {
     match choice {
         ClashChoice::Replace => skyward_files::Clash::Replace,
         ClashChoice::Skip => skyward_files::Clash::Skip,
@@ -750,7 +751,7 @@ fn part_stop(stop: partwork::Stop) -> PartStop {
 /// it, and where the table lists one, it is that. /metadata keeps the key
 /// the data partition opens with, which making it afresh would lose, so it
 /// is offered no other.
-fn read_filesystems() -> Result<Vec<FsRow>> {
+pub(crate) fn read_filesystems() -> Result<Vec<FsRow>> {
     let mut rows = Vec::new();
     for (name, point) in [(DATA_PARTITION, "/data"), ("metadata", "/metadata"), ("cache", "/cache")] {
         let entries = fstab::read(point)?;
@@ -894,8 +895,12 @@ fn read_folder(path: &Path) -> Result<Vec<FileRow>> {
         } else {
             FileKind::Special
         };
-        let name = full.file_name().with_context(|| format!("{} has no name", full.display()))?.to_string_lossy().into_owned();
-        rows.push(FileRow { name, kind, size: meta.len(), modified: meta.mtime(), mode: meta.mode(), uid: meta.uid(), gid: meta.gid() });
+        let component = full.file_name().with_context(|| format!("{} has no name", full.display()))?;
+        let name_utf8 = component.to_str().is_some();
+        let name = component.to_string_lossy().into_owned();
+        let modified = meta.mtime();
+        let modified_known = meta.file_type().is_symlink() || crate::filetime::known(&full, modified);
+        rows.push(FileRow { name, name_utf8, kind, size: meta.len(), modified, modified_known, mode: meta.mode(), uid: meta.uid(), gid: meta.gid() });
     }
     rows.sort_by_key(|r| (!matches!(r.kind, FileKind::Folder { .. } | FileKind::Link { folder: true, .. }), r.name.to_lowercase()));
     Ok(rows)

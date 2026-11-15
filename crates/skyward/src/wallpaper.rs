@@ -45,9 +45,11 @@ pub fn list(root: &Path, folder: &str) -> Result<Vec<FileRow>> {
         };
         images.push(FileRow {
             name: name.into(),
+            name_utf8: true,
             kind,
             size: meta.len(),
             modified: meta.mtime(),
+            modified_known: true,
             mode: meta.mode(),
             uid: meta.uid(),
             gid: meta.gid(),

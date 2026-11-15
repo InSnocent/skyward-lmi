@@ -221,10 +221,10 @@ pub fn rows(t: &Theme, f: &Fonts, entries: &[FileRow], action: fn(usize) -> Acti
 
 /// Entry `e`'s row over the whole of `c`, sized for it: its icon, its name
 /// on up to two lines, the detail below it, and a chevron when it opens a folder.
-pub fn row(c: &mut Canvas, t: &Theme, f: &Fonts, e: &FileRow, detail: &str) {
+pub fn row(c: &mut Canvas, t: &Theme, f: &Fonts, e: &FileRow, detail: &str, wallpaper: bool) {
     let m = &t.m;
     let p = palette(t);
-    c.clear(p.page);
+    c.clear(if wallpaper { p.page.with_alpha(0) } else { p.page });
     let cy = c.h as f32 / 2.0;
     let size = m.dp(ICON_DP);
     let folder = matches!(e.kind, FileKind::Folder { .. } | FileKind::Link { folder: true, .. });
@@ -435,11 +435,11 @@ fn arrow(c: &mut Canvas, t: &Theme, x: f32, cy: f32, color: Rgba) {
 /// `top`, and the folder shown last in amber; each earlier one goes up to
 /// its folder. A path longer than the strip shows its end, as the stock
 /// strip does scrolled to it.
-pub fn strip(t: &Theme, f: &Fonts, top: &str, folder: &str) -> Pinned {
+pub fn strip(t: &Theme, f: &Fonts, top: &str, folder: &str, wallpaper: bool) -> Pinned {
     let m = &t.m;
     let p = palette(t);
     let mut c = Canvas::new(m.w, m.dp(STRIP_DP).round() as u32);
-    c.clear(p.page);
+    c.clear(if wallpaper { p.page.with_alpha(0) } else { p.page });
     let below = Path::new(folder).components().filter_map(|part| match part {
         Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
         _ => None,
@@ -607,12 +607,12 @@ mod tests {
     fn the_path_goes_up_by_its_capsules_and_shows_its_end_when_long() {
         let f = crate::font::bundled();
         let t = Theme::light(1440, 3200, 3.5);
-        let path = strip(&t, &f, "根目录", "/system/bin");
+        let path = strip(&t, &f, "根目录", "/system/bin", false);
         let ups: Vec<Action> = path.hits.iter().map(|h| h.action).collect();
         assert_eq!(ups, [Action::OpenAncestor(0), Action::OpenAncestor(1)], "the root and system go up; bin is where we are");
-        let place = strip(&t, &f, "内部存储", "Download");
+        let place = strip(&t, &f, "内部存储", "Download", false);
         assert_eq!(place.hits.iter().map(|h| h.action).collect::<Vec<_>>(), [Action::OpenAncestor(0)], "a place's top goes up");
-        let deep = strip(&t, &f, "根目录", "/data/media/0/Android/data/com.example.something.long/files/cache/images");
+        let deep = strip(&t, &f, "根目录", "/data/media/0/Android/data/com.example.something.long/files/cache/images", false);
         let last = deep.hits.last().expect("the capsules before the folder shown");
         assert!(last.rect.x + last.rect.w < t.m.w as f32, "the end shows");
         assert!(deep.hits[0].rect.x < 0.0, "the start runs off the left edge");

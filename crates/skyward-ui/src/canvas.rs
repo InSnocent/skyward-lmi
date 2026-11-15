@@ -1,5 +1,6 @@
 use crate::color::{blend_over, blend_px, Rgba};
 use crate::font::{Face, SUBPIXELS};
+use crate::geom::Rect;
 use ab_glyph::{Font, GlyphId, PxScale, ScaleFont};
 
 /// A straight-alpha RGBA8 raster target. All primitives are antialiased via
@@ -20,6 +21,8 @@ pub struct Canvas {
     bottom: u32,
     left: u32,
     span: u32,
+    card_tint: Option<Rgba>,
+    card_regions: Vec<Rect>,
 }
 
 /// How a layer covers a stretch of pixels.
@@ -92,7 +95,7 @@ impl Canvas {
                 data.extend_from_within(..data.len().min(n - data.len()));
             }
         }
-        Self { w, h, data, top, bottom, left, span }
+        Self { w, h, data, top, bottom, left, span, card_tint: None, card_regions: Vec::new() }
     }
 
     /// A canvas `w` × `h` that holds rows `rows` of it whole, as whatever
@@ -107,7 +110,7 @@ impl Canvas {
         } else {
             data.resize(n, 0);
         }
-        Self { w, h, data, top, bottom, left: 0, span: w }
+        Self { w, h, data, top, bottom, left: 0, span: w, card_tint: None, card_regions: Vec::new() }
     }
 
     /// Keep memory for `n` canvases `w` × `h`, written to once, for the
@@ -224,6 +227,7 @@ impl Canvas {
     }
 
     pub fn clear(&mut self, color: Rgba) {
+        self.card_regions.clear();
         for px in self.data.as_chunks_mut::<4>().0 {
             *px = [color.r, color.g, color.b, color.a];
         }
@@ -539,8 +543,20 @@ impl Canvas {
         self
     }
 
+    /// Record the card shapes a page draws while its wallpaper is visible.
+    pub(crate) fn track_cards(&mut self, tint: Rgba) {
+        self.card_tint = Some(tint);
+    }
+
+    pub(crate) fn card_regions(&self) -> &[Rect] {
+        &self.card_regions
+    }
+
     /// A rounded rectangle in one colour.
     pub fn fill_round_rect(&mut self, x: f32, y: f32, w: f32, h: f32, r: f32, color: Rgba) {
+        if self.card_tint == Some(color) && w > 0.0 && h > 0.0 {
+            self.card_regions.push(Rect::new(x, y, w, h));
+        }
         self.fill_round_rect_graded(x, y, w, h, r, &|_| color);
     }
 

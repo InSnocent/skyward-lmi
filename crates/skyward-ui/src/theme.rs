@@ -169,6 +169,7 @@ impl Theme {
     pub(crate) fn frosted(mut self) -> Self {
         let (alpha, detail, chevron) = if self.dark { (190, 205, 176) } else { (166, 54, 79) };
         self.pal.card = self.pal.card.with_alpha(alpha);
+        self.hero.card = self.pal.card;
         self.pal.subtitle = Rgba::rgb(detail, detail, detail);
         self.pal.value = self.pal.subtitle;
         self.pal.chevron = Rgba::rgb(chevron, chevron, chevron);

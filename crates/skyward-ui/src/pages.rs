@@ -184,7 +184,12 @@ const DUAL_BOOT: Text = ["双系统", "雙系統", "Dual boot"];
 fn sheet(cx: &Ctx, h: u32, bg: Rgba) -> Canvas {
     let w = cx.t.m.w;
     let Band { rows, cols } = cx.band.unwrap_or(Band { rows: (0, h), cols: (0, w) });
-    Canvas::band(w, h, rows.0..rows.1, cols.0..cols.1, bg)
+    let wallpaper = cx.state.wallpaper().is_some();
+    let mut canvas = Canvas::band(w, h, rows.0..rows.1, cols.0..cols.1, if wallpaper { bg.with_alpha(0) } else { bg });
+    if wallpaper && cx.state.frosted_cards {
+        canvas.track_cards(cx.t.pal.card);
+    }
+    canvas
 }
 
 fn page(cx: &Ctx) -> Canvas {
@@ -650,6 +655,9 @@ pub fn about(cx: &Ctx) -> Frame {
     // how tall it comes to, then drawn that tall.
     let (_, _, bottom) = about_cards(cx, &mut Canvas::band(m.w, m.h * 3, 0..0, 0..0, Rgba { r: 0, g: 0, b: 0, a: 0 }));
     let mut c = Canvas::new(m.w, fitted(t, bottom));
+    if cx.state.wallpaper().is_some() && cx.state.frosted_cards {
+        c.track_cards(t.hero.card);
+    }
     let (out, summary_top, bottom) = about_cards(cx, &mut c);
     let canvas = fit(c, t, bottom);
     let art = HeroArt {
@@ -1003,6 +1011,19 @@ pub fn install(cx: &Ctx) -> Frame {
     if cx.state.sideload_test || cx.state.block_ota_preflight || cx.state.block_ota_install {
         let mut rows = Vec::new();
         let mut actions = Vec::new();
+        if cx.state.block_ota_install {
+            let (subtitle, action) = if cx.state.data.storage_open() {
+                (
+                    l.pick(["选择与此 Recovery 匹配的完整 ROM", "選擇與此 Recovery 相符的完整 ROM", "Choose the full ROM matching this recovery"]),
+                    Action::Open(Screen::Choose(Place::Storage)),
+                )
+            } else {
+                (l.pick(DECRYPT_NEEDED), Action::Open(Screen::Decrypt))
+            };
+            rows.push(Row::new(l.pick(["从内部存储安装", "從內部儲存空間安裝", "Install from internal storage"]))
+                .icon(BLUE, Icon::Phone).subtitle(subtitle));
+            actions.push(action);
+        }
         let subtitle = l.pick(["在电脑上运行 adb sideload", "在電腦上執行 adb sideload", "Run adb sideload on the computer"]);
         if cx.state.block_ota_preflight {
             let title = l.pick(["ADB sideload 只读预检", "ADB sideload 唯讀預檢", "ADB sideload preflight"]);
@@ -1541,11 +1562,19 @@ pub fn installing(cx: &Ctx) -> Frame {
             let mut y = widgets::list(&mut c, t, f, top, &[standing(name, ORANGE, Icon::Install, detail)]).bottom;
             if let Some(targets) = &s.block_ota_targets {
                 y = widgets::info_card(&mut c, t, f, y + t.m.card_gap, &block_ota_facts(l, targets));
-                let note = l.pick([
-                    "安装会重建 super 并覆盖 boot，现有 Root 可能失效。确认后保持 USB 连接。",
-                    "安裝會重建 super 並覆寫 boot，現有 Root 可能失效。確認後請保持 USB 連線。",
-                    "Installation rebuilds super and replaces boot, which can remove root. Keep USB connected after confirming.",
-                ]);
+                let note = if matches!(s.source, Source::File(_) | Source::Opened { .. }) {
+                    l.pick([
+                        "安装会重建 super、覆盖 boot 并清除部分系统缓存，现有 Root 可能失效。",
+                        "安裝會重建 super、覆寫 boot 並清除部分系統快取，現有 Root 可能失效。",
+                        "Installation rebuilds super, replaces boot and clears some system caches. Root may be lost.",
+                    ])
+                } else {
+                    l.pick([
+                        "安装会重建 super 并覆盖 boot，现有 Root 可能失效。确认后保持 USB 连接。",
+                        "安裝會重建 super 並覆寫 boot，現有 Root 可能失效。確認後請保持 USB 連線。",
+                        "Installation rebuilds super and replaces boot, which can remove root. Keep USB connected after confirming.",
+                    ])
+                };
                 y = widgets::footnote(&mut c, t, f, y, note);
             } else if let Some(note) = fmt::snapshot_script_note(l, &i.snapshot) {
                 y = widgets::footnote(&mut c, t, f, y, note);
@@ -2067,9 +2096,34 @@ pub fn restore(cx: &Ctx) -> Frame {
     let mut c = long_page(cx);
     let mut out = Vec::new();
     let top = t.m.content_top;
-    let y = widgets::section_first(&mut c, t, f, top, l.pick(["备份", "備份", "Backups"]));
-    let bottom = if s.backups.is_empty() {
-        widgets::list(&mut c, t, f, y, &[Row::new(l.pick(["暂无备份", "沒有備份", "No backups"])).trail(Trail::None)]).bottom
+    let mut y = widgets::section_first(&mut c, t, f, top, l.pick(["备份", "備份", "Backups"]));
+    let locked = !s.data.storage_open();
+    if locked {
+        let erased = s.data == Data::Erased;
+        let row = if erased {
+            Row::new(l.pick(DATA_ERASED)).trail(Trail::None)
+        } else {
+            Row::new(l.pick(["内部存储尚未解密", "內部儲存空間尚未解密", "Internal storage is locked"]))
+                .subtitle(l.pick(["点击解密以查找备份", "點選解密以尋找備份", "Decrypt to look for backups"]))
+        };
+        let prompt = widgets::list(&mut c, t, f, y, &[row]);
+        if !erased {
+            out.extend(hits(&prompt.rows, &[Action::Open(Screen::Decrypt)]));
+        }
+        y = prompt.bottom;
+        if !s.backups.is_empty() || !s.data_backup_only {
+            y += t.m.card_gap;
+        }
+    }
+    let bottom = if s.backups.is_empty() && locked && s.data_backup_only {
+        y
+    } else if s.backups.is_empty() {
+        let empty = if locked {
+            l.pick(["暂无其他可显示的备份", "沒有其他可顯示的備份", "No other backups to show"])
+        } else {
+            l.pick(["暂无备份", "沒有備份", "No backups"])
+        };
+        widgets::list(&mut c, t, f, y, &[Row::new(empty).trail(Trail::None)]).bottom
     } else {
         let texts: Vec<(String, String)> = s
             .backups
@@ -3376,7 +3430,7 @@ fn listing(
         }
         (None, Ok(entries)) => Some(files::rows(t, f, entries, action)),
     };
-    let pinned = Some(files::strip(t, f, top, &folder.path));
+    let pinned = Some(files::strip(t, f, top, &folder.path, cx.state.wallpaper().is_some()));
     Frame { bg, rows, pinned, ..Frame::new(t, c, Vec::new(), title, t.m.dp(files::STRIP_TOP_DP)) }
 }
 
@@ -3396,12 +3450,12 @@ pub fn row(screen: Screen, cx: &Ctx, i: usize, c: &mut Canvas) {
                 detail = fmt::file_line(l, entry, folder.listed, cx.state.time_zone);
                 &detail
             };
-            files::row(c, cx.t, cx.f, entry, caption);
+            files::row(c, cx.t, cx.f, entry, caption, cx.state.wallpaper().is_some());
         }
-        Screen::Installing => widgets::output_row(c, cx.t, cx.f, &cx.state.script_output, i),
+        Screen::Installing => widgets::output_row(c, cx.t, cx.f, &cx.state.script_output, i, cx.state.wallpaper().is_some()),
         Screen::PartWork => {
             let work = cx.state.part_work.as_ref().expect("the page of partition work shows work");
-            widgets::output_row(c, cx.t, cx.f, &work.output, i)
+            widgets::output_row(c, cx.t, cx.f, &work.output, i, cx.state.wallpaper().is_some())
         }
         other => unreachable!("{other:?} draws no list row by row"),
     }
@@ -3435,7 +3489,7 @@ pub fn file_info(cx: &Ctx) -> Frame {
             facts.push((l.pick(["大小", "大小", "Size"]), tr!(l, "{size}（{bytes} 字节）", "{size}（{bytes} 位元組）", "{size} ({bytes} bytes)")))
         }
     }
-    facts.push((l.pick(["修改时间", "修改時間", "Modified"]), fmt::datetime(l, e.modified, s.time_zone)));
+    facts.push((l.pick(["修改时间", "修改時間", "Modified"]), fmt::file_modified(l, e, s.time_zone)));
     let (mode, uid, gid) = (fmt::mode(e.mode), e.uid, e.gid);
     facts.push((l.pick(PERMISSIONS), tr!(l, "{mode}，所有者 {uid}，用户组 {gid}", "{mode}，擁有者 {uid}，群組 {gid}", "{mode}, owner {uid}, group {gid}")));
     let y = widgets::info_card(&mut c, t, f, top, &facts);
@@ -3524,7 +3578,7 @@ pub fn rename(cx: &Ctx) -> Frame {
     let mut c = page(cx);
     let mut out = Vec::new();
     let top = t.m.content_top;
-    let (y, caret) = widgets::text_field(&mut c, t, f, top, &s.new_name);
+    let (y, caret) = widgets::editable_text_field(&mut c, t, f, top, &s.new_name, s.new_name_cursor);
     widgets::footnote(&mut c, t, f, y, l.pick(["名称不能包含\"/\"。点击「完成」保存。", "名稱不能包含「/」。點選「完成」儲存。", "A name can't hold “/”. Tap Done to save it."]));
     keyboard_hits(&mut c, t, f, s, l.pick(DONE), &mut out);
     Frame { caret: Some(caret), ..Frame::new(t, c, out, l.pick(RENAME), top) }

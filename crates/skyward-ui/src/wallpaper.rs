@@ -128,27 +128,31 @@ impl Wallpaper {
             .data
             .chunks_exact_mut(stride)
             .zip(self.pixels.chunks_exact(stride));
-        let mut cards = cards.iter().peekable();
         let glass_strength = (u32::from(opacity) * 255 + 50) / 100;
         let bg = theme.pal.bg;
+        let mut spans = Vec::new();
         for (y, (out, photo)) in rows.enumerate() {
             let out = out.as_chunks_mut::<4>().0;
             let photo = photo.as_chunks::<4>().0;
             let strength = theme_strength(theme, y as f32, opacity);
             let page_y = y as f32 + scroll as f32 + 0.5;
-            while cards
-                .peek()
-                .is_some_and(|card| page_y > card.y + card.h + 1.0)
-            {
-                cards.next();
+            spans.clear();
+            for card in cards {
+                if page_y >= card.y - 1.0 && page_y <= card.y + card.h + 1.0 {
+                    let left = ((card.x - 1.0).floor() as usize).min(out.len());
+                    let right = ((card.x + card.w + 1.0).ceil() as usize).clamp(left, out.len());
+                    spans.push((left, right));
+                }
             }
-            if let Some(card) = cards.peek().filter(|card| page_y >= card.y - 1.0) {
-                let left = ((card.x - 1.0).floor() as usize).min(out.len());
-                let right = ((card.x + card.w + 1.0).ceil() as usize).clamp(left, out.len());
-                composite_wallpaper(&mut out[..left], &photo[..left], bg, strength);
-                let blurred = self.blurred[y * stride..(y + 1) * stride]
-                    .as_chunks::<4>()
-                    .0;
+            spans.sort_unstable();
+            let blurred = self.blurred[y * stride..(y + 1) * stride].as_chunks::<4>().0;
+            let mut end = 0;
+            for (left, right) in spans.iter().copied() {
+                let left = left.max(end);
+                if left >= right {
+                    continue;
+                }
+                composite_wallpaper(&mut out[end..left], &photo[end..left], bg, strength);
                 for ((pixel, sharp), blurred) in out[left..right]
                     .iter_mut()
                     .zip(&photo[left..right])
@@ -159,8 +163,7 @@ impl Wallpaper {
                         continue;
                     }
                     let glass = themed_pixel(*blurred, bg, glass_strength);
-                    // At a rounded edge the card's raster coverage falls
-                    // below the full tint. Fade the blur by the same amount.
+                    // Fade the blur along the rounded card's antialiased edge.
                     let tint = u32::from(theme.pal.card.a);
                     if u32::from(alpha) < tint {
                         *pixel = themed_pixel(*sharp, bg, strength);
@@ -171,10 +174,9 @@ impl Wallpaper {
                     }
                     blend_px(pixel, Rgba::rgb(r, g, b), u32::from(alpha));
                 }
-                composite_wallpaper(&mut out[right..], &photo[right..], bg, strength);
-            } else {
-                composite_wallpaper(out, photo, bg, strength);
+                end = right;
             }
+            composite_wallpaper(&mut out[end..], &photo[end..], bg, strength);
         }
     }
 
@@ -273,6 +275,20 @@ mod tests {
             image.pixels[image.pixels.len() - 2] > 220,
             "blue at the bottom"
         );
+    }
+
+    #[test]
+    fn all_side_by_side_cards_are_blurred() {
+        let sharp = [220u8, 20, 20, 255].repeat(8);
+        let blurred = [20u8, 20, 220, 255].repeat(8);
+        let image = Wallpaper { width: 8, height: 1, pixels: sharp.into(), blurred: blurred.into() };
+        let theme = Theme::light(8, 1, 1.0).frosted();
+        let mut canvas = Canvas::new(8, 1);
+        canvas.fill_rect(0.0, 0.0, 2.0, 1.0, theme.pal.card);
+        canvas.fill_rect(5.0, 0.0, 2.0, 1.0, theme.pal.card);
+        let cards = [Rect::new(5.0, 0.0, 2.0, 1.0), Rect::new(0.0, 0.0, 2.0, 1.0)];
+        image.show_behind(&mut canvas, &theme, 100, &cards, 0);
+        assert_eq!(&canvas.data[0..4], &canvas.data[5 * 4..6 * 4]);
     }
 
     #[test]

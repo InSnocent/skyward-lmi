@@ -4,7 +4,7 @@
 
 English | [简体中文](README.zh-CN.md)
 
-An unofficial preview of Skyward Recovery for the Redmi K30 Pro (`lmi`). This port builds on Skyward, the Android recovery written in Rust. [Upstream Skyward](https://github.com/kirklin/skyward)
+An unofficial preview of Skyward Recovery for the Redmi K30 Pro (`lmi`). This port builds on Skyward, the Android recovery written in Rust. The features below describe the current source; previously released or installed images may not include the latest changes. [Upstream Skyward](https://github.com/kirklin/skyward)
 
 ## Screenshots
 
@@ -24,7 +24,7 @@ Enter the Android lock-screen PIN on the Decrypt page to unlock internal storage
 
 ### Installation preflight
 
-The **ADB sideload preflight** verifies the matching Infinity-X update ZIP's signature and SHA-256, then lists the target partitions. Reinstalling that exact ROM was tested with an earlier installer build. [Sideload and reinstall details](docs/lmi.zh-CN.md#临时启动与同版重装)
+The **ADB sideload preflight** verifies the matching Infinity-X update ZIP's signature and SHA-256, then lists the target partitions. The same ZIP can also be selected from decrypted internal storage: validation through the confirmation screen and a non-writing mock package have been tested on-device, while actual local ROM installation has not. Reinstalling that exact ROM over ADB sideload was tested with an earlier installer build; root was lost and the original Recovery returned afterward. [Sideload and reinstall details](docs/lmi.zh-CN.md#临时启动与同版重装)
 
 ### Backup and restore
 
@@ -32,22 +32,23 @@ Back up and verify the supported contents of `/data`. Backups appear on the Rest
 
 ### Wallpaper and appearance
 
-After decryption, import a JPG or PNG from internal storage and set its opacity from 5% to 100%. The **Frosted cards** switch applies to Home and Settings in both themes. Skyward loads the saved wallpaper and switch setting after decryption.
+After decryption, import a JPG or PNG from internal storage and set its opacity from 5% to 100%. The **Frosted cards** switch applies to the main pages in both themes. Skyward loads the saved wallpaper and switch setting after decryption.
 
 ### Other features
 
 - Touch, screen brightness and vibration control.
 - Read-only inspection of the system's logical partitions.
 - Reboot to Android from the Recovery menu.
+- Browse decrypted internal storage in the file manager; rename and copy have been tested with a sample file. The terminal, USB file transfer (MTP), log export and screenshots have received basic device testing.
 
 ## Current limitations
 
 Some upstream menu entries still appear. An unavailable action displays “Unavailable in the UI preview.”
 
-- **Advanced tools.** The file manager, terminal, USB file transfer (MTP), log export, screenshot shortcut and SELinux relabeling are pending. The Wallpaper page has its own image picker.
+- **Advanced tools.** Other file manager write operations and large file sets need further testing. Names containing non-UTF-8 bytes are shown but cannot be operated on in the GUI; MTP omits names with non-UTF-8 bytes or longer than its protocol can represent. MTP temporarily withdraws internal storage during file writes, text editing and terminal jobs. Background processes that deliberately leave the terminal session cannot be fully tracked; ensure they have stopped before backup, restore or installation. SELinux relabeling is not yet adapted.
 - **Maintenance and reboot.** Data wipe, factory reset, filesystem checks, repair and formatting are pending. The Mount page shows the logical system partitions read-only. The Reboot menu can return to Android.
-- **Installation.** ADB sideload installation accepts the matching full Infinity-X ZIP. General ZIP or IMG flashing, installation from internal storage or a USB drive, online updates and dual boot are pending.
-- **Backup and restore.** Backups of `/data` go to internal storage. A full `/data` restore and migration from another ROM still need device testing. Skyward refuses to restore backups tied to the old encryption key after a factory reset.
+- **Installation.** ADB sideload and internal storage accept only the matching full Infinity-X ZIP. Actual installation from internal storage has not been tested. General ZIP or IMG flashing, installation from a USB drive, online updates and dual boot are not yet adapted.
+- **Backup and restore.** Backups of `/data` go to internal storage; backup directories containing non-UTF-8 bytes are not listed. A full `/data` restore and migration from another ROM still need device testing. Skyward refuses to restore backups tied to the old encryption key after a factory reset.
 - **Settings.** Language, theme, brightness and vibration settings last for the current Recovery session. Unlocking storage loads the saved wallpaper, opacity and frosted cards setting.
 
 ## Supported device

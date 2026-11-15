@@ -125,9 +125,11 @@ fn run(name: &str, f: &Fonts, i: &DeviceInfo, quiet: bool) {
             let mut p = Panel::new(Screen::Files, f, i, quiet);
             let many = (0..5000).map(|k| FileRow {
                 name: format!("IMG_{k:05}.jpg"),
+                name_utf8: true,
                 kind: FileKind::File,
                 size: 4_200_000,
                 modified: 1_792_348_260,
+                modified_known: true,
                 mode: 0o100_644,
                 uid: 1023,
                 gid: 1023,

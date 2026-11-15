@@ -20,24 +20,41 @@ pub fn prepare() -> Result<()> {
     Ok(())
 }
 
-/// Close data and unmount the dependencies of the executable system mounts.
-pub fn finish() -> Result<()> {
+fn stop_services() -> Result<()> {
     let mut services = SERVICES.lock().expect("the lmi services lock is not poisoned");
     if let Some(active) = services.as_mut() {
         active.stop()?;
         *services = None;
     }
-    skyward_crypto::data::close()?;
-    for (name, point) in [("modem", crate::FIRMWARE_SHOWN), ("modem", "/vendor/firmware_mnt"), ("metadata", "/metadata")] {
-        let path = Path::new(point);
-        if let Some(mounted) = mount::visible(path)? {
-            let partition = Path::new(skyward_block::BY_NAME).join(name);
-            let device = skyward_block::devnum(&partition)?;
-            ensure!(mounted.device == device, "unexpected filesystem mounted at {point}");
-            mount::umount(path)?;
-        }
+    Ok(())
+}
+
+fn unmount_partition(name: &str, point: &str) -> Result<()> {
+    let path = Path::new(point);
+    if let Some(mounted) = mount::visible(path)? {
+        let partition = Path::new(skyward_block::BY_NAME).join(name);
+        let device = skyward_block::devnum(&partition)?;
+        ensure!(mounted.device == device, "unexpected filesystem mounted at {point}");
+        mount::umount(path)?;
     }
     Ok(())
+}
+
+/// Stop the installed services and firmware mounts while leaving data open
+/// for an OTA package being read from internal storage.
+pub fn stop_for_local_install() -> Result<()> {
+    stop_services()?;
+    unmount_partition("modem", crate::FIRMWARE_SHOWN)?;
+    unmount_partition("modem", "/vendor/firmware_mnt")
+}
+
+/// Close data and unmount the dependencies of the executable system mounts.
+pub fn finish() -> Result<()> {
+    stop_services()?;
+    skyward_crypto::data::close()?;
+    unmount_partition("modem", crate::FIRMWARE_SHOWN)?;
+    unmount_partition("modem", "/vendor/firmware_mnt")?;
+    unmount_partition("metadata", "/metadata")
 }
 
 fn start() -> Result<crate::services::Managed> {

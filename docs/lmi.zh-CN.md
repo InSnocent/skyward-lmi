@@ -18,6 +18,13 @@
 | 测试应用恢复 | 使用与完整备份相同的归档和恢复代码。删除测试应用的私有文件、SharedPreferences 和 SQLite 数据库后，从备份写回 F2FS。三份文件的 SHA-256、权限、所有者和 SELinux 标签均与原件一致，Android 重启后由应用自身读取通过 |
 | 合版 Recovery | 原 PIN 解密后可识别已有备份。以上述 ROM 通过只读 sideload，报告列出 5 个逻辑分区和 4 个独立分区。刷入合版后，音量上＋电源冷启动、查看备份和返回 Infinity-X 均通过，SukiSU Root 可用 |
 | 壁纸与毛玻璃版 | 各测试版分别验证了壁纸导入、两种主题、滚动、重启后解密恢复，以及状态栏和 5% 下限。最新版刷入后从 Android 回读的 `recovery` 分区哈希与镜像一致，Infinity-X 和 SukiSU Root 可用 |
+| 临时功能版 | 临时启动后验证了安装、备份和高级等页面的壁纸与毛玻璃；文件管理浏览、终端的 `pwd`、`ls`、`cd`、MTP 文件传输、日志导出与截图可用。仅测试过指定样本的文件日期和损坏 ZIP 的失败返回 |
+| 内部存储预检 | 解密后从内部存储选择匹配的 Infinity-X ZIP，通过签名、SHA-256 和分区清单检查，在确认写入前返回；实际本地安装写入尚未验证 |
+| 内部存储模拟安装 | 使用独立测试证书和无真实分区目标的模拟 ZIP，确认后释放逻辑分区映射，测试脚本仍能读取内部存储标记和安装包；正式 ROM 的本地写入尚未验证 |
+| 虚拟目录与重命名光标 | `/config` 的 configfs 原始时间戳为 1，界面显示时间未知且详情保留原始值；重命名时点击中间位置插入字符通过真机验证 |
+| 测试文件操作 | 使用单独测试文件完成重命名和复制，通过 MTP 回读后，两份文件的 SHA-256 均与原文件一致；其他文件写入操作仍需验证 |
+| 特殊文件名与 MTP 互斥 | 非 UTF-8 测试名称被图形界面拦截，同显示名称的合法文件可打开。终端运行时 MTP 撤出存储，退出后恢复；MTP 开启时重命名测试文件，恢复后回读的 SHA-256 与原件一致 |
+| 恢复页解密提示版 | 未解密时进入恢复页，点击提示完成解密；点「完成」后无需重新进入，即可看到已有备份。只查看，未执行整份恢复。刷入后音量上＋电源冷启动、返回 Android、Recovery 分区哈希和 SukiSU Root 核对通过 |
 
 实机验证范围限于上述 Redmi K30 Pro 和 Infinity-X 构建。合版验证了只读预检以及解密服务和挂载的正常释放。实际 ROM 写入由此前的安装版验证。未接通的菜单和完整恢复的限制见首页。 [当前限制](../README.zh-CN.md#当前限制)
 
@@ -43,7 +50,9 @@
 4. 两个入口均核对原 Infinity-X Recovery 的 OTA 签名和固定的 ZIP SHA-256。只读预检显示分区清单后结束。安装系统会继续显示滑动确认，开始后请保持 USB 连接，直到显示「安装成功」，再选「重启到系统」。
 5. 用原 PIN 解锁，并核对共享存储和应用资料。如需恢复 Root，使用与这个构建匹配的 SukiSU boot，先临时启动验证，再刷入 `boot` 并重启复测。 [Infinity-X lmi 项目](https://github.com/InSnocent/infinityx-lmi)
 
-重装会重建 `super` 中的逻辑分区，并覆盖 `boot`、`dtbo`、`vbmeta` 和 `vbmeta_system`。滑动确认后，Skyward 停止解密服务、关闭数据分区并释放自己的逻辑分区映射，再将写入交给 ROM 自带的 `update-binary`。流程没有格式化步骤。使用 `fastboot boot` 临时启动后，重启进 Recovery 会进入手机已安装的 Recovery。若安装结果页报错，保留画面和 USB 连接以便排查。 [AOSP 的非 A/B 动态分区 OTA 文档](https://source.android.com/docs/core/ota/dynamic_partitions/nonab)
+重装会重建 `super` 中的逻辑分区，并覆盖 `boot`、`dtbo`、`vbmeta` 和 `vbmeta_system`。ADB sideload 确认后，Skyward 停止解密服务、关闭数据分区并释放自己的逻辑分区映射，再将写入交给 ROM 自带的 `update-binary`。流程没有格式化步骤。实际同版重装后，SukiSU 失效，原 Recovery 再次出现；如需继续使用，应重新验证并刷入配套的 Root 镜像和 Skyward。
+
+内部存储安装需要保持数据分区打开以读取 ZIP；ROM 的脚本会清除部分系统缓存。此路径已验证到确认页面，实际 ROM 写入尚未验证。使用 `fastboot boot` 临时启动后，重启进 Recovery 会进入手机已安装的 Recovery。若安装结果页报错，保留画面和 USB 连接以便排查。 [AOSP 的非 A/B 动态分区 OTA 文档](https://source.android.com/docs/core/ota/dynamic_partitions/nonab)
 
 ## 数据备份
 
@@ -127,6 +136,10 @@ sha256sum skyward-lmi.img
 
 | 文件 | 实机测试或构建输入的 SHA-256 |
 | --- | --- |
+| `lmi-skyward-restore-refresh-test-v9.img`（恢复页解密提示版） | `b09840c4f0585c2c021b6ca6d9ce3dc0bd93da527ffb1e5893eb9c95bce5c5e1` |
+| `lmi-skyward-features-global-test-v2.img`（临时功能版） | `f890cc4e12c3a28519b33d4dbfef139bbbf312dcc4e2edc8fa3363b0cc881d33` |
+| `lmi-skyward-security-test-v6.img`（临时文件与 MTP 测试版） | `b76bc2e35619fb3af88703fd4ea736ebf4abebba87f5701b0180df7d856f948f` |
+| `lmi-skyward-local-ota-test.img`（临时本地安装预检版） | `1242fe80965d14537a71af3a91cebae9fa58050d04111000976174fb40fc85c0` |
 | `lmi-skyward-frosted-wallpaper-tuned.img`（壁纸与毛玻璃版） | `128b7d7cb3666b3834b9327867cebb6c3f20cec8b4aeb9cb5e5d8961a315299f` |
 | `lmi-skyward-merged-candidate.img`（早期合版） | `8e196a8806aa2161ce44c7ffd01d84206b9c58c00de5f46fa7322edd3ee5c477` |
 | `lmi-skyward-data-backup-preview-v3.img`（临时数据备份版） | `1a016e734a190da8a5b09e008ba80b41ab559b18e7c9c0e9624cb67ba66cdd20` |

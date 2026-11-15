@@ -1374,6 +1374,98 @@ fn draw_text_field(c: &mut Canvas, t: &Theme, f: &Fonts, x0: f32, top: f32, text
     at
 }
 
+/// The part of an editable text field that fits around its cursor.
+struct EditableField {
+    rect: Rect,
+    text_x: f32,
+    start: usize,
+    end: usize,
+    cursor: usize,
+}
+
+/// A byte position that never splits a UTF-8 character.
+pub(crate) fn text_boundary(text: &str, offset: usize) -> usize {
+    let mut at = offset.min(text.len());
+    while !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    at
+}
+
+/// Keep the cursor and as much surrounding text as possible in the card.
+fn editable_field(t: &Theme, f: &Fonts, x0: f32, top: f32, text: &str, cursor: usize) -> EditableField {
+    let m = &t.m;
+    let (w, h) = (m.w as f32 - m.margin * 2.0, m.dp(56.0));
+    let rect = Rect::new(x0, top, w, h);
+    let text_x = x0 + m.inner;
+    let room = (w - m.inner * 2.0 - m.dp(4.0)).max(0.0);
+    let cursor = text_boundary(text, cursor);
+    let mut edges: Vec<usize> = text.char_indices().map(|(at, _)| at).collect();
+    edges.push(text.len());
+    let mut left = edges.partition_point(|&at| at < cursor);
+    let mut right = left;
+    let measure = Canvas::new(0, 0);
+    loop {
+        let mut grew = false;
+        if left > 0 && measure.text_width(&f.heading, &text[edges[left - 1]..edges[right]], m.row_title_px) <= room {
+            left -= 1;
+            grew = true;
+        }
+        if right + 1 < edges.len() && measure.text_width(&f.heading, &text[edges[left]..edges[right + 1]], m.row_title_px) <= room {
+            right += 1;
+            grew = true;
+        }
+        if !grew {
+            break;
+        }
+    }
+    EditableField { rect, text_x, start: edges[left], end: edges[right], cursor }
+}
+
+/// A single-line card whose cursor can stand inside the text.
+pub fn editable_text_field(c: &mut Canvas, t: &Theme, f: &Fonts, top: f32, text: &str, cursor: usize) -> (f32, Caret) {
+    let at = draw_editable_text_field(c, t, f, t.m.margin, top, text, cursor, false);
+    let caret = caret_over(at, |art, dx, dy| {
+        draw_editable_text_field(art, t, f, t.m.margin - dx, top - dy, text, cursor, true);
+    });
+    (top + t.m.dp(56.0), caret)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_editable_text_field(
+    c: &mut Canvas, t: &Theme, f: &Fonts, x0: f32, top: f32, text: &str, cursor: usize, caret: bool,
+) -> Rect {
+    let view = editable_field(t, f, x0, top, text, cursor);
+    let m = &t.m;
+    c.fill_round_rect(view.rect.x, view.rect.y, view.rect.w, view.rect.h, m.card_radius, t.pal.card);
+    let before = &text[view.start..view.cursor];
+    let shown = &text[view.start..view.end];
+    let at = self::cursor(t, f, view.text_x + c.text_width(&f.heading, before, m.row_title_px), top + view.rect.h / 2.0, m.row_title_px);
+    if caret {
+        c.fill_round_rect(at.x, at.y, at.w, at.h, m.dp(CARET_RADIUS_DP), t.pal.accent);
+    }
+    c.text_vc(&f.heading, shown, view.text_x, top + view.rect.h / 2.0, m.row_title_px, t.pal.text, None);
+    at
+}
+
+/// The character boundary nearest a tap on the visible part of a field.
+pub fn editable_text_position(t: &Theme, f: &Fonts, top: f32, text: &str, cursor: usize, x: f32, y: f32) -> Option<usize> {
+    let view = editable_field(t, f, t.m.margin, top, text, cursor);
+    if !view.rect.contains(x, y) {
+        return None;
+    }
+    let measure = Canvas::new(0, 0);
+    let mut best = (view.start, (x - view.text_x).abs());
+    for offset in text[view.start..view.end].char_indices().skip(1).map(|(at, _)| view.start + at).chain(std::iter::once(view.end)) {
+        let px = view.text_x + measure.text_width(&f.heading, &text[view.start..offset], t.m.row_title_px);
+        let distance = (x - px).abs();
+        if distance < best.1 {
+            best = (offset, distance);
+        }
+    }
+    Some(best.0)
+}
+
 /// A full-width button in the accent colour, for a page's one action that
 /// destroys nothing. Returns its rect.
 pub fn button(c: &mut Canvas, t: &Theme, f: &Fonts, top: f32, label: &str) -> Rect {
@@ -2474,13 +2566,13 @@ pub fn output_edges(c: &Canvas, t: &Theme, f: &Fonts, top: f32, lines: &[String]
 /// Line `i` of `lines` over the whole of `c`, as its row of the card
 /// [`output_edges`] lays out. The card runs on past each end of the row
 /// that it goes on from, so only its first and last rows round it.
-pub fn output_row(c: &mut Canvas, t: &Theme, f: &Fonts, lines: &[String], i: usize) {
+pub fn output_row(c: &mut Canvas, t: &Theme, f: &Fonts, lines: &[String], i: usize, wallpaper: bool) {
     let m = &t.m;
     let pitch = m.dp(OUTPUT_PITCH_DP);
     let (base, above, _) = output_layout(t, f);
     let y0 = if i == 0 { 0.0 } else { -m.card_radius };
     let y1 = c.h as f32 + if i + 1 == lines.len() { 0.0 } else { m.card_radius };
-    c.clear(t.pal.bg);
+    c.clear(if wallpaper { t.pal.bg.with_alpha(0) } else { t.pal.bg });
     c.fill_round_rect(m.margin, y0, m.w as f32 - 2.0 * m.margin, y1 - y0, m.card_radius, t.pal.card);
     let (face, parts) = output_line(c, t, f, &lines[i]);
     let first = base + if i == 0 { above } else { 0.0 };
