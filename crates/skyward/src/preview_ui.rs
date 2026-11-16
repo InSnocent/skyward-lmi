@@ -11,7 +11,7 @@ use skyward_config::{ramdisk, DeviceConfig};
 use skyward_install::{block_preflight, sideload_test, Event as InstallEvent, Installer};
 use skyward_ui::app::{BackupAt, Data, Effect, FileOp, FileTask, JobEnd, MountRow, Place, RenameRefused, Screen, Target};
 use skyward_ui::surface::kms::KmsSurface;
-use skyward_ui::wallpaper::Wallpaper;
+use skyward_ui::wallpaper::{Wallpaper, WallpaperCrop};
 use skyward_ui::{App, Canvas, Fonts, Lang, Surface};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
@@ -103,7 +103,7 @@ fn exercise(cfg: &DeviceConfig, inspect: bool) -> Result<()> {
         shell: None,
         terminal_sessions: Vec::new(),
         terminal_check_at: 0,
-        wallpaper_import: None,
+        wallpaper_job: None,
         fixture_started: false,
         job: None,
         closed: Vec::new(),
@@ -138,7 +138,7 @@ fn exercise(cfg: &DeviceConfig, inspect: bool) -> Result<()> {
                 backlight = None;
             }
         }
-        let max_wait = if data.wallpaper_import.is_some() { 50 } else { 1000 };
+        let max_wait = if data.wallpaper_job.is_some() { 50 } else { 1000 };
         let millis = app.deadline(now).map_or(max_wait, |due| due.saturating_sub(now).clamp(1, max_wait as u64) as i32);
         let fds = [inputs.fd()].into_iter()
             .chain(installer.as_ref().map(Installer::fd))
@@ -227,10 +227,12 @@ fn exercise(cfg: &DeviceConfig, inspect: bool) -> Result<()> {
                 ]), now);
             }
         }
-        if let Some(job) = data.wallpaper_import.take_if(|job| job.is_finished()) {
-            let result = job.join().unwrap_or_else(|_| Err(anyhow::anyhow!("the wallpaper import stopped")));
-            let result = result.map_err(|error| wallpaper_error(&app, &error));
-            app.wallpaper_imported(result, monotonic_ms());
+        if let Some(job) = data.wallpaper_job.take_if(|job| job.is_finished()) {
+            let now = monotonic_ms();
+            match job {
+                WallpaperJob::Prepare(job) => app.wallpaper_prepared(wallpaper_result(&app, job), now),
+                WallpaperJob::Save(job) => app.wallpaper_applied(wallpaper_result(&app, job), now),
+            }
         }
         if let Some(ended) = data.job.as_ref().and_then(Decryptor::ended) {
             let was_open = app.state.data.storage_open();
@@ -371,6 +373,26 @@ fn hardware_error(app: &mut App, name: &str, error: &anyhow::Error, now: u64) {
     app.report(&message, now);
 }
 
+enum WallpaperJob {
+    Prepare(JoinHandle<Result<WallpaperCrop>>),
+    Save(JoinHandle<Result<Wallpaper>>),
+}
+
+impl WallpaperJob {
+    fn is_finished(&self) -> bool {
+        match self {
+            Self::Prepare(job) => job.is_finished(),
+            Self::Save(job) => job.is_finished(),
+        }
+    }
+}
+
+fn wallpaper_result<T>(app: &App, job: JoinHandle<Result<T>>) -> Result<T, String> {
+    job.join()
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("the wallpaper task stopped")))
+        .map_err(|error| wallpaper_error(app, &error))
+}
+
 struct DataWork {
     enabled: bool,
     install_committed: bool,
@@ -383,7 +405,7 @@ struct DataWork {
     shell: Option<pty::Shell>,
     terminal_sessions: Vec<u32>,
     terminal_check_at: u64,
-    wallpaper_import: Option<JoinHandle<Result<Wallpaper>>>,
+    wallpaper_job: Option<WallpaperJob>,
     fixture_started: bool,
     job: Option<Decryptor>,
     closed: Vec<Closed>,
@@ -443,7 +465,7 @@ impl DataWork {
     }
 
     fn tasks_idle(&self) -> bool {
-        self.backuper.is_none() && self.files.is_none() && self.job.is_none() && self.wallpaper_import.is_none()
+        self.backuper.is_none() && self.files.is_none() && self.job.is_none() && self.wallpaper_job.is_none()
     }
 
     fn idle(&self) -> bool {
@@ -595,23 +617,34 @@ fn handle(
                     .map_err(|error| format!("{error:#}"));
                 app.set_wallpaper_folder(folder, listed, crate::ui::unix_now()?);
             }
-            Effect::ImportWallpaper(path) if data.data_backup => {
+            Effect::PrepareWallpaper(path) if data.data_backup => {
+                let started = (|| -> Result<_> {
+                    let root = data.wallpaper_storage(app, installer)?;
+                    ensure!(crate::ui::withhold(&mut data.transfer, app, now)?, "file transfer still holds internal storage");
+                    let screen = app.theme().m;
+                    Ok(thread::Builder::new().name("wallpaper".into()).spawn(move || {
+                        wallpaper::prepare(root, &path, (screen.w, screen.h))
+                    })?)
+                })();
+                match started {
+                    Ok(job) => data.wallpaper_job = Some(WallpaperJob::Prepare(job)),
+                    Err(error) => app.wallpaper_prepared(Err(wallpaper_error(app, &error)), now),
+                }
+            }
+            Effect::SaveWallpaper if data.data_backup => {
                 let started = (|| -> Result<_> {
                     let root = data.wallpaper_storage(app, installer)?;
                     ensure!(crate::ui::withhold(&mut data.transfer, app, now)?, "file transfer still holds internal storage");
                     let ownership = crate::ui::ownership(root)?;
-                    let screen = app.theme().m;
                     let opacity = app.wallpaper_opacity();
+                    let crop = app.wallpaper_crop().cloned().context("select a picture first")?;
                     Ok(thread::Builder::new().name("wallpaper".into()).spawn(move || {
-                        wallpaper::import(root, &path, opacity, (screen.w, screen.h), ownership)
+                        wallpaper::apply(root, &crop, opacity, ownership)
                     })?)
                 })();
                 match started {
-                    Ok(job) => data.wallpaper_import = Some(job),
-                    Err(error) => {
-                        let message = wallpaper_error(app, &error);
-                        app.wallpaper_imported(Err(message), now);
-                    }
+                    Ok(job) => data.wallpaper_job = Some(WallpaperJob::Save(job)),
+                    Err(error) => app.wallpaper_applied(Err(wallpaper_error(app, &error)), now),
                 }
             }
             Effect::SaveWallpaperOpacity { before, after } if data.data_backup => {

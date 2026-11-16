@@ -32,7 +32,7 @@ Back up and verify the supported contents of `/data`. Backups appear on the Rest
 
 ### Wallpaper and appearance
 
-After decryption, import a JPG or PNG from internal storage and set its opacity from 5% to 100%. The **Frosted cards** switch applies to the main pages in both themes. Skyward loads the saved wallpaper and switch setting after decryption.
+After decryption, choose a JPG or PNG from internal storage. Drag and zoom the picture to frame it for the screen. The dimmed part outside the frame provides a reference as you adjust the crop. Tap **Apply wallpaper** to save. Wallpaper opacity ranges from 5% to 100%. The **Frosted cards** switch applies to the main pages in both themes. Skyward loads the saved wallpaper and switch setting after decryption.
 
 ### Other features
 

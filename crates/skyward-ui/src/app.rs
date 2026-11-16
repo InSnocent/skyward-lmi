@@ -18,7 +18,7 @@ use crate::settings::Settings;
 use crate::term::{self, Term, TermKey};
 use crate::theme::Theme;
 use crate::tr;
-use crate::wallpaper::{opacity_level, opacity_percent, Wallpaper, DEFAULT_OPACITY, MIN_OPACITY};
+use crate::wallpaper::{opacity_level, opacity_percent, Wallpaper, WallpaperCrop, DEFAULT_OPACITY, MIN_OPACITY};
 use crate::widgets::{self, Bar, Bolt, Cap, Layer, WlanMark};
 use skyward_info::DeviceInfo;
 use skyward_install::{Event, ImageKind, Outcome, Reflash, Refusal, Stage};
@@ -38,6 +38,7 @@ pub enum Screen {
     Settings,
     Wallpaper,
     PickWallpaper,
+    CropWallpaper,
     Reboot,
     Wipe,
     /// Mounting and unmounting the slot's partitions.
@@ -543,6 +544,7 @@ pub enum Slider {
     /// How strongly the motor taps.
     Vibration,
     WallpaperOpacity,
+    WallpaperZoom,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1255,6 +1257,7 @@ pub enum Action {
     /// in, or the file to install.
     ChooseEntry(usize),
     WallpaperEntry(usize),
+    ApplyWallpaper,
     ResetWallpaper,
     /// Go up to the folder this many levels below the top of the list
     /// shown, by its place in the path shown over the list.
@@ -1373,6 +1376,8 @@ pub struct Frame {
     /// rows: a drag on it scrolls through what it holds, rather than moving
     /// the page.
     pub scrollback: Option<(Rect, f32)>,
+    /// The draggable preview area and the crop frame inside it.
+    pub(crate) wallpaper_preview: Option<(Rect, Rect)>,
     /// A strip held at the bottom of the screen over the page; the page
     /// scrolls far enough for nothing to stay under it.
     pub dock: Option<Dock>,
@@ -1541,6 +1546,7 @@ impl Frame {
             pinned: None,
             fold: None,
             scrollback: None,
+            wallpaper_preview: None,
             dock: None,
             caret: None,
             button: None,
@@ -1602,7 +1608,8 @@ pub struct State {
     pub(crate) frosted_cards: bool,
     pub(crate) wallpaper_image: Option<Wallpaper>,
     pub(crate) wallpaper_opacity: u8,
-    pub(crate) wallpaper_importing: bool,
+    pub(crate) wallpaper_busy: bool,
+    pub(crate) wallpaper_crop: Option<WallpaperCrop>,
     pub(crate) wallpaper_unreadable: bool,
     pub(crate) wallpaper_folder: Folder,
     pub brightness: f32,
@@ -1795,7 +1802,8 @@ impl Default for State {
             frosted_cards: false,
             wallpaper_image: None,
             wallpaper_opacity: DEFAULT_OPACITY,
-            wallpaper_importing: false,
+            wallpaper_busy: false,
+            wallpaper_crop: None,
             wallpaper_unreadable: false,
             wallpaper_folder: Folder::new(""),
             brightness: SLIDER_START,
@@ -1970,7 +1978,7 @@ impl State {
             Screen::Wlan => self.wlan.is_some(),
             Screen::SkywardUpdate => self.wlan.is_some() && self.recovery_partitions,
             Screen::Systems => self.dual_boot,
-            Screen::Wallpaper | Screen::PickWallpaper => self.wallpaper_enabled,
+            Screen::Wallpaper | Screen::PickWallpaper | Screen::CropWallpaper => self.wallpaper_enabled,
             _ => true,
         }
     }
@@ -2062,7 +2070,8 @@ pub enum Effect {
     /// List the folder at this path for the file manager.
     ReadDir(String),
     ReadWallpaperFolder(String),
-    ImportWallpaper(String),
+    PrepareWallpaper(String),
+    SaveWallpaper,
     SaveWallpaperOpacity { before: u8, after: u8 },
     SaveFrostedCards(bool),
     ResetWallpaper,
@@ -2204,6 +2213,7 @@ enum Drag {
     /// threshold, lifting goes back.
     Edge { start: f32, from_left: bool, armed: bool, x: f32, cy: f32 },
     Slider(Slider, Rect),
+    PanWallpaper { viewport: Rect, frame: Rect, x: f32, y: f32 },
     Confirm { which: Confirm, track: Rect, grab: f32 },
     /// Scrolling a terminal's screen back through what the shell wrote, or
     /// the editor's text, `carry` being the part of a row not yet scrolled.
@@ -3366,6 +3376,9 @@ impl App {
             Some((user, keys)) => Data::Locked { user, keys, checking: false },
             None => Data::Open,
         };
+        if !self.state.data.storage_open() {
+            self.state.wallpaper_crop = None;
+        }
         self.state.code.clear();
         self.refresh();
     }
@@ -3373,7 +3386,8 @@ impl App {
     /// The data partition did not open, and why.
     pub fn data_failed(&mut self, why: String) {
         self.state.data = Data::Failed(why);
-        self.state.wallpaper_importing = false;
+        self.state.wallpaper_busy = false;
+        self.state.wallpaper_crop = None;
         self.set_wallpaper(None);
     }
 
@@ -4029,15 +4043,42 @@ impl App {
         self.state.wallpaper_opacity
     }
 
-    pub fn wallpaper_imported(&mut self, result: Result<Wallpaper, String>, now: u64) {
-        self.state.wallpaper_importing = false;
+    pub fn wallpaper_prepared(&mut self, result: Result<WallpaperCrop, String>, now: u64) {
+        self.state.wallpaper_busy = false;
         if self.screen() != Screen::PickWallpaper || !self.state.data.storage_open() {
+            self.refresh();
+            return;
+        }
+        match result {
+            Ok(crop) => {
+                self.state.wallpaper_crop = Some(crop);
+                self.open(Screen::CropWallpaper);
+            }
+            Err(why) => {
+                self.refresh();
+                self.report(&why, now);
+            }
+        }
+    }
+
+    pub fn wallpaper_crop(&self) -> Option<&WallpaperCrop> {
+        self.state.wallpaper_crop.as_ref()
+    }
+
+    pub fn wallpaper_applied(&mut self, result: Result<Wallpaper, String>, now: u64) {
+        self.state.wallpaper_busy = false;
+        if self.screen() != Screen::CropWallpaper || !self.state.data.storage_open() {
+            self.refresh();
             return;
         }
         match result {
             Ok(image) => {
                 self.leave(true);
+                self.state.wallpaper_crop = None;
                 self.stack.pop();
+                if self.stack.len() > 1 && self.screen() == Screen::PickWallpaper {
+                    self.stack.pop();
+                }
                 self.settle_page();
                 self.set_wallpaper(Some((image, self.state.wallpaper_opacity)));
             }
@@ -5030,12 +5071,18 @@ impl App {
                 self.state.clip = None;
             }
             Screen::PickWallpaper => {
-                if self.state.wallpaper_importing {
+                if self.state.wallpaper_busy {
                     return fx;
                 }
                 if let Some(up) = self.state.wallpaper_folder.up() {
                     return vec![Effect::ReadWallpaperFolder(up)];
                 }
+            }
+            Screen::CropWallpaper => {
+                if self.state.wallpaper_busy {
+                    return fx;
+                }
+                self.state.wallpaper_crop = None;
             }
             Screen::Wallpaper => fx.extend(self.save_wallpaper_opacity()),
             Screen::Choose(place) => {
@@ -5748,7 +5795,7 @@ impl App {
                 }
             }
             Action::WallpaperEntry(i) => {
-                if !self.state.data.storage_open() || self.state.wallpaper_importing {
+                if !self.state.data.storage_open() || self.state.wallpaper_busy {
                     return Vec::new();
                 }
                 let entry = self.state.wallpaper_folder.entry(i).clone();
@@ -5762,14 +5809,23 @@ impl App {
                     self.state.wallpaper_folder.leave(scroll);
                     return vec![Effect::ReadWallpaperFolder(path)];
                 }
-                self.state.wallpaper_importing = true;
+                self.state.wallpaper_busy = true;
                 self.refresh();
-                return vec![Effect::ImportWallpaper(path)];
+                return vec![Effect::PrepareWallpaper(path)];
+            }
+            Action::ApplyWallpaper => {
+                if self.screen() == Screen::CropWallpaper && self.state.data.storage_open()
+                    && self.state.wallpaper_crop.is_some() && !self.state.wallpaper_busy
+                {
+                    self.state.wallpaper_busy = true;
+                    self.refresh();
+                    return vec![Effect::SaveWallpaper];
+                }
             }
             Action::ResetWallpaper => return vec![Effect::ResetWallpaper],
             Action::OpenAncestor(depth) => {
                 let screen = self.screen();
-                if screen == Screen::PickWallpaper && self.state.wallpaper_importing {
+                if screen == Screen::PickWallpaper && self.state.wallpaper_busy {
                     return Vec::new();
                 }
                 if let Some(path) = self.state.folder(screen).ancestor(depth) {
@@ -6379,6 +6435,14 @@ impl App {
                     fr.and_then(|fr| fr.hit(x, y + scroll).filter(|h| fr.shown(h.rect, scroll).is_some_and(|r| r.contains(x, y))))
                         .map(|h| (h.action, h.rect))
                 };
+                if hit.is_none() && at_edge.is_none() && (!self.bar.on || y >= widgets::bar_bottom(&t)) {
+                    if let Some((viewport, frame)) = self.frame.as_ref().and_then(|fr| fr.wallpaper_preview)
+                        .filter(|(viewport, _)| viewport.contains(x, y + scroll))
+                    {
+                        self.drag = Drag::PanWallpaper { viewport, frame, x, y };
+                        return fx;
+                    }
+                }
                 let action = hit.map(|h| h.0);
                 // A row of the page darkens behind its words a moment after
                 // the finger lands on it, if the finger stays.
@@ -6453,6 +6517,13 @@ impl App {
                     }
                     self.drag = Drag::Edge { start, from_left, armed: ready, x, cy };
                     self.dirty = true;
+                }
+                Drag::PanWallpaper { viewport, frame, x: last_x, y: last_y } => {
+                    if let Some(crop) = self.state.wallpaper_crop.as_mut() {
+                        crop.pan(x - last_x, y - last_y, frame);
+                        self.refresh_rows(viewport.y as u32, (viewport.y + viewport.h) as u32);
+                    }
+                    self.drag = Drag::PanWallpaper { viewport, frame, x, y };
                 }
                 Drag::Slider(which, track) => {
                     self.set_slider(&t, which, track, x);
@@ -6915,6 +6986,11 @@ impl App {
                             "按音量鍵調整桌布不透明度，按電源鍵完成",
                             "Set wallpaper opacity with the volume keys, then press the power key",
                         ],
+                        Slider::WallpaperZoom => [
+                            "按音量键调节缩放，按电源键完成",
+                            "按音量鍵調整縮放，按電源鍵完成",
+                            "Set the zoom with the volume keys, then press the power key",
+                        ],
                         Slider::Vibration => {
                             ["按音量键调节振动强度，按电源键完成", "按音量鍵調整震動強度，按電源鍵完成", "Set the vibration with the volume keys, then press the power key"]
                         }
@@ -7283,6 +7359,7 @@ impl App {
             Slider::Brightness => self.state.brightness,
             Slider::Vibration => self.state.vibration,
             Slider::WallpaperOpacity => opacity_level(self.state.wallpaper_opacity),
+            Slider::WallpaperZoom => self.wallpaper_crop().map_or(0.0, WallpaperCrop::zoom_level),
         }
     }
 
@@ -7290,6 +7367,13 @@ impl App {
     /// its floor, and draw the slider at `track` on the page again.
     fn set_level(&mut self, t: &Theme, which: Slider, track: Rect, level: f32) {
         let value = match which {
+            Slider::WallpaperZoom => {
+                if let Some(crop) = self.state.wallpaper_crop.as_mut() {
+                    crop.set_zoom(level);
+                    self.refresh();
+                }
+                return;
+            }
             Slider::WallpaperOpacity => {
                 let percent = opacity_percent(level);
                 if self.state.wallpaper_opacity != percent {
@@ -7321,8 +7405,9 @@ impl App {
     /// knob where it has come to.
     fn paint_knob(&mut self, t: &Theme, f: &Fonts, which: Confirm, track: Rect) {
         let (label, danger) = pages::confirm_label(which, &self.state);
+        let bg = if self.state.wallpaper().is_some() { t.pal.bg.with_alpha(0) } else { t.pal.bg };
         if let Some(fr) = self.frame.as_mut() {
-            fr.canvas.fill_rect(track.x, track.y, track.w, track.h, t.pal.bg);
+            fr.canvas.fill_rect(track.x, track.y, track.w, track.h, bg);
             widgets::confirm(&mut fr.canvas, t, f, track.y, label, danger, self.state.confirm);
         }
         self.layer = None;
@@ -7672,12 +7757,19 @@ mod tests {
         app.set_wallpaper_folder("DCIM".into(), Ok(vec![row("photo.jpg", FileKind::File)]), 0);
         assert_eq!(app.back(0), vec![Effect::ReadWallpaperFolder("".into())]);
         app.set_wallpaper_folder("DCIM".into(), Ok(vec![row("photo.jpg", FileKind::File)]), 0);
-        assert_eq!(tap(&mut app, &f, &i, Action::WallpaperEntry(0)), vec![Effect::ImportWallpaper("DCIM/photo.jpg".into())]);
-        app.wallpaper_imported(Err("unable to open picture".into()), 0);
+        assert_eq!(tap(&mut app, &f, &i, Action::WallpaperEntry(0)), vec![Effect::PrepareWallpaper("DCIM/photo.jpg".into())]);
+        app.wallpaper_prepared(Err("unable to open picture".into()), 0);
         assert_eq!(app.screen(), Screen::PickWallpaper);
         assert!(app.state.wallpaper().is_none());
-        assert_eq!(tap(&mut app, &f, &i, Action::WallpaperEntry(0)), vec![Effect::ImportWallpaper("DCIM/photo.jpg".into())]);
-        app.wallpaper_imported(Ok(test_wallpaper(W, H)), 0);
+        assert_eq!(tap(&mut app, &f, &i, Action::WallpaperEntry(0)), vec![Effect::PrepareWallpaper("DCIM/photo.jpg".into())]);
+        let mut png = Vec::new();
+        test_wallpaper(24, 16).write_png(&mut png).unwrap();
+        let crop = WallpaperCrop::decode(std::io::Cursor::new(png), (W, H)).unwrap();
+        app.wallpaper_prepared(Ok(crop.clone()), 0);
+        assert_eq!(app.screen(), Screen::CropWallpaper);
+        assert!(app.state.wallpaper().is_none(), "a selected picture must wait for confirmation");
+        assert_eq!(tap(&mut app, &f, &i, Action::ApplyWallpaper), vec![Effect::SaveWallpaper]);
+        app.wallpaper_applied(Ok(crop.render()), 0);
         assert_eq!(app.screen(), Screen::Wallpaper);
         assert_eq!(app.wallpaper_opacity(), DEFAULT_OPACITY);
         assert_eq!(tap(&mut app, &f, &i, Action::ResetWallpaper), vec![Effect::ResetWallpaper]);
@@ -7688,6 +7780,51 @@ mod tests {
         let mut png = Vec::new();
         canvas.write_png(&mut png).unwrap();
         Wallpaper::decode(std::io::Cursor::new(png), w, h).unwrap()
+    }
+
+    #[test]
+    fn wallpaper_crop_drags_from_the_dimmed_area_and_back_discards_the_draft() {
+        let (f, i) = (fonts(), info());
+        let (w, h) = (360, 800);
+        let mut app = App::new(Screen::Wallpaper, w, h, 1.0);
+        app.enable_wallpaper();
+        app.data_waiting(None);
+        let original = test_wallpaper(w, h);
+        app.set_wallpaper(Some((original.clone(), 65)));
+        assert_eq!(
+            tap(&mut app, &f, &i, Action::Open(Screen::PickWallpaper)),
+            vec![Effect::ReadWallpaperFolder(String::new())]
+        );
+
+        let mut source = Canvas::filled(96, 32, Rgba::rgb(240, 20, 50));
+        source.fill_rect(32.0, 0.0, 64.0, 32.0, Rgba::rgb(18, 90, 235));
+        let mut png = Vec::new();
+        source.write_png(&mut png).unwrap();
+        app.wallpaper_prepared(Ok(WallpaperCrop::decode(std::io::Cursor::new(png), (w, h)).unwrap()), 0);
+        let (viewport, frame) = app.frame(&f, &i).wallpaper_preview.unwrap();
+        let (x, y) = frame.centre();
+        let outside = frame.x - 4.0;
+        assert!(viewport.contains(outside, y));
+        let index = |x: f32| ((y as u32 * w + x as u32) * 4) as usize;
+        let at = index(x);
+        let edge = index(outside);
+        let mut screen = Canvas::new(w, h);
+        app.compose(&mut screen, &f, &i, "12:00", 1000);
+        assert_eq!(&screen.data[at..at + 4], &[18, 90, 235, 255]);
+        assert_eq!(&screen.data[edge..edge + 4], &[10, 49, 129, 255]);
+        assert!(app.touch(Touch::Down(outside, y), &f, 1001).is_empty());
+        assert!(app.touch(Touch::Move(outside + 2000.0, y), &f, 1002).is_empty());
+        assert!(app.touch(Touch::Up, &f, 1003).is_empty());
+        app.compose(&mut screen, &f, &i, "12:00", 1004);
+        assert_eq!(&screen.data[at..at + 4], &[240, 20, 50, 255]);
+        let bg = app.theme().pal.bg;
+        assert_eq!(&screen.data[edge..edge + 4], &[bg.r, bg.g, bg.b, 255]);
+
+        assert!(app.back(1005).is_empty());
+        assert_eq!(app.screen(), Screen::PickWallpaper);
+        assert!(app.wallpaper_crop().is_none());
+        assert_eq!(app.state.wallpaper(), Some(&original));
+        assert_eq!(app.wallpaper_opacity(), 65);
     }
 
     #[test]
@@ -8967,6 +9104,39 @@ mod tests {
         let fx = app.touch(Touch::Up, &f, 0);
         assert_eq!(fx, vec![Effect::Reboot(Target::Bootloader)]);
         assert_eq!(app.state.confirm, 0.0, "the knob springs back");
+    }
+
+    #[test]
+    fn reboot_confirm_keeps_wallpaper_visible_around_rounded_corners_while_dragging() {
+        let (f, mut i) = (fonts(), info());
+        i.slot = None;
+        let (w, h) = (540, 1200);
+        let wallpaper = test_wallpaper(w, h);
+        for dark in [false, true] {
+            let mut app = App::new(Screen::Reboot, w, h, 1.375);
+            app.state.dark = dark;
+            app.enable_wallpaper();
+            app.data_waiting(None);
+            app.set_wallpaper(Some((wallpaper.clone(), 100)));
+            app.set_frosted_cards(true);
+            let track = app.frame(&f, &i).hits.iter()
+                .find(|hit| hit.action == Action::Confirm(Confirm::Reboot)).unwrap().rect;
+            let y = track.centre().1;
+            let corner = ((track.y as usize + 3) * w as usize + track.x as usize + 3) * 4;
+
+            let mut panel = Canvas::new(w, h);
+            app.compose(&mut panel, &f, &i, "12:00", 0);
+            let before: [u8; 4] = panel.data[corner..corner + 4].try_into().unwrap();
+            assert!(app.touch(Touch::Down(track.x + track.h / 2.0, y), &f, 1).is_empty());
+            assert!(app.touch(Touch::Move(track.x + track.w / 2.0, y), &f, 2).is_empty());
+            assert!((app.state.confirm - 0.5).abs() < 0.01);
+            app.compose(&mut panel, &f, &i, "12:00", 2);
+            assert_eq!(panel.data[corner..corner + 4], before, "dark theme {dark}: wallpaper at the rounded edge");
+
+            assert!(app.touch(Touch::Up, &f, 3).is_empty());
+            app.compose(&mut panel, &f, &i, "12:00", 3);
+            assert_eq!(panel.data[corner..corner + 4], before);
+        }
     }
 
     #[test]

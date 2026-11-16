@@ -2317,7 +2317,7 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                     }
                     Effect::ReadDir(folder) => list(&mut app, folder)?,
                     Effect::ReadPlace(place, folder) => list_place(&mut app, place, folder)?,
-                    Effect::ReadWallpaperFolder(_) | Effect::ImportWallpaper(_) | Effect::SaveWallpaperOpacity { .. } | Effect::SaveFrostedCards(_) | Effect::ResetWallpaper => {
+                    Effect::ReadWallpaperFolder(_) | Effect::PrepareWallpaper(_) | Effect::SaveWallpaper | Effect::SaveWallpaperOpacity { .. } | Effect::SaveFrostedCards(_) | Effect::ResetWallpaper => {
                         unreachable!("the lmi runtime handles wallpaper effects");
                     }
                     // A name taken where an entry goes is the user's to

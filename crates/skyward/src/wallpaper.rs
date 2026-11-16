@@ -3,7 +3,7 @@ use rustix::fs::{self as at, Mode, OFlags};
 use rustix::io::Errno;
 use skyward_files::Ownership;
 use skyward_ui::app::{FileKind, FileRow};
-use skyward_ui::wallpaper::{Wallpaper, MIN_OPACITY};
+use skyward_ui::wallpaper::{Wallpaper, WallpaperCrop, MIN_OPACITY};
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Cursor, Read, Write};
 use std::os::fd::AsRawFd;
@@ -59,13 +59,7 @@ pub fn list(root: &Path, folder: &str) -> Result<Vec<FileRow>> {
     Ok(images)
 }
 
-pub fn import(
-    root: &Path,
-    relative: &str,
-    opacity: u8,
-    size: (u32, u32),
-    ownership: Ownership,
-) -> Result<Wallpaper> {
+pub fn prepare(root: &Path, relative: &str, size: (u32, u32)) -> Result<WallpaperCrop> {
     let path = Path::new(relative);
     ensure!(is_picture(path), "choose a JPG or PNG picture");
     let name = path.file_name().context("the picture has no name")?;
@@ -86,9 +80,11 @@ pub fn import(
         bytes.len() as u64 <= MAX_SOURCE_BYTES,
         "the selected picture is larger than 32 MiB"
     );
-    let image = Wallpaper::decode(Cursor::new(bytes), size.0, size.1)?;
+    WallpaperCrop::decode(Cursor::new(bytes), size)
+}
 
-    // Decode fully before creating or changing anything under Skyward.
+pub fn apply(root: &Path, crop: &WallpaperCrop, opacity: u8, ownership: Ownership) -> Result<Wallpaper> {
+    let image = crop.render();
     let saved = open_store(root, Some(ownership))?.context("no Skyward folder")?;
     replace(&saved, NAME, ownership, |to| {
         write_header(to, opacity)?;
@@ -295,6 +291,11 @@ mod tests {
             .unwrap();
     }
 
+    fn import(root: &Path, relative: &str, opacity: u8, size: (u32, u32), ownership: Ownership) -> Result<Wallpaper> {
+        let crop = prepare(root, relative, size)?;
+        apply(root, &crop, opacity, ownership)
+    }
+
     #[test]
     fn wallpaper_picker_lists_folders_and_images_and_stays_inside_shared_storage() {
         let folder = tempfile::tempdir().unwrap();
@@ -328,6 +329,34 @@ mod tests {
         assert_eq!(load(root, (8, 16)).unwrap(), Some((first, MIN_OPACITY)));
         reset(root).unwrap();
         assert!(load(root, (8, 16)).unwrap().is_none());
+    }
+
+    #[test]
+    fn wallpaper_preparation_leaves_the_record_intact_and_the_selected_crop_survives_reload() {
+        let folder = tempfile::tempdir().unwrap();
+        let root = folder.path();
+        picture(root, "original.png");
+        let original = import(root, "original.png", 65, (8, 16), Ownership::Kept).unwrap();
+        let record = root.join(SKYWARD).join(NAME);
+        let before = fs::read(&record).unwrap();
+
+        let mut wide = Canvas::filled(48, 12, Rgba::rgb(220, 20, 40));
+        wide.fill_rect(30.0, 0.0, 18.0, 12.0, Rgba::rgb(20, 160, 230));
+        let source = root.join("wide.png");
+        wide.write_png(File::create(&source).unwrap()).unwrap();
+        let mut crop = prepare(root, "wide.png", (8, 16)).unwrap();
+        let centered = crop.render();
+        crop.pan(-80.0, 0.0, skyward_ui::geom::Rect::new(0.0, 0.0, 8.0, 16.0));
+        assert_eq!(fs::read(&record).unwrap(), before);
+        let mut source_bytes = Vec::new();
+        wide.write_png(&mut source_bytes).unwrap();
+        assert_eq!(fs::read(&source).unwrap(), source_bytes);
+
+        fs::remove_file(source).unwrap();
+        let selected = apply(root, &crop, 65, Ownership::Kept).unwrap();
+        assert_ne!(selected, centered);
+        assert_ne!(selected, original);
+        assert_eq!(load(root, (8, 16)).unwrap(), Some((selected, 65)));
     }
 
     #[test]

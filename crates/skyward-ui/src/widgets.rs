@@ -1867,6 +1867,7 @@ pub struct SliderBlock {
 pub enum Caption {
     Sun,
     Opacity,
+    Zoom,
     /// A phone between the lines of its shaking.
     Vibrate,
 }
@@ -1902,6 +1903,13 @@ pub fn slider_card(c: &mut Canvas, t: &Theme, f: &Fonts, top: f32, caption: Capt
             c.stroke_round_rect(scx - radius, lcy - radius, radius * 2.0, radius * 2.0, radius, m.dp(1.8), t.pal.mono_icon);
             c.line(scx - m.dp(5.0), lcy + m.dp(5.0), scx + m.dp(5.0), lcy - m.dp(5.0), m.dp(1.8), t.pal.mono_icon);
             c.fill_circle(scx + m.dp(2.0), lcy + m.dp(2.0), m.dp(2.3), t.pal.mono_icon);
+        }
+        Caption::Zoom => {
+            let radius = m.dp(6.0);
+            let weight = m.dp(1.8);
+            let (x, y) = (scx - radius / 3.0, lcy - radius / 3.0);
+            c.stroke_round_rect(x - radius, y - radius, 2.0 * radius, 2.0 * radius, radius, weight, t.pal.mono_icon);
+            c.line(x + radius * 0.7, y + radius * 0.7, x + radius * 1.6, y + radius * 1.6, weight, t.pal.mono_icon);
         }
         Caption::Vibrate => {
             c.stroke_round_rect(scx - m.dp(4.3), lcy - m.dp(7.7), m.dp(8.6), m.dp(15.4), m.dp(2.2), m.dp(2.0), t.pal.mono_icon);

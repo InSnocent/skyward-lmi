@@ -67,6 +67,7 @@ pub fn render(screen: Screen, cx: &Ctx) -> Frame {
         Screen::Settings => settings(cx),
         Screen::Wallpaper => wallpaper(cx),
         Screen::PickWallpaper => pick_wallpaper(cx),
+        Screen::CropWallpaper => crop_wallpaper(cx),
         Screen::Reboot => reboot(cx),
         Screen::Wipe => wipe(cx),
         Screen::Mount => mount(cx),
@@ -523,6 +524,64 @@ pub fn wallpaper(cx: &Ctx) -> Frame {
         y = reset.bottom;
     }
     Frame::new(t, fit(c, t, y), out, l.pick(WALLPAPER), top)
+}
+
+fn crop_wallpaper(cx: &Ctx) -> Frame {
+    let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
+    let m = t.m;
+    let top = m.content_top;
+    let title = l.pick(["裁剪壁纸", "裁剪桌布", "Crop wallpaper"]);
+    let mut c = long_page(cx);
+    let Some(crop) = s.wallpaper_crop.as_ref().filter(|_| s.data.storage_open()) else {
+        return Frame::new(t, fit(c, t, top), Vec::new(), title, top);
+    };
+
+    let hint = l.pick([
+        "拖动图片调整取景，用滑块缩放",
+        "拖曳圖片調整取景，用滑桿縮放",
+        "Drag the picture to frame it. Use the slider to zoom.",
+    ]);
+    let y = widgets::footnote(&mut c, t, f, top, hint) + m.dp(8.0);
+    let controls = m.dp(73.0 + 48.0) + m.slider_h + 2.0 * m.card_gap + 2.0 * m.margin;
+    let space = (m.h as f32 - y - controls).max(m.dp(144.0));
+    let margin = m.margin.round();
+    let viewport = Rect::new(margin, y.round(), m.w as f32 - 2.0 * margin, space.floor());
+    let inset = m.dp(28.0).min(viewport.w / 6.0).min(viewport.h / 6.0);
+    let frame = crop.preview_rect(Rect::new(
+        viewport.x + inset, viewport.y + inset, viewport.w - 2.0 * inset, viewport.h - 2.0 * inset,
+    ));
+    crop.preview(&mut c, viewport, frame, t.pal.bg);
+    let line = m.dp(1.0).round().max(1.0);
+    c.stroke_round_rect(
+        frame.x - line / 2.0, frame.y - line / 2.0, frame.w + line, frame.h + line, 0.0, line,
+        Rgba::rgb(255, 255, 255),
+    );
+
+    let zoom = crop.zoom_percent();
+    let label = tr!(l, "缩放 {zoom}%", "縮放 {zoom}%", "Zoom {zoom}%");
+    let slider = widgets::slider_card(
+        &mut c, t, f, viewport.y + viewport.h + m.card_gap, Caption::Zoom, &label,
+        crop.zoom_level(), None,
+    );
+    let button_y = slider.bottom + m.card_gap;
+    let (out, bottom) = if s.wallpaper_busy {
+        let saving = l.pick(["正在保存壁纸", "正在儲存桌布", "Saving wallpaper"]);
+        (Vec::new(), widgets::footnote(&mut c, t, f, button_y, saving))
+    } else {
+        let apply = l.pick(["应用壁纸", "套用桌布", "Apply wallpaper"]);
+        let button = widgets::button(&mut c, t, f, button_y, apply);
+        (
+            vec![
+                Hit { rect: slider.track, action: Action::Slider(Slider::WallpaperZoom) },
+                Hit { rect: button, action: Action::ApplyWallpaper },
+            ],
+            button.y + button.h,
+        )
+    };
+    Frame {
+        wallpaper_preview: (!s.wallpaper_busy).then_some((viewport, frame)),
+        ..Frame::new(t, fit(c, t, bottom), out, title, top)
+    }
 }
 
 /// What the settings page says beside its Skyward update entry: an update
@@ -3378,9 +3437,9 @@ pub fn choose(cx: &Ctx, place: Place) -> Frame {
 
 fn pick_wallpaper(cx: &Ctx) -> Frame {
     let (s, l) = (cx.state, cx.state.lang);
-    let absent = if s.wallpaper_importing {
+    let absent = if s.wallpaper_busy {
         Some((
-            l.pick(["正在导入图片", "正在匯入圖片", "Importing picture"]),
+            l.pick(["正在打开图片", "正在開啟圖片", "Opening picture"]),
             l.pick(["正在准备壁纸预览", "正在準備桌布預覽", "Preparing the wallpaper preview"]),
         ))
     } else if !s.data.storage_open() {
