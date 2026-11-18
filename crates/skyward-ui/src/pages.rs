@@ -134,6 +134,7 @@ pub fn confirm_label(which: Confirm, s: &State) -> (&'static str, bool) {
         Confirm::DeleteEntry | Confirm::DeleteBackup => (["滑动以删除", "滑動以刪除", "Slide to delete"], true),
         Confirm::Install => (INSTALL, false),
         Confirm::InstallWipe => (["滑动以安装并清除", "滑動以安裝並清除", "Slide to install and wipe"], true),
+        Confirm::RunScript if s.local_zip_name().is_some() => (["滑动以刷入 ZIP", "滑動以刷入 ZIP", "Swipe to flash ZIP"], true),
         Confirm::RunScript => (INSTALL, true),
         Confirm::Merge => (["滑动以合并", "滑動以合併", "Slide to merge"], true),
         Confirm::Relabel => (["滑动以修复", "滑動以修復", "Slide to fix"], true),
@@ -296,10 +297,6 @@ pub fn home(cx: &Ctx) -> Frame {
     // phone can hold a second system, the two systems.
     let mut rows = Vec::new();
     let mut opens = Vec::new();
-    if cx.state.offers(Screen::Wallpaper) {
-        rows.push(Row::new("Language / 语言").icon(BLUE, Icon::Globe).trail(Trail::Value(l.name())));
-        opens.push(Action::Open(Screen::Language));
-    }
     if let Some(w) = &cx.state.wlan {
         rows.push(Row::new(l.pick(WLAN)).icon(BLUE, Icon::Wlan).trail(Trail::Value(fmt::wlan_value(l, w))));
         opens.push(Action::Open(Screen::Wlan));
@@ -1105,9 +1102,9 @@ pub fn install(cx: &Ctx) -> Frame {
         let rows = widgets::list(&mut c, t, f, y, &rows);
         let note = if cx.state.block_ota_install {
             l.pick([
-                "验签通过后，需滑动确认才会写入系统分区。",
-                "驗證簽章後，需滑動確認才會寫入系統分割區。",
-                "The signed OTA writes system partitions after you confirm.",
+                "可选择对应的完整 ROM ZIP 或 lmi 的 boot / recovery IMG。核对后需滑动确认才会写入目标分区。",
+                "可選擇對應的完整 ROM ZIP 或 lmi 的 boot / recovery IMG。核對後需滑動確認才會寫入目標分割區。",
+                "Choose the matching full ROM ZIP or a boot / recovery IMG for lmi. Target partitions are written after you confirm.",
             ])
         } else if cx.state.block_ota_preflight {
             l.pick([
@@ -1246,7 +1243,7 @@ fn update_stage(l: Lang, stage: Option<&Stage>) -> (String, Option<f32>) {
         }
         Some(Stage::Finishing) => (l.pick(["第 3 步，共 3 步：完成安装", "第 3 步，共 3 步：完成安裝", "Step 3 of 3: finishing"]).into(), None),
         Some(Stage::Reflashing { done, total }) => (l.pick(REFLASHING).into(), Some(*done as f32 / *total as f32)),
-        Some(Stage::Flashing { .. } | Stage::Script { .. } | Stage::Signature { .. } | Stage::Allocating { .. } | Stage::Root { .. } | Stage::Storing) | None => {
+        Some(Stage::InspectingImage { .. } | Stage::Flashing { .. } | Stage::Script { .. } | Stage::Signature { .. } | Stage::Allocating { .. } | Stage::Root { .. } | Stage::Storing) | None => {
             (l.pick(GETTING_READY).into(), None)
         }
     }
@@ -1327,6 +1324,7 @@ fn script_output(c: &mut Canvas, cx: &Ctx, y: f32, rows: &mut Option<Rows>) -> f
 fn pick_title(l: Lang, pick: Pick, current: Option<Slot>) -> String {
     let letter = |s: Option<Slot>| s.map(|s| format!(" {}", s.letter())).unwrap_or_default();
     match pick {
+        Pick::Single => l.pick(["独立分区", "獨立分割區", "Single partition"]).into(),
         Pick::Current => format!("{}{}", l.pick(CURRENT_SLOT), letter(current)),
         Pick::Other => format!("{}{}", l.pick(["另一个槽位", "另一個槽位", "Other slot"]), letter(current.map(Slot::other))),
         Pick::Both => l.pick(["两个槽位", "兩個槽位", "Both slots"]).into(),
@@ -1420,6 +1418,29 @@ pub fn installing(cx: &Ctx) -> Frame {
             ]);
             widgets::footnote(&mut c, t, f, y, note)
         }
+        Install::Checking { size, stage } if s.local_zip_name().is_some() => {
+            let name = s.local_zip_name().expect("checking a selected local ZIP");
+            let y = widgets::info_card(&mut c, t, f, top, &[(l.pick(["文件", "檔案", "File"]), name.into())]);
+            let progress = match stage {
+                Some(Stage::Signature { done, total }) => Some(share(*done, *total)),
+                _ => None,
+            };
+            let detail = progress.map_or_else(|| fmt::bytes(*size), |v| {
+                let p = percent(v);
+                tr!(l, "已读取 {p}%", "已讀取 {p}%", "{p}% read")
+            });
+            let y = widgets::progress_card(&mut c, t, f, y + t.m.card_gap, l.pick(["正在校验 ZIP", "正在驗證 ZIP", "Checking ZIP"]), &detail, progress);
+            let track = widgets::pending_confirm(&mut c, t, f, y + t.m.dp(28.0), l.pick(["等待校验", "等待驗證", "Awaiting verification"]));
+            widgets::footnote(&mut c, t, f, track.y + track.h,
+                l.pick(["现在只读取文件。校验通过后，滑动才会刷入。返回可取消。", "現在只讀取檔案。驗證通過後，滑動才會刷入。返回可取消。", "Checking only. After verification, swipe to flash or go back to cancel."]))
+        }
+        Install::Checking { stage: Some(Stage::InspectingImage { done, total }), .. } => {
+            let read = share(*done, *total);
+            let p = percent(read);
+            let detail = tr!(l, "已读取 {p}%", "已讀取 {p}%", "{p}% read");
+            let y = widgets::progress_card(&mut c, t, f, top, l.pick(["正在核对镜像", "正在核對映像檔", "Checking the image"]), &detail, Some(read));
+            widgets::footnote(&mut c, t, f, y, l.pick(["确认前不会写入分区。返回可取消。", "確認前不會寫入分割區。返回可取消。", "No partition is written before confirmation. Go back to cancel."]))
+        }
         Install::Checking { stage: Some(Stage::Signature { done, total }), .. } => {
             let read = share(*done, *total);
             let p = percent(read);
@@ -1460,6 +1481,10 @@ pub fn installing(cx: &Ctx) -> Frame {
             let size = fmt::bytes(choice.size);
             let detail = tr!(l, "{size}，{holds}", "{size}，{holds}", "{size} · {holds}");
             let y = widgets::list(&mut c, t, f, top, &[standing(name, GREEN, Icon::Install, &detail)]).bottom;
+            let y = if let Some(digest) = &choice.sha256 {
+                let digest = digest.as_bytes().chunks(16).map(|part| String::from_utf8_lossy(part)).collect::<Vec<_>>().join(" ");
+                widgets::info_card(&mut c, t, f, y + t.m.card_gap, &[("SHA-256", digest)])
+            } else { y };
             let y = widgets::section(&mut c, t, f, y, l.pick(["分区", "分割區", "Partition"]));
             let rows: Vec<Row> = choice
                 .partitions
@@ -1470,14 +1495,23 @@ pub fn installing(cx: &Ctx) -> Frame {
             let parts = widgets::list(&mut c, t, f, y, &rows);
             let choose: Vec<Action> = (0..choice.partitions.len()).map(Action::FlashPartition).collect();
             out.extend(hits(&parts.rows, &choose));
-            let y = widgets::section(&mut c, t, f, parts.bottom, l.pick(["槽位", "槽位", "Slot"]));
-            let titles = Pick::ALL.map(|p| pick_title(l, p, i.slot));
-            let rows: Vec<Row> =
-                Pick::ALL.iter().zip(&titles).map(|(p, title)| Row::new(title).trail(Trail::Check(*p == choice.pick))).collect();
-            let picks = widgets::list(&mut c, t, f, y, &rows);
-            out.extend(hits(&picks.rows, &Pick::ALL.map(Action::FlashSlots)));
+            let y = if choice.pick == Pick::Single {
+                widgets::footnote(&mut c, t, f, parts.bottom, l.pick([
+                    "此 IMG 未验证签名或来源。SHA-256 仅供手动比对；请确认镜像适用于红米 K30 Pro（lmi）。",
+                    "此 IMG 未驗證簽章或來源。SHA-256 僅供手動比對；請確認映像檔適用於 Redmi K30 Pro（lmi）。",
+                    "Signature and source are not verified for this IMG. Compare SHA-256 with the publisher and confirm it is made for Redmi K30 Pro (lmi).",
+                ]))
+            } else {
+                let y = widgets::section(&mut c, t, f, parts.bottom, l.pick(["槽位", "槽位", "Slot"]));
+                let titles = Pick::ALL.map(|p| pick_title(l, p, i.slot));
+                let rows: Vec<Row> =
+                    Pick::ALL.iter().zip(&titles).map(|(p, title)| Row::new(title).trail(Trail::Check(*p == choice.pick))).collect();
+                let picks = widgets::list(&mut c, t, f, y, &rows);
+                out.extend(hits(&picks.rows, &Pick::ALL.map(Action::FlashSlots)));
+                picks.bottom
+            };
             let (label, danger) = confirm_label(Confirm::Flash, cx.state);
-            let track = widgets::confirm(&mut c, t, f, picks.bottom + t.m.dp(28.0), label, danger, s.confirm);
+            let track = widgets::confirm(&mut c, t, f, y + t.m.dp(28.0), label, danger, s.confirm);
             out.push(Hit { rect: track, action: Action::Confirm(Confirm::Flash) });
             let note = l.pick(match s.source {
                 Source::Computer => [
@@ -1622,9 +1656,14 @@ pub fn installing(cx: &Ctx) -> Frame {
                 "這個刷機包將執行其中的安裝指令碼，安裝指令碼可以改寫本機的任何分割區。",
                 "This zip runs the install script it holds, which can rewrite any partition of this phone.",
             ]);
-            let mut y = widgets::list(&mut c, t, f, top, &[standing(name, ORANGE, Icon::Install, detail)]).bottom;
+            let local_zip = s.local_zip_name();
+            let heading = if local_zip.is_some() && s.block_ota_targets.is_some() { l.pick(["ZIP 预检通过", "ZIP 預檢通過", "ZIP verified"]) } else { name };
+            let mut y = widgets::list(&mut c, t, f, top, &[standing(heading, ORANGE, Icon::Install, detail)]).bottom;
             if let Some(targets) = &s.block_ota_targets {
-                y = widgets::info_card(&mut c, t, f, y + t.m.card_gap, &block_ota_facts(l, targets));
+                let mut facts = Vec::new();
+                if let Some(name) = local_zip { facts.push((l.pick(["文件", "檔案", "File"]), name.to_owned())); }
+                facts.extend(block_ota_facts(l, targets));
+                y = widgets::info_card(&mut c, t, f, y + t.m.card_gap, &facts);
                 let note = if matches!(s.source, Source::File(_) | Source::Opened { .. }) {
                     l.pick([
                         "安装会重建 super、覆盖 boot 并清除部分系统缓存，现有 Root 可能失效。",
@@ -1678,7 +1717,12 @@ pub fn installing(cx: &Ctx) -> Frame {
         (Source::Asked { .. }, Some(reason)) => widgets::info_card(&mut c, t, f, bottom + t.m.dp(12.0), &[(l.pick(REASON), reason.clone())]),
         _ => bottom,
     };
-    Frame { rows, ..Frame::new(t, fit(c, t, bottom), out, install_title(l, s.source), top) }
+    let title = match (&s.install, s.local_zip_name()) {
+        (Install::Checking { .. }, Some(_)) => l.pick(["校验 ZIP", "驗證 ZIP", "Check ZIP"]),
+        (Install::ConfirmingScript, Some(_)) => l.pick(["确认刷入 ZIP", "確認刷入 ZIP", "Confirm ZIP installation"]),
+        _ => install_title(l, s.source),
+    };
+    Frame { rows, ..Frame::new(t, fit(c, t, bottom), out, title, top) }
 }
 
 /// What a request the system made gives as why.
@@ -1744,6 +1788,8 @@ fn finished(
 ) -> f32 {
     let (t, f, source, l) = (cx.t, cx.f, cx.state.source, cx.state.lang);
     let gap = t.m.card_gap;
+    let zip_preflight_failed = cx.state.local_zip_name().is_some() && cx.state.block_ota_targets.is_none();
+    let zip_failure = ["ZIP 未通过预检", "ZIP 未通過預檢", "ZIP preflight failed"];
     let choose_another = ["选择其他文件", "選擇其他檔案", "Choose another file"];
     let (again, another) = match source {
         Source::Computer => {
@@ -1782,8 +1828,12 @@ fn finished(
             afterwards_of(c, cx, y, true)
         }
         Outcome::Flashed { partition, slots } => {
-            let slots = fmt::slots(l, slots);
-            let detail = tr!(l, "{partition} 已刷入{slots}。", "{partition} 已刷入{slots}。", "Flashed to {partition} in {slots}.");
+            let detail = if slots.is_empty() {
+                tr!(l, "已刷入 {partition} 分区，并通过回读校验。", "已刷入 {partition} 分割區，並通過回讀驗證。", "Flashed {partition} and verified by reading it back.")
+            } else {
+                let slots = fmt::slots(l, slots);
+                tr!(l, "{partition} 已刷入{slots}。", "{partition} 已刷入{slots}。", "Flashed to {partition} in {slots}.")
+            };
             let y = widgets::list(c, t, f, top, &[standing(l.pick(["刷入成功", "刷入成功", "Flashed"]), GREEN, Icon::Install, &detail)]).bottom;
             let mut rows = vec![restart];
             let mut acts = vec![Action::RebootTo(Target::System)];
@@ -1826,7 +1876,7 @@ fn finished(
         }
         Outcome::Refused(r) => {
             let reason = fmt::refusal(l, r, &cx.info.codename, source, cx.state.time_zone);
-            let y = widgets::list(c, t, f, top, &[standing(l.pick(["无法安装", "無法安裝", "Can't install"]), ORANGE, Icon::Install, &reason)]).bottom;
+            let y = widgets::list(c, t, f, top, &[standing(l.pick(if zip_preflight_failed { zip_failure } else { ["无法安装", "無法安裝", "Can't install"] }), ORANGE, Icon::Install, &reason)]).bottom;
             // What the system asked for and did not go in leaves the phone
             // where it was, from which it may go back to the system.
             let (rows, acts) = match source {
@@ -1840,7 +1890,7 @@ fn finished(
         }
         Outcome::Failed(failure) => {
             let (what, detail) = fmt::failure(l, failure, source);
-            let y = widgets::list(c, t, f, top, &[standing(l.pick(["安装失败", "安裝失敗", "Install failed"]), RED, Icon::Install, &what)]).bottom;
+            let y = widgets::list(c, t, f, top, &[standing(l.pick(if zip_preflight_failed { zip_failure } else { ["安装失败", "安裝失敗", "Install failed"] }), RED, Icon::Install, &what)]).bottom;
             let next = widgets::list(c, t, f, y + gap, &[again, restart]);
             out.extend(hits(&next.rows, &[another, Action::RebootTo(Target::System)]));
             // The package is sent again, or installed or flashed again.
@@ -1858,9 +1908,9 @@ fn finished(
                 ),
                 Some(Damage::Partition(p)) => tr!(
                     l,
-                    "{p} 仅写入了部分内容，重启后可能无法正常启动。请{flash}该镜像，刷入完成后再重启。",
-                    "{p} 僅寫入了部分內容，重新啟動後可能無法正常啟動。請{flash}這個映像檔，刷入完成後再重新啟動。",
-                    "{p} was only partly written, so the phone may not start properly after a reboot. {flash} the image again, and reboot once it's flashed."
+                    "{p} 可能只写入了部分内容，重启后可能无法正常启动。请{flash}该镜像，刷入完成后再重启。",
+                    "{p} 可能僅寫入了部分內容，重新啟動後可能無法正常啟動。請{flash}這個映像檔，刷入完成後再重新啟動。",
+                    "{p} may have been partly written, so the phone may not start properly after a reboot. {flash} the image again, and reboot once it's flashed."
                 ),
                 Some(Damage::Script) => tr!(
                     l,

@@ -1,5 +1,6 @@
 use anyhow::{ensure, Context, Result};
-use rustix::fs::{self as at, Mode, OFlags};
+use rustix::fs::{self as at, Mode};
+use crate::storage::{DIRECTORY, open_folder, open_regular};
 use rustix::io::Errno;
 use skyward_files::Ownership;
 use skyward_ui::app::{FileKind, FileRow};
@@ -9,11 +10,9 @@ use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Cursor, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::{ffi::OsStr, io::ErrorKind};
 
-#[cfg(target_os = "android")]
-pub const OWNER_STORAGE: &str = "/data/media/0";
 const SKYWARD: &str = "Skyward";
 const NAME: &str = ".wallpaper";
 const FROSTED_CARDS: &str = ".frosted-cards";
@@ -22,10 +21,6 @@ const MAX_SETTINGS_BYTES: u64 = 64 * 1024;
 const MAGIC: &[u8; 4] = b"SWP1";
 const MAX_SOURCE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_SAVED_BYTES: u64 = 16 * 1024 * 1024;
-const DIRECTORY: OFlags = OFlags::RDONLY
-    .union(OFlags::DIRECTORY)
-    .union(OFlags::NOFOLLOW)
-    .union(OFlags::CLOEXEC);
 
 pub fn list(root: &Path, folder: &str) -> Result<Vec<FileRow>> {
     let directory = open_folder(root, Path::new(folder))?;
@@ -180,30 +175,6 @@ fn is_picture(path: &Path) -> bool {
             .iter()
             .any(|known| ext.eq_ignore_ascii_case(known))
     })
-}
-
-fn open_folder(root: &Path, relative: &Path) -> Result<File> {
-    let mut current =
-        File::from(at::open(root, DIRECTORY, Mode::empty()).context("open internal storage")?);
-    for part in relative.components() {
-        let Component::Normal(name) = part else {
-            anyhow::bail!("the picture path leaves internal storage")
-        };
-        current = File::from(
-            at::openat(&current, name, DIRECTORY, Mode::empty())
-                .context("open a picture folder")?,
-        );
-    }
-    Ok(current)
-}
-
-pub(crate) fn open_regular(folder: &File, name: &OsStr) -> io::Result<File> {
-    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
-    let file = File::from(at::openat(folder, name, flags, Mode::empty())?);
-    if !file.metadata()?.is_file() {
-        return Err(io::Error::new(ErrorKind::InvalidData, "not a regular file"));
-    }
-    Ok(file)
 }
 
 fn fd_path(directory: &File) -> PathBuf {

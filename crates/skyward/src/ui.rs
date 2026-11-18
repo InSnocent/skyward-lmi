@@ -2273,8 +2273,14 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         installer = Some(Installer::open(PathBuf::from(path), detach(cfg.services.clone()), install_options(&app))?);
                     }
                     Effect::Flash { partition, pick } => {
-                        let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
-                        installer.as_ref().context("no installer holds an image")?.flash(partition, pick.slots(slot));
+                        let slots = if pick == skyward_ui::app::Pick::Single {
+                            ensure!(cfg.device.codename == "lmi" && skyward_vab::current_slot()?.is_none(), "expected the single-slot lmi device");
+                            Vec::new()
+                        } else {
+                            let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
+                            pick.slots(slot)
+                        };
+                        installer.as_ref().context("no installer holds an image")?.flash(partition, slots);
                     }
                     Effect::Cancel => match &installer {
                         Some(i) => i.cancel()?,

@@ -5,7 +5,8 @@ use crate::{filework, pty};
 use skyward_crypto::data::Closed;
 use crate::input::{monotonic_ms, Event, Inputs};
 use crate::ui::Backlight;
-use crate::wallpaper::{self, OWNER_STORAGE};
+use crate::storage::{open_owner_image, OWNER_STORAGE};
+use crate::wallpaper;
 use anyhow::{ensure, Context, Result};
 use skyward_config::{ramdisk, DeviceConfig};
 use skyward_install::{block_preflight, sideload_test, Event as InstallEvent, Installer};
@@ -1032,12 +1033,20 @@ fn handle(
                     ensure!(app.state.block_ota_install, "local installation is unavailable");
                     ensure!(data.shell.is_none() && data.terminal_sessions.is_empty(), "finish the terminal and its background jobs before installing");
                     ensure!(data.tasks_idle() && !data.install_committed && installer.is_none(), "finish the current operation first");
-                    ensure!(full.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("zip")), "choose the supported full ROM ZIP");
+                    let is_image = full.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("img"));
+                    ensure!(is_image || full.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("zip")), "choose an IMG or the supported full ROM ZIP");
+                    ensure!(app.state.data.storage_open(), "decrypt internal storage first");
                     ensure!(crate::ui::withhold(&mut data.transfer, app, now)?, "file transfer still holds internal storage");
                     ensure!(skyward_block::mount::is_mount_point(Path::new("/data"))?, "decrypt internal storage first");
-                    ensure!(std::fs::metadata(&full)?.dev() == std::fs::metadata("/data")?.dev(),
-                        "choose the supported ROM ZIP from internal storage");
-                    Installer::open_block_install(full, Box::new(release_for_local_block_install))
+                    let data_device = std::fs::metadata("/data")?.dev();
+                    if is_image {
+                        let file = open_owner_image(Path::new(OWNER_STORAGE), Path::new(skyward_crypto::data::SDCARD), &full)?;
+                        ensure!(file.metadata()?.dev() == data_device, "the image is not on the data partition");
+                        Installer::open_lmi_image(file)
+                    } else {
+                        ensure!(std::fs::metadata(&full)?.dev() == data_device, "choose the supported ROM ZIP from internal storage");
+                        Installer::open_block_install(full, Box::new(release_for_local_block_install))
+                    }
                 })();
                 match started {
                     Ok(started) => *installer = Some(started),
@@ -1045,6 +1054,16 @@ fn handle(
                         let failure = skyward_install::Failure::Error(format!("{error:#}"));
                         app.install(InstallEvent::Finished(skyward_install::Outcome::Failed(failure)), now);
                     }
+                }
+            }
+            Effect::Flash { partition, pick: skyward_ui::app::Pick::Single } => {
+                if let Some(active) = installer.as_ref() {
+                    data.keep_settings(app, now, true);
+                    active.flash(partition, Vec::new());
+                } else {
+                    app.install(InstallEvent::Finished(skyward_install::Outcome::Failed(
+                        skyward_install::Failure::Error("no prepared local image is available".into()),
+                    )), now);
                 }
             }
             Effect::Install if app.state.sideload_test || app.state.block_ota_install => {

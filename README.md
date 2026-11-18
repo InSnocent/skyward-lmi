@@ -26,6 +26,12 @@ Enter the Android lock-screen PIN on the Decrypt page to unlock internal storage
 
 The **ADB sideload preflight** verifies the matching Infinity-X update ZIP's signature and SHA-256, then lists the target partitions. The same ZIP can also be selected from decrypted internal storage: validation through the confirmation screen and a non-writing mock package have been tested on-device, while actual local ROM installation has not. Reinstalling that exact ROM over ADB sideload was tested with an earlier installer build; root was lost and the original Recovery returned afterward. [Sideload and reinstall details](docs/lmi.zh-CN.md#临时启动与同版重装)
 
+Selecting a local ZIP in Install or File manager opens a read-only check. You can go back to cancel. Once it passes, check the filename, device and target partitions, then use **Swipe to flash ZIP** to start writing.
+
+### Local boot and recovery images
+
+After decryption, open **Install → Install from internal storage** and choose an `.img`. Skyward inspects the ramdisk, shows the inferred `boot` or `recovery` partition and the SHA-256 of the selected file, and waits for a swipe. Compare the hash with a trusted copy for your exact device and build. After writing, Skyward reads the entire partition back and checks it against the prepared image.
+
 ### Backup and restore
 
 Back up and verify the supported contents of `/data`. Backups appear on the Restore page. **Verify backup** independently checks the manifest, volume lengths and content digests without restoring data, and can be stopped. Stopping and a complete recheck have been validated on the supported lmi build. Shared storage, including photos and downloads, needs a separate backup. Restore has been tested with a sample app. Restoring all of `/data` is still awaiting device validation. [Backup details](docs/lmi.zh-CN.md#数据备份)
@@ -36,7 +42,7 @@ After decryption, choose a JPG or PNG from internal storage. Drag and zoom the p
 
 ### Other features
 
-- Basic preferences save to `/metadata/skyward/settings.json` and load before data decryption. The home page provides a **Language / 语言** shortcut.
+- Basic preferences save to `/metadata/skyward/settings.json` and load before data decryption. Language can be changed in Settings before decryption.
 - Touch, screen brightness and vibration control.
 - Read-only inspection of the system's logical partitions.
 - Reboot to Android from the Recovery menu.
@@ -48,7 +54,7 @@ Some upstream menu entries still appear. An unavailable action displays “Unava
 
 - **Advanced tools.** Other file manager write operations and large file sets need further testing. Names containing non-UTF-8 bytes are shown but cannot be operated on in the GUI; MTP omits names with non-UTF-8 bytes or longer than its protocol can represent. MTP temporarily withdraws internal storage during file writes, text editing and terminal jobs. Background processes that deliberately leave the terminal session cannot be fully tracked; ensure they have stopped before backup, restore or installation. SELinux relabeling is not yet adapted.
 - **Maintenance and reboot.** Data wipe, factory reset, filesystem checks, repair and formatting are pending. The Mount page shows the logical system partitions read-only. The Reboot menu can return to Android.
-- **Installation.** ADB sideload and internal storage accept only the matching full Infinity-X ZIP. Actual installation from internal storage has not been tested. General ZIP or IMG flashing, installation from a USB drive, online updates and dual boot are not yet adapted.
+- **Installation.** ROM ZIP installation accepts only the matching full Infinity-X update. Writing that ROM from internal storage still needs device testing. Local IMG installation supports only the two physical `boot` and `recovery` partitions on `lmi`, with an Android v2 boot header, 4096-byte pages, a kernel and a file size up to 128 MiB. It does not authenticate the IMG or establish device compatibility for generic images. Other partitions and ZIP packages, installation from USB storage, online updates and dual boot are unsupported.
 - **Backup and restore.** Backups of `/data` go to internal storage; backup directories containing non-UTF-8 bytes are not listed. A full `/data` restore and migration from another ROM still need device testing. Skyward refuses to restore backups tied to the old encryption key after a factory reset.
 - **Settings and wallpaper.** Older preferences in shared storage migrate after the first unlock. Wallpaper, opacity and frosted cards load after internal storage is decrypted.
 

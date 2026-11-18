@@ -1940,10 +1940,21 @@ pub fn slider_card(c: &mut Canvas, t: &Theme, f: &Fonts, top: f32, caption: Capt
 /// Swipe-to-confirm control in the thick-slider style; `progress` (0 to 1)
 /// is how far the knob has been dragged. Returns the track.
 pub fn confirm(c: &mut Canvas, t: &Theme, f: &Fonts, top: f32, label: &str, danger: bool, progress: f32) -> Rect {
+    let colors = if danger { (t.pal.danger, t.pal.danger_soft) } else { (t.pal.accent, t.pal.badge) };
+    confirm_track(c, t, f, top, label, colors, progress)
+}
+
+/// Inactive sibling of the swipe control, shown while its ZIP is being checked.
+/// It has no input target and cannot receive focus or carry a gesture over.
+pub fn pending_confirm(c: &mut Canvas, t: &Theme, f: &Fonts, top: f32, label: &str) -> Rect {
+    confirm_track(c, t, f, top, label, (t.pal.subtitle, t.pal.track), 0.0)
+}
+
+fn confirm_track(c: &mut Canvas, t: &Theme, f: &Fonts, top: f32, label: &str, colors: (Rgba, Rgba), progress: f32) -> Rect {
     let m = &t.m;
-    let accent = if danger { t.pal.danger } else { t.pal.accent };
+    let (accent, background) = colors;
     let (x, w, h) = (m.margin, m.w as f32 - m.margin * 2.0, m.dp(56.0));
-    c.fill_round_rect(x, top, w, h, h / 2.0, if danger { t.pal.danger_soft } else { t.pal.badge });
+    c.fill_round_rect(x, top, w, h, h / 2.0, background);
     c.text_center(&f.heading, label, x + w / 2.0 + h / 4.0, top + h / 2.0, m.row_title_px, accent);
     let k = h - m.dp(8.0);
     let kcx = x + h / 2.0 + (w - h) * progress.clamp(0.0, 1.0);

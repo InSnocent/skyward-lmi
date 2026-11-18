@@ -61,7 +61,7 @@ fn folder(root: &Path, create: bool) -> Result<Option<File>> {
 
 fn read_file(root: &Path) -> Result<Kept> {
     let Some(folder) = folder(root, false)? else { return Ok(Kept::Nothing) };
-    let file = match crate::wallpaper::open_regular(&folder, OsStr::new(NAME)) {
+    let file = match crate::storage::open_regular(&folder, OsStr::new(NAME)) {
         Ok(file) => file,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Kept::Nothing),
         Err(error) => return Err(error).context("open the settings file"),

@@ -161,6 +161,42 @@ fn verification_previews(out: &Path, root: &Path, fonts: &Fonts) -> Result<()> {
     Ok(())
 }
 
+/// Inspect a real local IMG and render its read-only confirmation flow.
+/// This utility never sends a flash command or opens a target partition.
+fn local_image_previews(out: &Path, root: &Path, fonts: &Fonts, path: &Path) -> Result<()> {
+    let cfg = DeviceConfig::load(root.join("devices/lmi.toml"))?;
+    let mut info = nezha(&cfg);
+    info.slot = None;
+    let image = skyward_install::local_image::prepare(path, &|| false, &mut |_, _| {})?;
+    println!("checked image: target={}, bytes={}, sha256={}", image.partition, image.size, image.sha256);
+    for dark in [false, true] {
+        for phase in ["confirm", "checking", "passed"] {
+            let mut app = App::new(Screen::Installing, cfg.display.width, cfg.display.height, cfg.display.density as f32/160.0);
+            app.state.lang = lang();
+            app.state.dark = dark;
+            app.state.source = Source::Opened { drive: false };
+            app.state.block_ota_install = true;
+            match phase {
+                "confirm" => app.install(skyward_install::Event::LocalImage {
+                    kind: image.kind, size: image.size, partition: image.partition, sha256: image.sha256.clone(),
+                }, 0),
+                "checking" => {
+                    app.install(skyward_install::Event::Checking { size: image.size }, 0);
+                    app.install(skyward_install::Event::Progress(Stage::InspectingImage { done: image.size/2, total: image.size }), 0);
+                }
+                _ => app.install(skyward_install::Event::Finished(Outcome::Flashed {
+                    partition: image.partition, slots: Vec::new(),
+                }), 0),
+            }
+            let mode = if dark { "dark" } else { "light" };
+            let shot = out.join(format!("img-{}-{phase}-{mode}.png", image.partition));
+            write_png(&shot, &whole_page(&mut app, fonts, &info))?;
+            println!("wrote {}", shot.display());
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let out = PathBuf::from(args.get(1).map(String::as_str).unwrap_or("preview-out"));
@@ -186,6 +222,10 @@ fn main() -> Result<()> {
 
     match args.get(2).map(String::as_str) {
         Some("--backup-verification") => return verification_previews(&out, &root, &fonts),
+        Some("--local-image") => {
+            let image = args.get(3).ok_or_else(|| anyhow!("--local-image needs an IMG path"))?;
+            return local_image_previews(&out, &root, &fonts, Path::new(image));
+        }
         Some("--calibrate") => {
             let path = out.join("calibrate.png");
             write_png(&path, &calibrate(&fonts, &light)?)?;
@@ -250,7 +290,7 @@ fn main() -> Result<()> {
         (
             "32-sideload-choosing",
             false,
-            Install::Choosing(Choice { kind: recovery, size: 43_257_856, partitions: vec!["recovery"], partition: 0, pick: Pick::Current }),
+            Install::Choosing(Choice { kind: recovery, size: 43_257_856, partitions: vec!["recovery"], partition: 0, pick: Pick::Current, sha256: None }),
         ),
         (
             "33-sideload-writing-dark",

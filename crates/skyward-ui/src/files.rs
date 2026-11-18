@@ -236,7 +236,7 @@ pub fn row(c: &mut Canvas, t: &Theme, f: &Fonts, e: &FileRow, detail: &str, wall
             FileKind::Special => FileType::Other,
             _ => file_type(&e.name),
         };
-        file_icon(c, f, ix, iy, size, p.page, kind);
+        file_icon(c, f, ix, iy, size, kind);
     }
     let (x, w) = (m.dp(TEXT_X_DP), name_width(t));
     let lines = name_lines(&f.heading, m.dp(NAME_DP), &e.name, w);
@@ -272,15 +272,21 @@ fn folder_icon(c: &mut Canvas, x: f32, y: f32, size: f32) {
 
 /// A file 40 units square scaled to `size`: a sheet with its top right
 /// corner folded down, in the colour of what the file holds, and a sign of
-/// that in white; `page` is the colour around it.
-fn file_icon(c: &mut Canvas, f: &Fonts, x: f32, y: f32, size: f32, page: Rgba, kind: FileType) {
+/// that in white. Only the outline of the sheet is painted.
+fn file_icon(c: &mut Canvas, f: &Fonts, x: f32, y: f32, size: f32, kind: FileType) {
     let u = size / 40.0;
     let at = |v: f32, w: f32| (x + v * u, y + w * u);
     let color = sheet(kind);
-    c.fill_round_rect(x + 4.0 * u, y, 32.0 * u, 40.0 * u, 8.0 * u, color);
-    // The corner cut away along the fold, and the flap folded down over the
-    // sheet, its inner corner rounded.
-    c.fill_convex(&[at(25.5, -0.5), at(36.5, -0.5), at(36.5, 10.5)], page);
+    // Trace the diagonal fold and the three remaining rounded corners. The
+    // cut-away triangle belongs to whatever is behind the file row.
+    let mut outline = vec![at(26.0, 0.0), at(36.0, 10.0)];
+    for (cx, cy, quarter) in [(28.0, 32.0, 0.0), (12.0, 32.0, 1.0), (12.0, 8.0, 2.0)] {
+        outline.extend((0..=8).map(|step| {
+            let angle = FRAC_PI_2 * (quarter + step as f32 / 8.0);
+            at(cx + 8.0 * angle.cos(), cy + 8.0 * angle.sin())
+        }));
+    }
+    c.fill_convex(&outline, color);
     let mut flap = vec![at(25.0, 0.0), at(26.0, 0.0), at(36.0, 10.0), at(36.0, 11.0)];
     flap.extend((0..=8).map(|k| {
         let a = FRAC_PI_2 * (1.0 + k as f32 / 8.0);
@@ -548,6 +554,21 @@ mod tests {
     ];
 
     #[test]
+    fn zip_fold_leaves_the_wallpaper_visible_outside_the_sheet() {
+        let f = crate::font::bundled();
+        let zip = FileRow { name: "update.zip".into(), name_utf8: true, kind: FileKind::File, size: 128,
+            modified: 0, modified_known: false, mode: 0, uid: 0, gid: 0 };
+        for theme in [Theme::light(400, 720, 1.0), Theme::dark(400, 720, 1.0)] {
+            let mut layer = Canvas::new(400, 72);
+            row(&mut layer, &theme, &f, &zip, "128 B", true);
+            let alpha = |x: usize, y: usize| layer.data[((16 + y) * 400 + 28 + x) * 4 + 3];
+            assert_eq!(alpha(34, 2), 0, "the missing corner shows the wallpaper through");
+            assert_eq!(alpha(27, 9), 255, "the turned-down flap remains visible");
+            assert_eq!(alpha(19, 20), 255, "the zip pull remains on its sheet");
+        }
+    }
+
+    #[test]
     fn each_type_has_an_icon_of_its_own() {
         let f = crate::font::bundled();
         let drawn: Vec<Canvas> = KINDS
@@ -555,7 +576,7 @@ mod tests {
             .map(|&kind| {
                 let mut c = Canvas::new(140, 140);
                 c.clear(WHITE);
-                file_icon(&mut c, &f, 0.0, 0.0, 140.0, WHITE, kind);
+                file_icon(&mut c, &f, 0.0, 0.0, 140.0, kind);
                 c
             })
             .collect();
@@ -575,7 +596,7 @@ mod tests {
         let mut c = Canvas::new(side, side);
         let page = Rgba::rgb(0, 0, 0);
         c.clear(page);
-        file_icon(&mut c, f, 0.0, 0.0, side as f32, page, kind);
+        file_icon(&mut c, f, 0.0, 0.0, side as f32, kind);
         let (mut l, mut t, mut r, mut b) = (u32::MAX, u32::MAX, 0, 0);
         for (i, p) in c.data.chunks(4).enumerate() {
             if p[..3].iter().all(|&v| v > 230) {

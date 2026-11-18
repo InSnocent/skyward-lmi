@@ -229,6 +229,9 @@ pub fn flash<R: Read + Seek>(image: &mut R, len: u64, devices: &[PathBuf], progr
     let mut written = Sha256::new();
     let mut done = 0;
     let mut at = 0;
+    // A short failed write can change the target before a complete chunk
+    // is reported. Tell the UI the write phase starts before that first I/O.
+    progress(0, total);
     while at < end {
         let n = (end - at).min(CHUNK as u64) as usize;
         source.read_exact(&mut buf[..n]).context("read the image")?;

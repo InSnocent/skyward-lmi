@@ -1004,6 +1004,8 @@ pub struct Asked {
 /// Which slots an image goes to, by the slot the phone runs from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Pick {
+    /// A single physical partition on a non-A/B phone.
+    Single,
     Current,
     Other,
     Both,
@@ -1015,6 +1017,7 @@ impl Pick {
     /// The slots this means on a phone running from `current`.
     pub fn slots(self, current: Slot) -> Vec<Slot> {
         match self {
+            Pick::Single => Vec::new(),
             Pick::Current => vec![current],
             Pick::Other => vec![current.other()],
             Pick::Both => vec![Slot::A, Slot::B],
@@ -1093,6 +1096,8 @@ pub struct Choice {
     /// Which of them is chosen.
     pub partition: usize,
     pub pick: Pick,
+    /// Original local image digest, before partition padding.
+    pub sha256: Option<String>,
 }
 
 /// A system to install beside the installed one, and the room its root
@@ -1914,6 +1919,13 @@ impl Default for State {
 }
 
 impl State {
+    pub(crate) fn local_zip_name(&self) -> Option<&str> {
+        if !self.block_ota_install || !matches!(self.source, Source::File(Place::Storage) | Source::Opened { drive: false }) {
+            return None;
+        }
+        self.package_name.as_deref().filter(|name| std::path::Path::new(name).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("zip")))
+    }
+
     pub(crate) fn wallpaper(&self) -> Option<&Wallpaper> {
         self.wallpaper_image.as_ref().filter(|_| self.wallpaper_enabled && self.data.storage_open())
     }
@@ -5226,7 +5238,8 @@ impl App {
             match self.state.install {
                 // Checking a signature only reads the package, and stops
                 // when the page is left.
-                Install::Checking { stage: Some(Stage::Signature { .. }), .. } => {
+                Install::Checking { ref stage, .. } if self.state.local_zip_name().is_some()
+                    || matches!(stage, Some(Stage::Signature { .. } | Stage::InspectingImage { .. })) => {
                     self.state.install = Install::Ending;
                     fx.push(Effect::Cancel);
                 }
@@ -5309,7 +5322,7 @@ impl App {
         if matches!(ev, Event::Wipe | Event::Reboot(_)) {
             return;
         }
-        if matches!(ev, Event::Image { .. } | Event::Ready { .. } | Event::BlockReady(_) | Event::Script | Event::System { .. } | Event::Done(_) | Event::Finished(_)) {
+        if matches!(ev, Event::Image { .. } | Event::LocalImage { .. } | Event::Ready { .. } | Event::BlockReady(_) | Event::Script | Event::System { .. } | Event::Done(_) | Event::Finished(_)) {
             self.wake(now);
         }
         let install = &mut self.state.install;
@@ -5324,7 +5337,10 @@ impl App {
                 }
             }
             Event::Image { kind, size, partitions } => {
-                *install = Install::Choosing(Choice { kind, size, partitions, partition: 0, pick: Pick::Current })
+                *install = Install::Choosing(Choice { kind, size, partitions, partition: 0, pick: Pick::Current, sha256: None })
+            }
+            Event::LocalImage { kind, size, partition, sha256 } => {
+                *install = Install::Choosing(Choice { kind, size, partitions: vec![partition], partition: 0, pick: Pick::Single, sha256: Some(sha256) });
             }
             Event::Script => *install = Install::ConfirmingScript,
             Event::BlockReady(report) => {
@@ -5356,7 +5372,7 @@ impl App {
             Event::Done(outcome) | Event::Finished(outcome) => {
                 let damage = match (&outcome, &*install) {
                     (Outcome::Failed(_), Install::Updating { overwriting: true, .. }) => Some(Damage::System),
-                    (Outcome::Failed(_), Install::Flashing { partition, stage: Some(Stage::Flashing { done, .. }) }) if *done > 0 => {
+                    (Outcome::Failed(_), Install::Flashing { partition, stage: Some(Stage::Flashing { .. }) }) => {
                         Some(Damage::Partition(partition))
                     }
                     (Outcome::Failed(_), Install::Scripting { running: true, .. }) => Some(Damage::Script),
@@ -5567,8 +5583,10 @@ impl App {
             }
             Action::FlashSlots(pick) => {
                 if let Install::Choosing(choice) = &mut self.state.install {
-                    choice.pick = pick;
-                    self.refresh();
+                    if choice.pick != Pick::Single && pick != Pick::Single {
+                        choice.pick = pick;
+                        self.refresh();
+                    }
                 }
             }
             Action::SystemSize(k) => {
@@ -7674,21 +7692,24 @@ mod tests {
     }
 
     #[test]
-    fn lmi_home_opens_language_selection_before_data_is_unlocked() {
+    fn lmi_language_selection_is_in_settings_before_data_is_unlocked() {
         let (f, i) = (fonts(), info());
         let mut app = App::new(Screen::Home, W, H, PPD);
         app.enable_wallpaper();
         assert!(!app.state.data.storage_open());
-        assert!(app.frame(&f, &i).hits.iter().any(|hit| hit.action == Action::Open(Screen::Language)));
+        assert!(!app.frame(&f, &i).hits.iter().any(|hit| hit.action == Action::Open(Screen::Language)));
+        assert!(tap(&mut app, &f, &i, Action::Open(Screen::Settings)).is_empty());
+        assert_eq!(app.screen(), Screen::Settings);
         assert!(tap(&mut app, &f, &i, Action::Open(Screen::Language)).is_empty());
         assert!(tap(&mut app, &f, &i, Action::Language(Lang::En)).is_empty());
         assert_eq!(app.state.lang, Lang::En);
         assert_eq!(app.settings().language.as_deref(), Some("en"));
         assert!(!app.state.data.storage_open());
         app.back(0);
+        assert_eq!(app.screen(), Screen::Settings);
+        app.back(0);
         assert_eq!(app.screen(), Screen::Home);
-        assert!(tap(&mut app, &f, &i, Action::Open(Screen::Settings)).is_empty());
-        assert_eq!(app.frame(&f, &i).hits.first().unwrap().action, Action::Theme { dark: false });
+        assert!(!app.frame(&f, &i).hits.iter().any(|hit| hit.action == Action::Open(Screen::Language)));
     }
 
     #[test]
@@ -10018,6 +10039,45 @@ mod tests {
     }
 
     #[test]
+    fn local_zip_preflight_and_swipe_are_distinct_for_both_file_entries() {
+        let (f, i) = (fonts(), info());
+        for picker in [true, false] {
+            let browse = if picker { Screen::Choose(Place::Storage) } else { Screen::Files };
+            let mut app = App::new(browse, W, H, PPD);
+            app.state.lang = Lang::En;
+            app.state.data = Data::Open;
+            app.state.block_ota_install = true;
+            let files = Ok(vec![entry("System.ZIP", FileKind::File)]);
+            let action = if picker {
+                app.set_place(Place::Storage, "Download".into(), files, LISTED);
+                Action::ChooseEntry(0)
+            } else {
+                app.set_files("/sdcard/Download".into(), files, LISTED);
+                Action::OpenEntry(0)
+            };
+            let opened = tap(&mut app, &f, &i, action);
+            assert!(matches!(&opened[..], [Effect::InstallFile(Place::Storage, _)] | [Effect::InstallPath(_)]));
+            assert_eq!(app.state.package_name.as_deref(), Some("System.ZIP"));
+            assert_eq!(app.frame(&f, &i).title, "Check ZIP");
+            assert!(!app.frame(&f, &i).hits.iter().any(|h| matches!(h.action, Action::Confirm(_))));
+            assert_eq!(app.key(Key::Back, 1000), vec![Effect::Cancel]);
+            app.install(Event::Finished(Outcome::Cancelled), 1000);
+            tap_at(&mut app, &f, &i, action, 2000);
+            app.install(Event::BlockReady(skyward_install::block_preflight::BlockPreflight {
+                device: "lmi".into(), logical: vec!["system".into()], physical: vec!["boot".into()],
+            }), 2000);
+            assert_eq!(app.frame(&f, &i).title, "Confirm ZIP installation");
+            let track = app.frame(&f, &i).hits.iter().find(|h| h.action == Action::Confirm(Confirm::RunScript)).unwrap().rect;
+            let y = track.centre().1 - app.top().1;
+            for (fraction, commit) in [(0.0, false), (0.5, false), (1.0, true)] {
+                app.touch(Touch::Down(track.x + track.h / 2.0, y), &f, 4000);
+                app.touch(Touch::Move(track.x + track.h / 2.0 + (track.w - track.h) * fraction, y), &f, 4000);
+                assert_eq!(app.touch(Touch::Up, &f, 4000), if commit { vec![Effect::Install] } else { vec![] });
+            }
+        }
+    }
+
+    #[test]
     fn a_zip_runs_its_install_script_once_agreed_to_and_shows_what_it_says() {
         let (f, i) = (fonts(), info());
         let mut app = opened(Screen::Install, &f, &i);
@@ -10297,6 +10357,65 @@ mod tests {
             slot: Some(Slot::B),
         };
         BackupEntry { place, name: fmt::stamp(made, 0), held: Ok(held) }
+    }
+
+    #[test]
+    fn a_local_image_uses_its_single_target_without_slot_controls() {
+        let (f, i) = (fonts(), DeviceInfo { slot: None, ..info() });
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        app.open(Screen::Installing);
+        app.state.block_ota_install = true;
+        assert!(!app.state.data_backup_only, "local image confirmation does not depend on backups");
+        app.state.source = Source::Opened { drive: false };
+        let kind = ImageKind::Boot { kernel: true, ramdisk: skyward_install::Ramdisk::Generic };
+        app.install(Event::LocalImage { kind, size: 1 << 20, partition: "boot", sha256: "ab".repeat(32) }, 0);
+        let frame = app.frame(&f, &i);
+        assert!(!frame.hits.iter().any(|h| matches!(h.action, Action::FlashSlots(_))));
+        let Install::Choosing(choice) = &app.state.install else { panic!("image confirmation"); };
+        assert_eq!(choice.pick, Pick::Single);
+        assert_eq!(choice.partitions, ["boot"]);
+        assert_eq!(choice.sha256.as_deref(), Some("ab".repeat(32).as_str()));
+        assert!(app.act(Action::FlashSlots(Pick::Both), 1000).is_empty());
+        assert!(matches!(&app.state.install, Install::Choosing(c) if c.pick == Pick::Single));
+        let track = app.frame(&f, &i).hits.iter().find(|h| h.action == Action::Confirm(Confirm::Flash)).unwrap().rect;
+        let y = track.centre().1 - app.top().1;
+        app.touch(Touch::Down(track.x + track.h / 2.0, y), &f, 1000);
+        app.touch(Touch::Move(track.x + track.w, y), &f, 1000);
+        assert_eq!(app.touch(Touch::Up, &f, 1000), vec![Effect::Flash { partition: "boot", pick: Pick::Single }]);
+    }
+
+    #[test]
+    fn a_local_image_can_be_cancelled_before_the_confirmation() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        app.open(Screen::Installing);
+        app.state.source = Source::Opened { drive: false };
+        app.install(Event::Checking { size: 1 << 20 }, 0);
+        app.install(Event::Progress(Stage::InspectingImage { done: 512, total: 1 << 20 }), 0);
+        app.frame(&f, &i);
+        assert_eq!(app.key(Key::Back, 1000), vec![Effect::Cancel]);
+        assert_eq!(app.state.install, Install::Ending);
+    }
+
+    #[test]
+    fn a_local_image_error_after_the_write_phase_begins_marks_the_target() {
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        app.state.install = Install::Flashing { partition: "boot", stage: None };
+        app.install(Event::Progress(Stage::Flashing { done: 0, total: 256 << 20 }), 0);
+        app.install(Event::Finished(Outcome::Failed(skyward_install::Failure::Error("partial first write".into()))), 1);
+        assert!(matches!(app.state.install, Install::Finished { damage: Some(Damage::Partition("boot")), .. }));
+    }
+
+    #[test]
+    fn a_local_image_returned_from_confirmation_does_not_flash() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        app.open(Screen::Installing);
+        app.state.source = Source::Opened { drive: false };
+        let kind = ImageKind::Boot { kernel: true, ramdisk: skyward_install::Ramdisk::Recovery };
+        app.install(Event::LocalImage { kind, size: 1 << 20, partition: "recovery", sha256: "cd".repeat(32) }, 0);
+        app.frame(&f, &i);
+        assert_eq!(app.key(Key::Back, 1000), vec![Effect::Cancel]);
     }
 
     #[test]

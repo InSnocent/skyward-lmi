@@ -11,6 +11,7 @@ pub mod commands;
 pub mod fuse;
 pub mod image;
 pub mod keep;
+pub mod local_image;
 pub mod ota;
 pub mod package;
 pub mod script;
@@ -98,6 +99,8 @@ pub enum Event {
     /// A partition image, held until [`Command::Flash`] says where it goes:
     /// the partitions of this phone it fits, the likeliest first.
     Image { kind: ImageKind, size: u64, partitions: Vec<&'static str> },
+    /// A checked, immutable lmi image for its one non-slotted target.
+    LocalImage { kind: ImageKind, size: u64, partition: &'static str, sha256: String },
     /// A zip that installs itself by running the script inside it, held
     /// until [`Command::Install`]: a script may write over any partition,
     /// so it always waits.
@@ -140,6 +143,8 @@ pub enum Reflash {
 /// How far the work is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Stage {
+    /// A local image is read, checked and cached before confirmation.
+    InspectingImage { done: u64, total: u64 },
     /// update_engine writes the new system: the bytes of its payload read
     /// so far.
     Writing { done: u64, total: u64 },

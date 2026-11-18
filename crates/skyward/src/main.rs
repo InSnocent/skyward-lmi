@@ -43,6 +43,8 @@ mod services;
 #[cfg(any(target_os = "android", test))]
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
 mod settings;
+#[cfg(any(target_os = "android", test))]
+mod storage;
 #[cfg(target_os = "android")]
 mod systems;
 #[cfg(target_os = "android")]

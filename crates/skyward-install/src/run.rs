@@ -23,7 +23,7 @@ use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::fs::{symlink, PermissionsExt};
+use std::os::unix::fs::{symlink, FileTypeExt, PermissionsExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -105,6 +105,13 @@ impl Installer {
         let digest_path = Path::new("/").join(skyward_config::ramdisk::BLOCK_OTA_DIGEST);
         let digest = read_block_digest(&digest_path)?;
         Installer::spawn(Origin::BlockFileInstall(digest), detach, Options::default(), move |ctx| run_file(ctx, &path))
+    }
+
+    /// Prepare an IMG for lmi's independent boot or recovery partition.
+    /// No sideload, OTA script or dynamic-partition detach is involved.
+    pub fn open_lmi_image(file: File) -> Result<Installer> {
+        check_lmi_image_targets()?;
+        Installer::spawn(Origin::LocalImage, Box::new(|| Ok(())), Options::default(), move |ctx| run_local_image(ctx, file))
     }
 
     /// Install the file at `path`, from a thread of its own; `detach` and
@@ -227,6 +234,7 @@ enum Origin {
     BlockPreflight(Option<[u8; 32]>),
     BlockInstall([u8; 32]),
     BlockFileInstall([u8; 32]),
+    LocalImage,
     /// A file on the phone.
     File,
     /// The system, which asked before the recovery started for a package
@@ -329,6 +337,61 @@ fn receive(ctx: &mut Context, mut conn: Connection<Endpoints>, offer: Offer, res
 }
 
 /// Install the file at `path`, read where it is.
+fn check_lmi_image_targets() -> Result<()> {
+    ensure!(prop("ro.product.device").as_deref() == Some("lmi") && skyward_vab::current_slot()?.is_none(),
+        "local IMG installation requires the single-slot lmi device");
+    for name in ["boot", "recovery"] {
+        let path = Path::new(skyward_block::BY_NAME).join(name);
+        ensure!(fs::metadata(&path)?.file_type().is_block_device(), "{name} is not a block partition");
+        ensure!(skyward_block::size_bytes(&path)? == crate::local_image::PARTITION_BYTES, "unexpected {name} partition capacity");
+    }
+    Ok(())
+}
+
+/// An isolated IMG path: immutable RAM snapshot, explicit confirmation,
+/// one validated physical target, and whole-partition readback.
+fn run_local_image(ctx: &mut Context, file: File) -> Outcome {
+    let mut committed = false;
+    let result = (|| -> Result<Outcome> {
+        check_lmi_image_targets()?;
+        if let Some(refusal) = battery()? { return Ok(Outcome::Refused(refusal)); }
+        let size = file.metadata()?.len();
+        ctx.send(Event::Checking { size });
+        let mut told: Option<Instant> = None;
+        let mut image = crate::local_image::prepare_file(file, &|| ctx.shared.cancelled(), &mut |done, total| {
+            if done == total || told.is_none_or(|at| at.elapsed() >= PROGRESS_EVERY) {
+                ctx.send(Event::Progress(Stage::InspectingImage { done, total }));
+                told = Some(Instant::now());
+            }
+        })?;
+        if ctx.shared.cancelled() { return Ok(Outcome::Cancelled); }
+        ctx.send(Event::LocalImage { kind: image.kind, size: image.size, partition: image.partition, sha256: image.sha256.clone() });
+        let (partition, slots) = match ctx.commands.recv() {
+            Ok(Command::Flash { partition, slots }) => (partition, slots),
+            Ok(Command::Cancel) | Err(_) => return Ok(Outcome::Cancelled),
+            Ok(other) => bail!("a local image awaiting confirmation received {other:?}"),
+        };
+        ensure!(partition == image.partition && slots.is_empty(), "the local image requires its one physical target");
+        if ctx.shared.cancelled() { return Ok(Outcome::Cancelled); }
+        check_lmi_image_targets()?;
+        if let Some(refusal) = battery()? { return Ok(Outcome::Refused(refusal)); }
+        committed = true;
+        let mut told: Option<Instant> = None;
+        image.flash(Path::new(skyward_block::BY_NAME), partition, &mut |done, total| {
+            if done == 0 || done == total || told.is_none_or(|at| at.elapsed() >= PROGRESS_EVERY) {
+                ctx.send(Event::Progress(Stage::Flashing { done, total }));
+                told = Some(Instant::now());
+            }
+        })?;
+        Ok(Outcome::Flashed { partition, slots: Vec::new() })
+    })();
+    match result {
+        Ok(outcome) => outcome,
+        Err(_) if !committed && ctx.shared.cancelled() => Outcome::Cancelled,
+        Err(error) => failed(error),
+    }
+}
+
 fn run_file(ctx: &mut Context, path: &Path) -> Outcome {
     let (file, offer) = match LocalFile::open(path) {
         Ok(opened) => opened,
@@ -477,7 +540,7 @@ fn conclude(done: Done, served: Result<Option<Fault>>, origin: Origin) -> Outcom
         (_, Err(e)) => failed(e.context("serve the package")),
         (_, Ok(Some(Fault::Transfer(why)))) => Outcome::Failed(match origin {
             Origin::Computer | Origin::SideloadTest | Origin::BlockPreflight(_) | Origin::BlockInstall(_) => Failure::Disconnected,
-            Origin::File | Origin::BlockFileInstall(_) | Origin::Asked { .. } => Failure::Unreadable(why),
+            Origin::File | Origin::LocalImage | Origin::BlockFileInstall(_) | Origin::Asked { .. } => Failure::Unreadable(why),
         }),
         (_, Ok(Some(Fault::Changed(_)))) => Outcome::Failed(Failure::Changed),
         (Done::Engine(code), Ok(None)) => Outcome::Failed(Failure::Engine(code)),
@@ -578,7 +641,7 @@ fn install_system(ctx: &Context, contents: &skyward_systems::package::Contents) 
 /// to itself, as with Android's own recovery.
 fn waits(origin: Origin, wipe: bool) -> bool {
     match origin {
-        Origin::File | Origin::BlockFileInstall(_) => true,
+        Origin::File | Origin::LocalImage | Origin::BlockFileInstall(_) => true,
         Origin::Computer | Origin::SideloadTest | Origin::BlockPreflight(_) | Origin::BlockInstall(_) => wipe,
         Origin::Asked { .. } => false,
     }
