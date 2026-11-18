@@ -3,6 +3,7 @@ use rustix::fs::{self as at, Mode, OFlags};
 use rustix::io::Errno;
 use skyward_files::Ownership;
 use skyward_ui::app::{FileKind, FileRow};
+use skyward_ui::settings::Settings;
 use skyward_ui::wallpaper::{Wallpaper, WallpaperCrop, MIN_OPACITY};
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Cursor, Read, Write};
@@ -16,6 +17,8 @@ pub const OWNER_STORAGE: &str = "/data/media/0";
 const SKYWARD: &str = "Skyward";
 const NAME: &str = ".wallpaper";
 const FROSTED_CARDS: &str = ".frosted-cards";
+const SETTINGS: &str = ".settings.json";
+const MAX_SETTINGS_BYTES: u64 = 64 * 1024;
 const MAGIC: &[u8; 4] = b"SWP1";
 const MAX_SOURCE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_SAVED_BYTES: u64 = 16 * 1024 * 1024;
@@ -146,6 +149,20 @@ pub fn save_frosted_cards(root: &Path, enabled: bool, ownership: Ownership) -> R
     })
 }
 
+pub fn load_settings(root: &Path) -> Result<Option<Settings>> {
+    let Some(folder) = open_store(root, None)? else { return Ok(None) };
+    let file = match open_regular(&folder, OsStr::new(SETTINGS)) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("open the saved settings"),
+    };
+    ensure!(file.metadata()?.len() <= MAX_SETTINGS_BYTES, "the settings file is too large");
+    let mut text = String::new();
+    file.take(MAX_SETTINGS_BYTES + 1).read_to_string(&mut text).context("read the saved settings")?;
+    ensure!(text.len() as u64 <= MAX_SETTINGS_BYTES, "the settings file is too large");
+    Settings::read(&text).map(|settings| Some(settings.appearance()))
+}
+
 pub fn reset(root: &Path) -> Result<()> {
     let Some(folder) = open_store(root, None)? else {
         return Ok(());
@@ -180,7 +197,7 @@ fn open_folder(root: &Path, relative: &Path) -> Result<File> {
     Ok(current)
 }
 
-fn open_regular(folder: &File, name: &OsStr) -> io::Result<File> {
+pub(crate) fn open_regular(folder: &File, name: &OsStr) -> io::Result<File> {
     let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
     let file = File::from(at::openat(folder, name, flags, Mode::empty())?);
     if !file.metadata()?.is_file() {
@@ -245,7 +262,7 @@ fn write_header(to: &mut dyn Write, opacity: u8) -> Result<()> {
     Ok(())
 }
 
-fn replace(
+pub(crate) fn replace(
     folder: &File,
     name: &str,
     ownership: Ownership,
@@ -370,6 +387,51 @@ mod tests {
         bytes[4] = 0;
         fs::write(&saved, bytes).unwrap();
         assert_eq!(load(root, (8, 16)).unwrap(), Some((old, MIN_OPACITY)));
+    }
+
+    #[test]
+    fn legacy_preferences_remain_readable_for_migration_alongside_the_existing_wallpaper() {
+        let folder = tempfile::tempdir().unwrap();
+        let root = folder.path();
+        assert!(load_settings(root).unwrap().is_none());
+        picture(root, "photo.png");
+        let wallpaper = import(root, "photo.png", 65, (8, 16), Ownership::Kept).unwrap();
+        save_frosted_cards(root, true, Ownership::Kept).unwrap();
+        let saved = Settings {
+            language: Some("en".into()),
+            spoken: Some("en".into()),
+            dark: true,
+            brightness: 0.6,
+            vibrate: false,
+            vibration: 0.4,
+            screen_off: 300,
+            time_zone: "Asia/Hong_Kong".into(),
+            ..Settings::default()
+        };
+        fs::write(root.join(SKYWARD).join(SETTINGS), saved.text()).unwrap();
+        assert_eq!(load_settings(root).unwrap(), Some(saved.appearance()));
+        assert_eq!(load(root, (8, 16)).unwrap(), Some((wallpaper, 65)));
+        assert!(load_frosted_cards(root).unwrap());
+    }
+
+    #[test]
+    fn settings_read_older_fields_and_reject_corrupt_oversized_or_linked_files() {
+        let folder = tempfile::tempdir().unwrap();
+        let root = folder.path();
+        fs::create_dir(root.join(SKYWARD)).unwrap();
+        fs::write(root.join(SKYWARD).join(SETTINGS), Settings::default().text()).unwrap();
+        let file = root.join(SKYWARD).join(SETTINGS);
+        fs::write(&file, r#"{ "dark": true, "future_setting": 1 }"#).unwrap();
+        assert!(load_settings(root).unwrap().unwrap().dark);
+        fs::write(&file, b"broken json").unwrap();
+        assert!(load_settings(root).is_err());
+        assert_eq!(fs::read(&file).unwrap(), b"broken json");
+        fs::write(&file, vec![b' '; MAX_SETTINGS_BYTES as usize + 1]).unwrap();
+        assert!(load_settings(root).is_err());
+        fs::remove_file(&file).unwrap();
+        fs::write(root.join("target.json"), Settings::default().text()).unwrap();
+        symlink(root.join("target.json"), &file).unwrap();
+        assert!(load_settings(root).is_err());
     }
 
     #[test]

@@ -25,6 +25,7 @@
 | 测试文件操作 | 使用单独测试文件完成重命名和复制，通过 MTP 回读后，两份文件的 SHA-256 均与原文件一致；其他文件写入操作仍需验证 |
 | 特殊文件名与 MTP 互斥 | 非 UTF-8 测试名称被图形界面拦截，同显示名称的合法文件可打开。终端运行时 MTP 撤出存储，退出后恢复；MTP 开启时重命名测试文件，恢复后回读的 SHA-256 与原件一致 |
 | 恢复页解密提示版 | 未解密时进入恢复页，点击提示完成解密；点「完成」后无需重新进入，即可看到已有备份。只查看，未执行整份恢复。刷入后音量上＋电源冷启动、返回 Android、Recovery 分区哈希和 SukiSU Root 核对通过 |
+| 解密前基础设置 | 旧版六项设置已完整迁移到 `/metadata/skyward/settings.json`。再次启动时，语言、主题、亮度、振动、屏幕关闭时间和时区在解密前均已恢复。首页可直接打开语言选择，未解密切换 English 和浅色后，配置文件回读核对通过 |
 
 实机验证范围限于上述 Redmi K30 Pro 和 Infinity-X 构建。合版验证了只读预检以及解密服务和挂载的正常释放。实际 ROM 写入由此前的安装版验证。未接通的菜单和完整恢复的限制见首页。 [当前限制](../README.zh-CN.md#当前限制)
 
@@ -136,6 +137,7 @@ sha256sum skyward-lmi.img
 
 | 文件 | 实机测试或构建输入的 SHA-256 |
 | --- | --- |
+| `lmi-skyward-settings-preunlock-test-v4-20261118.img`（解密前基础设置版） | `522d5f1251a4fef00e29d811c7263c96474bb906a7ee11b734b10b6c9074b365` |
 | `lmi-skyward-restore-refresh-test-v9.img`（恢复页解密提示版） | `b09840c4f0585c2c021b6ca6d9ce3dc0bd93da527ffb1e5893eb9c95bce5c5e1` |
 | `lmi-skyward-features-global-test-v2.img`（临时功能版） | `f890cc4e12c3a28519b33d4dbfef139bbbf312dcc4e2edc8fa3363b0cc881d33` |
 | `lmi-skyward-security-test-v6.img`（临时文件与 MTP 测试版） | `b76bc2e35619fb3af88703fd4ea736ebf4abebba87f5701b0180df7d856f948f` |

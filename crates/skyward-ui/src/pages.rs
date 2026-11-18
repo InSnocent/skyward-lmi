@@ -296,6 +296,10 @@ pub fn home(cx: &Ctx) -> Frame {
     // phone can hold a second system, the two systems.
     let mut rows = Vec::new();
     let mut opens = Vec::new();
+    if cx.state.offers(Screen::Wallpaper) {
+        rows.push(Row::new("Language / 语言").icon(BLUE, Icon::Globe).trail(Trail::Value(l.name())));
+        opens.push(Action::Open(Screen::Language));
+    }
     if let Some(w) = &cx.state.wlan {
         rows.push(Row::new(l.pick(WLAN)).icon(BLUE, Icon::Wlan).trail(Trail::Value(fmt::wlan_value(l, w))));
         opens.push(Action::Open(Screen::Wlan));

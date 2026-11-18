@@ -3342,6 +3342,19 @@ impl App {
         self.refresh();
     }
 
+    /// Restore personal preferences as soon as the settings volume is read.
+    /// Operational choices remain those of the current recovery session.
+    pub fn take_appearance(&mut self, kept: &Settings) {
+        kept.apply_appearance(&mut self.state);
+        self.state.brightness = self.state.brightness.max(MIN_BRIGHTNESS);
+        if !self.state.language_chosen {
+            if let Some(lang) = kept.spoken() {
+                self.state.lang = lang;
+            }
+        }
+        self.refresh();
+    }
+
     /// The page's readings changed (battery, storage): render it again.
     pub fn refresh(&mut self) {
         self.frame = None;
@@ -7624,6 +7637,24 @@ mod tests {
     }
 
     #[test]
+    fn lmi_home_opens_language_selection_before_data_is_unlocked() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        app.enable_wallpaper();
+        assert!(!app.state.data.storage_open());
+        assert!(app.frame(&f, &i).hits.iter().any(|hit| hit.action == Action::Open(Screen::Language)));
+        assert!(tap(&mut app, &f, &i, Action::Open(Screen::Language)).is_empty());
+        assert!(tap(&mut app, &f, &i, Action::Language(Lang::En)).is_empty());
+        assert_eq!(app.state.lang, Lang::En);
+        assert_eq!(app.settings().language.as_deref(), Some("en"));
+        assert!(!app.state.data.storage_open());
+        app.back(0);
+        assert_eq!(app.screen(), Screen::Home);
+        assert!(tap(&mut app, &f, &i, Action::Open(Screen::Settings)).is_empty());
+        assert_eq!(app.frame(&f, &i).hits.first().unwrap().action, Action::Theme { dark: false });
+    }
+
+    #[test]
     fn wallpaper_appearance_offers_a_frosted_cards_switch() {
         let (f, i) = (fonts(), info());
         let mut app = App::new(Screen::Settings, W, H, PPD);
@@ -9219,6 +9250,28 @@ mod tests {
         let mut first = App::new(Screen::Fastboot, W, H, PPD);
         first.take_settings(None, None);
         assert_eq!(first.state.lang, State::default().lang, "and with nothing kept, the pages' own");
+    }
+
+    #[test]
+    fn appearance_restoration_refreshes_the_frame_and_uses_a_visible_brightness() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Settings, 360, 800, 1.0);
+        app.state.file_transfer = false;
+        app.state.check_signature = true;
+        app.frame(&f, &i);
+        assert!(app.frame.is_some());
+        app.take_appearance(&Settings {
+            spoken: Some("en".into()),
+            dark: true,
+            brightness: 0.0,
+            ..Settings::default()
+        });
+        assert!(app.frame.is_none());
+        assert_eq!(app.state.lang, Lang::En);
+        assert!(app.state.dark);
+        assert_eq!(app.state.brightness, MIN_BRIGHTNESS);
+        assert!(app.state.check_signature);
+        assert!(!app.state.file_transfer);
     }
 
     #[test]

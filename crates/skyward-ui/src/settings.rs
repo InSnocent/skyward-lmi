@@ -141,6 +141,21 @@ impl Settings {
         }
     }
 
+    /// Keep the user's interface choices independently of operational options.
+    pub fn appearance(&self) -> Self {
+        Self {
+            language: self.language.clone(),
+            spoken: self.spoken.clone(),
+            dark: self.dark,
+            brightness: self.brightness,
+            screen_off: self.screen_off,
+            time_zone: self.time_zone.clone(),
+            vibrate: self.vibrate,
+            vibration: self.vibration,
+            ..Self::default()
+        }
+    }
+
     /// Read settings as [`Settings::text`] writes them.
     pub fn read(text: &str) -> Result<Settings> {
         serde_json::from_str(text).context("read the settings")
@@ -165,6 +180,26 @@ impl Settings {
     /// a slider's place between its ends, a time, a time zone, a part or a
     /// place they offer. Any other stays as it is.
     pub fn apply(&self, state: &mut State) {
+        self.apply_appearance(state);
+        state.file_transfer = self.file_transfer;
+        state.check_signature = self.install.check_signature;
+        state.keep_recovery = self.install.keep_recovery;
+        state.backup = picked(&self.backup.parts, &PARTS);
+        match self.backup.to.as_str() {
+            STORAGE => state.backup_to = Place::Storage,
+            USB_DRIVE => state.backup_to = Place::UsbDrive,
+            _ => {}
+        }
+        state.compress = self.backup.compress;
+        state.verify = self.backup.verify;
+        state.logs = picked(&self.logs.kinds, &LOGS);
+        if let Some(at) = LOG_PLACES.iter().position(|place| *place == self.logs.to) {
+            state.logs_to = at;
+        }
+    }
+
+    /// Restore the interface without changing the current operation.
+    pub fn apply_appearance(&self, state: &mut State) {
         if let Some(lang) = self.chosen() {
             state.lang = lang;
             state.language_chosen = true;
@@ -182,21 +217,6 @@ impl Settings {
         state.vibrate = self.vibrate;
         if (0.0..=1.0).contains(&self.vibration) {
             state.vibration = self.vibration;
-        }
-        state.file_transfer = self.file_transfer;
-        state.check_signature = self.install.check_signature;
-        state.keep_recovery = self.install.keep_recovery;
-        state.backup = picked(&self.backup.parts, &PARTS);
-        match self.backup.to.as_str() {
-            STORAGE => state.backup_to = Place::Storage,
-            USB_DRIVE => state.backup_to = Place::UsbDrive,
-            _ => {}
-        }
-        state.compress = self.backup.compress;
-        state.verify = self.backup.verify;
-        state.logs = picked(&self.logs.kinds, &LOGS);
-        if let Some(at) = LOG_PLACES.iter().position(|place| *place == self.logs.to) {
-            state.logs_to = at;
         }
     }
 }
@@ -271,6 +291,13 @@ impl Keeper {
         }
     }
 
+    /// What still needs saving before a deliberate exit, even when it has
+    /// not stood for the normal wait. An unreadable store remains untouched.
+    pub fn pending(&self, show: Settings) -> Option<Settings> {
+        let holds = self.holds.as_ref()?;
+        (holds.as_ref() != Some(&show)).then_some(show)
+    }
+
     /// `settings` are in the file now.
     pub fn written(&mut self, settings: Settings) {
         self.holds = Some(Some(settings));
@@ -323,6 +350,55 @@ mod tests {
         kept.apply(&mut back);
         assert_eq!(Settings::of(&back), Settings::of(&state));
         assert_eq!((back.lang, back.screen_off, back.time_zone), (Lang::En, 6, 7));
+    }
+
+    #[test]
+    fn appearance_preferences_exclude_operational_options() {
+        let mut state = State::default();
+        let first = Settings::of(&state).appearance();
+        state.check_signature = !state.check_signature;
+        state.keep_recovery = !state.keep_recovery;
+        state.file_transfer = !state.file_transfer;
+        state.backup_to = Place::UsbDrive;
+        state.verify = !state.verify;
+        state.logs_to = 1;
+        assert_eq!(Settings::of(&state).appearance(), first);
+        state.dark = !state.dark;
+        assert_ne!(Settings::of(&state).appearance(), first);
+    }
+
+    #[test]
+    fn appearance_preferences_restore_while_the_current_operation_stays_in_place() {
+        let mut current = State {
+            check_signature: true,
+            file_transfer: true,
+            backup: [false, false, true, false],
+            backup_to: Place::Storage,
+            verify: true,
+            ..State::default()
+        };
+        let before = Settings::of(&current);
+        let saved = Settings {
+            language: Some("en".into()),
+            dark: true,
+            brightness: 0.4,
+            vibration: 0.25,
+            vibrate: false,
+            screen_off: 120,
+            time_zone: "Asia/Hong_Kong".into(),
+            file_transfer: false,
+            backup: Backup { parts: vec!["boot".into()], to: "usb_drive".into(), verify: false, ..Backup::default() },
+            install: Install { check_signature: false, keep_recovery: false },
+            ..Settings::default()
+        };
+        saved.apply_appearance(&mut current);
+        let after = Settings::of(&current);
+        assert_eq!((after.file_transfer, after.install, after.backup, after.logs),
+                   (before.file_transfer, before.install, before.backup, before.logs));
+        assert_eq!((current.lang, current.dark, current.brightness, current.vibrate, current.vibration),
+                   (Lang::En, true, 0.4, false, 0.25));
+        assert_eq!(SCREEN_OFF[current.screen_off], Some(120_000));
+        assert_eq!(TIME_ZONES[current.time_zone].2, "Asia/Hong_Kong");
     }
 
     #[test]
@@ -387,6 +463,22 @@ mod tests {
         assert_eq!(keeper.due(dim.clone(), 9_000), None, "and once");
         assert_eq!(keeper.due(Settings::default(), 9_000), None, "going back starts another wait");
         assert_eq!(keeper.due(Settings::default(), 11_000), Some(Settings::default()));
+    }
+
+    #[test]
+    fn an_immediate_exit_can_keep_the_latest_settings_before_the_wait() {
+        let start = Settings::default();
+        let mut keeper = Keeper::new(&Kept::Settings(start.clone()));
+        assert!(keeper.pending(start).is_none());
+        let changed = Settings { dark: true, ..Settings::default() };
+        assert!(keeper.due(changed.clone(), 100).is_none());
+        assert_eq!(keeper.pending(changed.clone()), Some(changed.clone()));
+        keeper.failed();
+        assert!(keeper.due(changed.clone(), 5000).is_none());
+        assert_eq!(keeper.pending(changed.clone()), Some(changed.clone()), "a deliberate exit retries once");
+        keeper.written(changed.clone());
+        assert!(keeper.pending(changed.clone()).is_none());
+        assert!(Keeper::new(&Kept::Unreadable).pending(changed).is_none());
     }
 
     #[test]

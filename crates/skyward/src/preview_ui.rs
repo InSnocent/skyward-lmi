@@ -10,6 +10,7 @@ use anyhow::{ensure, Context, Result};
 use skyward_config::{ramdisk, DeviceConfig};
 use skyward_install::{block_preflight, sideload_test, Event as InstallEvent, Installer};
 use skyward_ui::app::{BackupAt, Data, Effect, FileOp, FileTask, JobEnd, MountRow, Place, RenameRefused, Screen, Target};
+use skyward_ui::settings::{Kept, Keeper};
 use skyward_ui::surface::kms::KmsSurface;
 use skyward_ui::wallpaper::{Wallpaper, WallpaperCrop};
 use skyward_ui::{App, Canvas, Fonts, Lang, Surface};
@@ -58,7 +59,17 @@ fn exercise(cfg: &DeviceConfig, inspect: bool) -> Result<()> {
 
     let mut app = App::new(Screen::Home, width, height, cfg.display.density as f32 / 160.0);
     app.set_screen_corners(cfg.display.corner_radius as f32);
-    app.take_settings(None, Some(Lang::Hans));
+    let kept = if data_backup { crate::settings::read()? } else { Kept::Nothing };
+    if let Some(settings) = kept.settings() {
+        app.take_appearance(settings);
+    }
+    let named = info.locale.as_deref().and_then(|locale| Lang::for_locale(locale).ok());
+    app.take_settings(None, named);
+    let legacy_settings_pending = data_backup && matches!(&kept, Kept::Nothing);
+    let settings_keeper = match &kept {
+        Kept::Unreadable => Keeper::new(&kept),
+        _ => Keeper::new(&Kept::Settings(app.settings().appearance())),
+    };
     // The A-only runtime starts MTP when the user enables it.
     app.state.file_transfer = false;
     if data_backup {
@@ -104,6 +115,8 @@ fn exercise(cfg: &DeviceConfig, inspect: bool) -> Result<()> {
         terminal_sessions: Vec::new(),
         terminal_check_at: 0,
         wallpaper_job: None,
+        settings_keeper,
+        legacy_settings_pending,
         fixture_started: false,
         job: None,
         closed: Vec::new(),
@@ -284,6 +297,7 @@ fn exercise(cfg: &DeviceConfig, inspect: bool) -> Result<()> {
                     app.screenshots_not_kept(&format!("{error:#}"), now);
                 }
                 let root = Path::new(OWNER_STORAGE);
+                data.migrate_settings(&mut app, now);
                 match wallpaper::load_frosted_cards(root) {
                     Ok(on) => app.set_frosted_cards(on),
                     Err(error) => {
@@ -325,6 +339,9 @@ fn exercise(cfg: &DeviceConfig, inspect: bool) -> Result<()> {
                 Event::Key(key, false) => app.key_up(key, monotonic_ms()),
             };
             handle(&mut app, &mut haptics, &mut installer, &mut data, cfg, &info, &fonts, &canvas, effects, monotonic_ms())?;
+        }
+        if installer.is_none() {
+            data.keep_settings(&mut app, monotonic_ms(), false);
         }
     }
 }
@@ -406,12 +423,56 @@ struct DataWork {
     terminal_sessions: Vec<u32>,
     terminal_check_at: u64,
     wallpaper_job: Option<WallpaperJob>,
+    settings_keeper: Keeper,
+    legacy_settings_pending: bool,
     fixture_started: bool,
     job: Option<Decryptor>,
     closed: Vec<Closed>,
 }
 
 impl DataWork {
+    fn keep_settings(&mut self, app: &mut App, now: u64, flush: bool) {
+        if !self.data_backup || self.install_committed || !self.tasks_idle() {
+            return;
+        }
+        let settings = app.settings().appearance();
+        let due = if flush { self.settings_keeper.pending(settings) } else { self.settings_keeper.due(settings, now) };
+        let Some(due) = due else { return };
+        match crate::settings::write(&due) {
+            Ok(()) => {
+                self.settings_keeper.written(due);
+                self.legacy_settings_pending = false;
+            }
+            Err(error) => {
+                self.settings_keeper.failed();
+                let name = app.state.lang.pick(["保存设置", "儲存設定", "Save settings"]);
+                hardware_error(app, name, &error, now);
+            }
+        }
+    }
+
+    fn migrate_settings(&mut self, app: &mut App, now: u64) {
+        if !std::mem::take(&mut self.legacy_settings_pending) {
+            return;
+        }
+        // A newer choice made before unlocking takes priority over the old
+        // shared-storage record.
+        if self.settings_keeper.pending(app.settings().appearance()).is_none() {
+            match wallpaper::load_settings(Path::new(OWNER_STORAGE)) {
+                Ok(Some(settings)) => {
+                    app.take_appearance(&settings);
+                    self.settings_keeper.remade();
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let name = app.state.lang.pick(["读取旧设置", "讀取舊設定", "Read old settings"]);
+                    hardware_error(app, name, &error, now);
+                }
+            }
+        }
+        self.keep_settings(app, now, true);
+    }
+
     fn wallpaper_storage(&self, app: &App, installer: &Option<Installer>) -> Result<&'static Path> {
         ensure!(app.state.data.storage_open() && !self.install_committed, "decrypt internal storage first");
         ensure!(self.idle() && installer.is_none(), "finish the current operation first");
@@ -530,6 +591,7 @@ fn handle(
                 if !crate::ui::withhold(&mut data.transfer, app, now)? {
                     continue;
                 }
+                data.keep_settings(app, now, true);
                 if data.enabled {
                     let closed = if data.install_committed {
                         crate::legacy_data::finish()
@@ -547,12 +609,14 @@ fn handle(
             }
             Effect::OpenData if data.enabled && data.idle() && !data.fixture_started
                 && !data.install_committed && installer.is_none() => {
+                data.keep_settings(app, now, true);
                 data.job = Some(Decryptor::start(Job::OpenLmi { readonly: !(data.app_restore_test || data.data_backup) })?);
             }
             Effect::OpenData if data.enabled => {
                 app.data_failed("请先结束当前操作，或重启 Recovery 后解密".into());
             }
             Effect::Unlock { user, code } if data.enabled && data.idle() && installer.is_none() && !data.install_committed => {
+                data.keep_settings(app, now, true);
                 data.job = Some(Decryptor::start(Job::Unlock { closed: data.closed.clone(), user, credential: code.into_bytes() })?);
             }
             Effect::Unlock { .. } if data.enabled => {
@@ -733,6 +797,7 @@ fn handle(
                         "Computer file transfer pauses while the terminal runs",
                     ]), now);
                 }
+                data.keep_settings(app, now, true);
                 let (rows, cols) = app.term_size(fonts);
                 match pty::Shell::start(rows, cols, &cfg.device.codename, Path::new(&folder)) {
                     Ok(shell) => {
@@ -963,6 +1028,7 @@ fn handle(
             Effect::Install if app.state.sideload_test || app.state.block_ota_install => {
                 if let Some(active) = installer.as_ref() {
                     if app.state.block_ota_install && !app.state.sideload_preflight {
+                        data.keep_settings(app, now, true);
                         data.install_committed = true;
                         data.closed.clear();
                         app.data_failed("请重启 Recovery 后再解密".into());

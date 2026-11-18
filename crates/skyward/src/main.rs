@@ -40,7 +40,8 @@ mod relabel;
 mod secure;
 #[cfg(target_os = "android")]
 mod services;
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", test))]
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
 mod settings;
 #[cfg(target_os = "android")]
 mod systems;
