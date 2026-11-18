@@ -3,6 +3,7 @@
 
 pub mod archive;
 pub mod store;
+pub mod verify;
 
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};

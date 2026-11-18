@@ -1,5 +1,5 @@
 use crate::app::{
-    Action, BackupAt, BackupEnd, BackupJob, Check, ClashChoice, Confirm, Damage, Data, Dock, DownloadEnd, EraseStop, Field, FileKind,
+    Action, BackupAt, BackupEnd, BackupJob, BackupKind, Check, ClashChoice, Confirm, Damage, Data, Dock, DownloadEnd, EraseStop, Field, FileKind,
     FileOp, FileTask, Fold, Folder, Frame, FsAction, FsChoice, FsRow, Have, HeroArt, Hit, Install, JobEnd, Keys, Pick, Place, Rows, Screen,
     SkywardCheck, SkywardEnd, SkywardJob, SkywardStage, Slider, Source, State, Switch, SystemsWork, Target, UsbDrive, UsbLink, Wipe, ADDABLE,
     BACKUP_PARTS, DATA_ERASED, DATA_PARTITION, DOWNLOADS, FASTBOOT_CHOICES, SCREEN_OFF, TARGETS, TIME_ZONES, USB_DRIVE_UNREADABLE,
@@ -2225,11 +2225,19 @@ pub fn restore_backup(cx: &Ctx) -> Frame {
     let mut c = long_page(cx);
     let mut out = Vec::new();
     let top = t.m.content_top;
+    let start = if s.data_backup_only && entry.place == Place::Storage && s.place_open(entry.place) {
+        let check = widgets::list(&mut c, t, f, top, &[
+            Row::new(l.pick(["校验备份", "驗證備份", "Verify backup"])).icon(BLUE, Icon::Shield)
+                .subtitle(l.pick(["检查备份文件，不恢复数据", "檢查備份檔案，不還原資料", "Checks backup files without restoring data"])),
+        ]);
+        out.extend(hits(&check.rows, &[Action::VerifyBackup]));
+        check.bottom + t.m.card_gap
+    } else { top };
     let location = l.pick(["位置", "位置", "Location"]);
     let y = match &entry.held {
         Err(why) => {
             let facts = [(l.pick(["文件夹", "資料夾", "Folder"]), entry.name.clone()), (location, place_name(l, entry.place).to_string())];
-            let y = widgets::info_card(&mut c, t, f, top, &facts);
+            let y = widgets::info_card(&mut c, t, f, start, &facts);
             let note = tr!(
                 l,
                 "无法读取该备份，备份可能未完成或已损坏。{why}",
@@ -2250,7 +2258,7 @@ pub fn restore_backup(cx: &Ctx) -> Frame {
             if let Some(slot) = held.slot {
                 facts.push((l.pick(["槽位", "槽位", "Slot"]), slot.letter().to_string()));
             }
-            let y = widgets::info_card(&mut c, t, f, top, &facts);
+            let y = widgets::info_card(&mut c, t, f, start, &facts);
             if held.device != i.codename {
                 let device = &held.device;
                 let note = tr!(
@@ -2327,8 +2335,8 @@ fn job_progress(job: &BackupJob, a: &BackupAt) -> (f32, u64) {
     let total: u64 = job.plan.iter().map(|(_, n)| n).sum();
     let before: u64 = job.plan[..a.item].iter().map(|(_, n)| n).sum();
     let passed = before as f64 + f64::from(part_share(a)) * job.plan[a.item].1 as f64;
-    let second = job.checks && a.checking != job.restore;
-    let passes = if job.checks { 2.0 } else { 1.0 };
+    let second = job.kind.checks() && a.checking != job.kind.restores();
+    let passes = if job.kind.checks() { 2.0 } else { 1.0 };
     let over = (if second { total as f64 } else { 0.0 } + passed) / (passes * total.max(1) as f64);
     (over as f32, passed as u64)
 }
@@ -2350,11 +2358,12 @@ const DONE: Text = ["完成", "完成", "Done"];
 /// Where part `k` of a backup or restore stands, as its row says it.
 fn part_state(l: Lang, job: &BackupJob, k: usize) -> String {
     use std::cmp::Ordering;
-    let (did, doing) = job_words(job.restore);
+    let (did, doing) = job_words(job.kind.restores());
     let ended = job.outcome.is_some();
     let a = match (&job.outcome, job.at) {
-        (Some(BackupEnd::Saved(_)), _) => return l.pick(if job.checks { VERIFIED } else { did }).to_string(),
+        (Some(BackupEnd::Saved(_)), _) => return l.pick(if job.kind.checks() { VERIFIED } else { did }).to_string(),
         (Some(BackupEnd::Restored { .. }), _) => return l.pick(did).to_string(),
+        (Some(BackupEnd::Verified), _) => return l.pick(VERIFIED).to_string(),
         (_, None) => return l.pick(if ended { ["未开始", "未開始", "Not started"] } else { WAITING_TURN }).to_string(),
         (_, Some(a)) => a,
     };
@@ -2365,7 +2374,8 @@ fn part_state(l: Lang, job: &BackupJob, k: usize) -> String {
         Ordering::Equal => return format!("{} {}%", l.pick(if a.checking { VERIFYING } else { doing }), percent(part_share(&a))),
         // Ahead of the pass under way: a backup checks its parts once all
         // are written, and a restore writes them once all are checked.
-        Ordering::Greater => match (a.checking, job.restore, ended) {
+        Ordering::Greater if job.kind == BackupKind::Verify => if ended { ["未校验", "未驗證", "Not verified"] } else { WAITING_TURN },
+        Ordering::Greater => match (a.checking, job.kind.restores(), ended) {
             (true, false, false) => did,
             (true, false, true) => ["未校验", "未驗證", "Not verified"],
             (false, false, false) | (true, true, false) => WAITING_TURN,
@@ -2386,8 +2396,9 @@ pub fn backup_job(cx: &Ctx) -> Frame {
     let mut c = long_page(cx);
     let mut out = Vec::new();
     let top = t.m.content_top;
-    let (did, doing) = job_words(job.restore);
-    let icon = if job.restore { Icon::Restore } else { Icon::Backup };
+    let verifying = job.kind == BackupKind::Verify;
+    let (did, doing) = if verifying { (VERIFIED, VERIFYING) } else { job_words(job.kind.restores()) };
+    let icon = if verifying { Icon::Shield } else if job.kind.restores() { Icon::Restore } else { Icon::Backup };
     let writing = job.at.is_some_and(|a| !a.checking);
     let mut y = match &job.outcome {
         None => {
@@ -2399,7 +2410,12 @@ pub fn backup_job(cx: &Ctx) -> Frame {
                     let (name, passed) = (&job.plan[a.item].0, fmt::bytes(passed));
                     (format!("{verb} {name}"), tr!(l, "{past} {passed}，共 {total}", "{past} {passed}，共 {total}", "{past} {passed} of {total}"), over)
                 }
-                None if job.restore => (
+                None if verifying => (
+                    l.pick(["正在读取备份", "正在讀取備份", "Reading the backup"]).to_string(),
+                    l.pick(["正在检查清单和分卷文件", "正在檢查清單和分卷檔案", "Checking the manifest and numbered volumes"]).to_string(),
+                    0.0,
+                ),
+                None if job.kind.restores() => (
                     l.pick(["正在读取备份", "正在讀取備份", "Reading the backup"]).to_string(),
                     l.pick(["正在核对备份与本机", "正在核對備份與本機", "Checking the backup against this phone"]).to_string(),
                     0.0,
@@ -2409,9 +2425,14 @@ pub fn backup_job(cx: &Ctx) -> Frame {
             widgets::progress_card(&mut c, t, f, top, &title, &detail, Some(done))
         }
         Some(end) => {
-            let gone = l.pick(if job.restore { ["未写入任何内容。", "未寫入任何內容。", "Nothing was written."] } else { ["未保存任何备份。", "未儲存任何備份。", "No backup was saved."] });
-            let failed = l.pick(if job.restore { RESTORE_FAILED } else { ["备份失败", "備份失敗", "Backup failed"] });
+            let gone = l.pick(if verifying { ["未执行恢复，原备份保持不变。", "未執行還原，原備份保持不變。", "Nothing was restored. The original backup is unchanged."] } else if job.kind.restores() { ["未写入任何内容。", "未寫入任何內容。", "Nothing was written."] } else { ["未保存任何备份。", "未儲存任何備份。", "No backup was saved."] });
+            let failed = l.pick(if verifying { VERIFY_FAILED } else if job.kind.restores() { RESTORE_FAILED } else { ["备份失败", "備份失敗", "Backup failed"] });
             let (title, color, detail) = match end {
+                BackupEnd::Verified => (l.pick(VERIFY_COMPLETE), GREEN, l.pick([
+                    "所有分卷的长度与内容摘要均符合备份清单。恢复前仍需核对设备和加密密钥。",
+                    "所有分卷的長度與內容摘要均符合備份清單。還原前仍需核對裝置和加密金鑰。",
+                    "All volume lengths and content digests match the manifest. Restoring still requires a compatible device and encryption key.",
+                ]).to_string()),
                 BackupEnd::Saved(name) => {
                     let saved = match job.place {
                         Place::Storage => tr!(l, "已保存到内部存储的 Skyward/backups/{name}", "已儲存到內部儲存空間的 Skyward/backups/{name}", "Saved to Skyward/backups/{name} in internal storage"),
@@ -2422,12 +2443,12 @@ pub fn backup_job(cx: &Ctx) -> Frame {
                 BackupEnd::Restored { .. } => {
                     (l.pick(RESTORE_COMPLETE), GREEN, l.pick(["重启手机后，将使用恢复的内容。", "重新啟動手機後，將使用還原的內容。", "The phone uses what was restored once it reboots."]).to_string())
                 }
-                BackupEnd::Stopped => (l.pick(["已停止", "已停止", "Stopped"]), SLATE, gone.to_string()),
+                BackupEnd::Stopped => (l.pick(if verifying { VERIFY_STOPPED } else { ["已停止", "已停止", "Stopped"] }), SLATE, gone.to_string()),
                 BackupEnd::Refused(r) => {
-                    let title = l.pick(if job.restore { ["无法恢复", "無法還原", "Can't restore"] } else { ["无法备份", "無法備份", "Can't back up"] });
-                    (title, ORANGE, fmt::backup_refusal(l, r, job.restore))
+                    let title = l.pick(if verifying { ["无法校验", "無法驗證", "Can't verify"] } else if job.kind.restores() { ["无法恢复", "無法還原", "Can't restore"] } else { ["无法备份", "無法備份", "Can't back up"] });
+                    (title, ORANGE, fmt::backup_refusal(l, r, job.kind.restores()))
                 }
-                BackupEnd::Failed(_) if job.restore && writing => {
+                BackupEnd::Failed(_) if job.kind.restores() && writing => {
                     let detail = l.pick([
                         "部分内容已写入，重启后可能无法正常启动。请重新恢复，完成后再重启。",
                         "部分內容已寫入，重新啟動後可能無法正常啟動。請重新還原，完成後再重新啟動。",
@@ -2446,14 +2467,16 @@ pub fn backup_job(cx: &Ctx) -> Frame {
     });
     match &job.outcome {
         None => {
-            let note = match (job.restore, job.at) {
+            let note = if verifying {
+                l.pick(["仅校验备份文件，不会恢复数据。可以随时停止。", "僅驗證備份檔案，不會還原資料。可以隨時停止。", "Only checks backup files. No data is restored, and you can stop at any time."]).to_string()
+            } else { match (job.kind.restores(), job.at) {
                 (false, _) => tr!(l, "备份完成前，{keep}停止后将删除未完成的备份。", "備份完成前，{keep}停止後將刪除未完成的備份。", "{keep} until the backup is done. Stopping deletes the unfinished backup."),
                 (true, Some(a)) if !a.checking => tr!(l, "恢复完成前，{keep}", "還原完成前，{keep}", "{keep} until the restore is done."),
                 (true, _) => l.pick(["校验备份完成前，不会写入任何内容。", "驗證備份完成前，不會寫入任何內容。", "Nothing is written until the backup is verified."]).to_string(),
-            };
+            } };
             y = widgets::footnote(&mut c, t, f, y, &note);
             // A restore that has begun writing goes on to its end.
-            if !(job.restore && writing) {
+            if !(job.kind.restores() && writing) {
                 let label = l.pick(if job.stopping { ["正在停止", "正在停止", "Stopping"] } else { STOP });
                 let stop = widgets::list(&mut c, t, f, y + t.m.card_gap, &[Row::new(label).trail(Trail::None)]);
                 if !job.stopping {
@@ -2492,22 +2515,32 @@ pub fn backup_job(cx: &Ctx) -> Frame {
     // The parts come after what can be done, which a long list would push
     // off the screen.
     if !job.plan.is_empty() {
-        let heading = l.pick(if job.restore { ["恢复内容", "還原內容", "Contents"] } else { ["备份内容", "備份內容", "Contents"] });
+        let heading = l.pick(if verifying { ["校验内容", "驗證內容", "Contents"] } else if job.kind.restores() { ["恢复内容", "還原內容", "Contents"] } else { ["备份内容", "備份內容", "Contents"] });
         let y0 = widgets::section(&mut c, t, f, y, heading);
         let states: Vec<String> = (0..job.plan.len()).map(|k| part_state(l, job, k)).collect();
         let rows: Vec<Row> = job.plan.iter().zip(&states).map(|((name, _), state)| Row::new(name).trail(Trail::Text(state))).collect();
         y = widgets::list(&mut c, t, f, y0, &rows).bottom;
     }
-    let title = l.pick(match (&job.outcome, job.restore) {
+    let title = l.pick(if verifying {
+        match &job.outcome {
+            None => VERIFYING,
+            Some(BackupEnd::Verified) => VERIFY_COMPLETE,
+            Some(BackupEnd::Stopped) => VERIFY_STOPPED,
+            Some(_) => VERIFY_FAILED,
+        }
+    } else { match (&job.outcome, job.kind.restores()) {
         (None, restore) => job_words(restore).1,
         (Some(BackupEnd::Saved(_)), _) => BACKUP_COMPLETE,
         (Some(BackupEnd::Restored { .. }), _) => RESTORE_COMPLETE,
         (Some(_), false) => ["备份未完成", "備份未完成", "Backup incomplete"],
         (Some(_), true) => ["恢复未完成", "還原未完成", "Restore incomplete"],
-    });
+    } });
     Frame { back: job.outcome.is_some(), ..Frame::new(t, fit(c, t, y), out, title, top) }
 }
 
+const VERIFY_COMPLETE: Text = ["校验通过", "驗證通過", "Verification passed"];
+const VERIFY_FAILED: Text = ["校验失败", "驗證失敗", "Verification failed"];
+const VERIFY_STOPPED: Text = ["校验已停止", "驗證已停止", "Verification stopped"];
 const BACKUP_COMPLETE: Text = ["备份完成", "備份完成", "Backup complete"];
 const RESTORE_COMPLETE: Text = ["恢复完成", "還原完成", "Restore complete"];
 const RESTORE_FAILED: Text = ["恢复失败", "還原失敗", "Restore failed"];
@@ -4345,11 +4378,28 @@ mod tests {
 
     fn job(restore: bool, checks: bool) -> BackupJob {
         let plan = vec![("boot".into(), 200), ("system".into(), 800)];
-        BackupJob { restore, place: Place::Storage, checks, plan, at: None, outcome: None, stopping: false }
+        let kind = if restore { BackupKind::Restore } else { BackupKind::Backup { checks } };
+        BackupJob { kind, place: Place::Storage, plan, at: None, outcome: None, stopping: false }
     }
 
     fn at(item: usize, done: u64, of: u64, checking: bool) -> BackupAt {
         BackupAt { item, done, of, checking }
+    }
+
+    #[test]
+    fn independent_verification_uses_one_pass_and_keeps_future_parts_waiting() {
+        let mut verifying = job(false, false);
+        verifying.kind = crate::app::BackupKind::Verify;
+        assert_eq!(job_progress(&verifying, &at(1, 400, 800, true)), (0.6, 600));
+        verifying.at = Some(at(0, 50, 200, true));
+        assert_eq!((0..2).map(|k| part_state(Lang::Hans, &verifying, k)).collect::<Vec<_>>(),
+                   ["正在校验 25%", "等待中"]);
+        verifying.outcome = Some(BackupEnd::Stopped);
+        assert_eq!((0..2).map(|k| part_state(Lang::Hans, &verifying, k)).collect::<Vec<_>>(),
+                   ["未完成", "未校验"]);
+        verifying.outcome = Some(BackupEnd::Verified);
+        assert_eq!((0..2).map(|k| part_state(Lang::En, &verifying, k)).collect::<Vec<_>>(),
+                   ["Verified", "Verified"]);
     }
 
     #[test]

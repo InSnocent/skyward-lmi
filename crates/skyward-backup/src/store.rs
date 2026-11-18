@@ -183,9 +183,16 @@ pub struct Reader {
 impl Reader {
     pub fn open(folder: &Path, stored: &Stored) -> Reader {
         let joined = Joined { folder: folder.to_path_buf(), names: stored.files.clone(), next: 0, open: None };
-        let source: Box<dyn Read + Send> = match stored.compressed {
-            true => Box::new(FrameDecoder::new(joined)),
-            false => Box::new(joined),
+        Self::from_source(joined, stored.compressed)
+    }
+
+    /// An anchored, checked volume reader can share the normal decompression
+    /// and content digest without reopening files through a path.
+    pub(crate) fn from_source(source: impl Read + Send + 'static, compressed: bool) -> Reader {
+        let source: Box<dyn Read + Send> = if compressed {
+            Box::new(FrameDecoder::new(source))
+        } else {
+            Box::new(source)
         };
         Reader { source, digest: Sha256::new(), size: 0 }
     }

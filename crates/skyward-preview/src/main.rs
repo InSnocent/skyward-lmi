@@ -10,7 +10,7 @@ use skyward_net::supplicant::Security;
 use skyward_net::wlan::{Bands, Joined, Link, Network, Power, Stage as Joining, Traffic, Wlan};
 use skyward_systems::{Named, Other, Overview, Who};
 use skyward_ui::app::{
-    Action, Adding, App, Asked, BackupAt, BackupEnd, BackupEntry, BackupJob, BackupRefusal, Choice, Clip, Damage, Data, DownloadEnd,
+    Action, Adding, App, Asked, BackupAt, BackupEnd, BackupEntry, BackupJob, BackupKind, BackupRefusal, Choice, Clip, Damage, Data, DownloadEnd,
     DownloadJob, EraseStop, Field, FileKind, FileOp, FileRow, FileTask, FsAction, FsRow, Have, Held, Install, ItemEnd, JobEnd, Key, Keys,
     MountFailure, MountRow, Part, PartKind, PartStop, Pick, Place, Screen, SkywardEnd, SkywardJob, SkywardStage, Source, SystemChoice,
     SystemsWork, TermEnd, Touch, UsbDrive, UsbLink, SCREEN_OFF,
@@ -124,6 +124,43 @@ type MountShot<'a> = (&'a str, bool, &'a DeviceInfo, Option<MountFailure>, &'a [
 /// File name, page, dark theme, and what to set before the page is drawn.
 type PageShot<'a> = (&'a str, Screen, bool, &'a dyn Fn(&mut App));
 
+/// Render only the lmi verification flow for visual review, with mock data.
+fn verification_previews(out: &Path, root: &Path, fonts: &Fonts) -> Result<()> {
+    let cfg = DeviceConfig::load(root.join("devices/lmi.toml"))?;
+    let info = nezha(&cfg);
+    let (w, h) = (cfg.display.width, cfg.display.height);
+    let ppd = cfg.display.density as f32 / 160.0;
+    for dark in [false, true] {
+        for (name, outcome) in [
+            ("details", None), ("progress", None), ("passed", Some(BackupEnd::Verified)),
+            ("stopped", Some(BackupEnd::Stopped)),
+            ("failed", Some(BackupEnd::Failed("check data: open data.tar.lz4.001: No such file or directory (os error 2)".into()))),
+        ] {
+            let mut app = App::new(Screen::RestoreBackup, w, h, ppd);
+            app.use_lmi_backup();
+            app.state.lang = lang();
+            app.state.dark = dark;
+            app.state.data = Data::Open;
+            let held = Held {
+                made: 1_793_000_000, size: 1_000_000, parts: [false, false, true, false],
+                device: cfg.device.codename.clone(), system: Some("Infinity-X 3.12".into()), slot: None,
+            };
+            app.state.restore = Some((BackupEntry { place: Place::Storage, name: "sample-backup".into(), held: Ok(held) }, [false, false, true, false]));
+            if name != "details" {
+                app.verification_started(Place::Storage);
+                app.backup_plan(vec![("data".into(), 2_000_000)]);
+                app.backup_at(BackupAt { item: 0, done: 1_140_000, of: 2_000_000, checking: true });
+                if let Some(outcome) = outcome { app.backup_ended(outcome, 0); }
+            }
+            let mode = if dark { "dark" } else { "light" };
+            let path = out.join(format!("verify-{name}-{mode}.png"));
+            write_png(&path, &whole_page(&mut app, fonts, &info))?;
+            println!("wrote {}", path.display());
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let out = PathBuf::from(args.get(1).map(String::as_str).unwrap_or("preview-out"));
@@ -148,6 +185,7 @@ fn main() -> Result<()> {
     let light = Theme::light(w, h, ppd);
 
     match args.get(2).map(String::as_str) {
+        Some("--backup-verification") => return verification_previews(&out, &root, &fonts),
         Some("--calibrate") => {
             let path = out.join("calibrate.png");
             write_png(&path, &calibrate(&fonts, &light)?)?;
@@ -350,7 +388,8 @@ fn main() -> Result<()> {
         .to_vec()
     };
     let job = |restore, plan: Vec<(String, u64)>, at, outcome| {
-        Some(BackupJob { restore, place: Place::Storage, checks: true, plan, at, outcome, stopping: false })
+        let kind = if restore { BackupKind::Restore } else { BackupKind::Backup { checks: true } };
+        Some(BackupJob { kind, place: Place::Storage, plan, at, outcome, stopping: false })
     };
     let reset_asked = || Asked { reason: Some("factroy_reset(1217)".into()), ..Asked::default() };
     let in_download = |app: &mut App, name: &str| {

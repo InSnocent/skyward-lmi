@@ -153,6 +153,8 @@ pub struct RestoreTask {
 pub enum Task {
     Backup(BackupTask),
     Restore(RestoreTask),
+    /// Inspect an existing backup without opening any restore target.
+    Verify(PathBuf),
 }
 
 /// Why backing up or restoring does not start.
@@ -201,6 +203,8 @@ pub enum Event {
 pub enum End {
     /// A backup made, in this folder.
     Saved(PathBuf),
+    /// All files matched their recorded lengths and content digests.
+    Verified,
     /// A backup restored, but for the folders a key of their own began in
     /// that are gone, which only the system makes, with what the backup
     /// held in them.
@@ -242,6 +246,7 @@ impl Worker {
                 let ended = match task {
                     Task::Backup(t) => backup(t, &tell, &stop).map(End::Saved),
                     Task::Restore(t) => restore(t, &tell, &stop).map(|unmade| End::Restored { unmade }),
+                    Task::Verify(folder) => verify(&folder, &tell, &stop).map(|()| End::Verified),
                 };
                 let end = match ended {
                     Ok(end) => end,
@@ -253,6 +258,7 @@ impl Worker {
                 };
                 let said = match &end {
                     End::Saved(folder) => format!("backup saved in {}", folder.display()),
+                    End::Verified => "backup verification passed without restoring".into(),
                     End::Restored { unmade } => format!("backup restored, all but {unmade:?}"),
                     End::Stopped => "backup stopped".into(),
                     End::Refused(why) => format!("backup refused: {why}"),
@@ -508,6 +514,21 @@ fn check(folder: &Path, stored: &Stored, cancel: &AtomicBool, telling: &mut Tell
     let mut extra = [0];
     ensure!(reader.read(&mut extra).context("finish reading the backup")? == 0, "the backup holds more than was stored");
     reader.check(stored)
+}
+
+/// A separate task with no restore target, key lookup or write phase.
+fn verify(folder: &Path, tell: &dyn Fn(Event), cancel: &AtomicBool) -> Result<()> {
+    let mut last = None;
+    skyward_backup::verify::verify(folder, cancel, &mut |event| match event {
+        skyward_backup::verify::Event::Plan(plan) => tell(Event::Plan(plan)),
+        skyward_backup::verify::Event::At { item, done, of } => {
+            let now = Instant::now();
+            if last.is_none_or(|(previous, at): (usize, Instant)| previous != item || now.duration_since(at) >= PROGRESS_EVERY) || done == of {
+                tell(Event::At { item, done, of, checking: true });
+                last = Some((item, now));
+            }
+        }
+    })
 }
 
 /// The index of a part in [`Part::ALL`].

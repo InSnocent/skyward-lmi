@@ -2325,10 +2325,12 @@ dependencies = [
  "anyhow",
  "libc",
  "lz4_flex",
+ "rustix",
  "serde",
  "sha2 0.10.9",
  "skyward-files",
  "tar",
+ "tempfile",
  "toml",
 ]
 

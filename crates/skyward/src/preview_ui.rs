@@ -520,6 +520,15 @@ impl DataWork {
         Ok(())
     }
 
+    fn start_verification(&mut self, app: &mut App, place: Place, name: &str) -> Result<()> {
+        ensure!(self.data_backup && !self.install_committed && self.idle(), "finish the current operation first");
+        ensure!(place == Place::Storage && app.state.data.storage_open(), "decrypt internal storage first");
+        let folder = lmi_backup_folder(place, name)?;
+        self.backuper = Some(backup::Worker::start(Task::Verify(folder))?);
+        app.verification_started(place);
+        Ok(())
+    }
+
     fn can_backup(&self, app: &App) -> bool {
         self.data_backup && !self.install_committed && self.idle()
             && self.closed.is_empty() && app.state.data == Data::Open
@@ -543,12 +552,7 @@ impl DataWork {
 }
 
 fn lmi_backup_folder(place: Place, name: &str) -> Result<std::path::PathBuf> {
-    ensure!(!name.is_empty() && !name.starts_with('.') && !name.contains('/'), "invalid backup folder name");
-    let parent = crate::ui::backups_in(place);
-    ensure!(parent.canonicalize()? == parent, "the backup directory contains a symbolic link");
-    let folder = parent.join(name);
-    ensure!(std::fs::symlink_metadata(&folder)?.is_dir(), "the selected backup is not a directory");
-    Ok(folder)
+    crate::ui::checked_backup_folder(place, name)
 }
 
 /// The BLOCK updater needs exclusive access to the logical partitions.
@@ -654,6 +658,24 @@ fn handle(
                     data.start_restore(app, place, &name)
                 })() {
                     hardware_error(app, "恢复", &error, now);
+                }
+            }
+            Effect::VerifyBackup { place, name } if data.data_backup => {
+                if data.shell.is_some() || !data.terminal_sessions.is_empty() {
+                    app.report(app.state.lang.pick([
+                        "请先结束终端及其后台任务",
+                        "請先結束終端及其背景工作",
+                        "Finish the terminal and its background jobs first",
+                    ]), now);
+                    continue;
+                }
+                if let Err(error) = (|| {
+                    ensure!(installer.is_none(), "an installation is in progress");
+                    ensure!(crate::ui::withhold(&mut data.transfer, app, now)?, "file transfer still holds internal storage");
+                    data.start_verification(app, place, &name)
+                })() {
+                    let title = app.state.lang.pick(["校验备份", "驗證備份", "Verify backup"]);
+                    hardware_error(app, title, &error, now);
                 }
             }
             Effect::FindBackups { storage, .. } if data.data_backup => {

@@ -603,16 +603,30 @@ pub struct Held {
     pub slot: Option<Slot>,
 }
 
-/// Backing up or restoring, as its page shows it.
+/// Whether work creates, restores, or only checks a backup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackupKind {
+    Backup { checks: bool },
+    Restore,
+    Verify,
+}
+
+impl BackupKind {
+    pub fn restores(self) -> bool { matches!(self, Self::Restore) }
+
+    /// Creation with readback and restoration use two passes. An independent
+    /// check reads each part once and never advances to a write pass.
+    pub fn checks(self) -> bool {
+        matches!(self, Self::Backup { checks: true } | Self::Restore)
+    }
+}
+
+/// Work on a backup, as its page shows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BackupJob {
-    /// Restoring a backup, rather than making one.
-    pub restore: bool,
+    pub kind: BackupKind,
     /// Where the backup goes, or comes from.
     pub place: Place,
-    /// Each part is read back to check it: all once they are written, for a
-    /// backup; all before any is written, for a restore.
-    pub checks: bool,
     /// The parts it goes through, by name with their bytes; none while it
     /// still measures them.
     pub plan: Vec<(String, u64)>,
@@ -638,6 +652,8 @@ pub struct BackupAt {
 pub enum BackupEnd {
     /// A backup made, in the folder of this name.
     Saved(String),
+    /// Every recorded volume and content digest matched, without restoring.
+    Verified,
     /// A backup restored, but for what it held in the folders of users gone
     /// since, which only the system makes: where those were.
     Restored { unmade: Vec<String> },
@@ -1223,6 +1239,8 @@ pub enum Action {
     BackupTo(Place),
     /// Open a backup found, by its place in the list, to restore it.
     OpenBackup(usize),
+    /// Check every part of the selected backup without restoring any of it.
+    VerifyBackup,
     /// Tick or untick a part of the backup being restored.
     RestorePart(usize),
     /// Stop backing up, or checking a backup before it is restored.
@@ -2161,6 +2179,8 @@ pub enum Effect {
     /// Restore the parts ticked of the backup in the folder `name` of
     /// `place`, telling how it goes as a backup does.
     Restore { place: Place, name: String, parts: [bool; 4] },
+    /// Read and check the whole selected backup without starting a restore.
+    VerifyBackup { place: Place, name: String },
     /// Look for backups in the places that can be read, telling what is
     /// found with [`App::set_backups`].
     FindBackups { storage: bool, usb: bool },
@@ -4146,7 +4166,17 @@ impl App {
     /// Backing up, or restoring, has begun: its page shows how far it comes.
     /// `checks` when each part is read back to check it.
     pub fn backup_started(&mut self, restore: bool, place: Place, checks: bool) {
-        self.state.backup_job = Some(BackupJob { restore, place, checks, plan: Vec::new(), at: None, outcome: None, stopping: false });
+        let kind = if restore { BackupKind::Restore } else { BackupKind::Backup { checks } };
+        self.start_backup_job(kind, place);
+    }
+
+    /// Check a backup as a single read pass, with no following restore.
+    pub fn verification_started(&mut self, place: Place) {
+        self.start_backup_job(BackupKind::Verify, place);
+    }
+
+    fn start_backup_job(&mut self, kind: BackupKind, place: Place) {
+        self.state.backup_job = Some(BackupJob { kind, place, plan: Vec::new(), at: None, outcome: None, stopping: false });
         self.open(Screen::BackupJob);
     }
 
@@ -5183,7 +5213,7 @@ impl App {
             Screen::BackupJob => {
                 let job = self.state.backup_job.as_ref().expect("the backup page shows work");
                 if job.outcome.is_none() {
-                    let writing = job.restore && job.at.is_some_and(|a| !a.checking);
+                    let writing = job.kind.restores() && job.at.is_some_and(|a| !a.checking);
                     let said = if writing { ["正在恢复，请等待恢复完成", "正在還原，請等待還原完成", "Restoring. Wait for it to finish"] } else { WAIT_OR_STOP };
                     self.say(l.pick(said), now);
                     return fx;
@@ -5683,6 +5713,13 @@ impl App {
                 self.state.restore = Some((entry, parts));
                 self.state.asking_delete = false;
                 self.open(Screen::RestoreBackup);
+            }
+            Action::VerifyBackup => {
+                if let Some((entry, _)) = &self.state.restore {
+                    if self.state.data_backup_only && entry.place == Place::Storage && self.state.place_open(entry.place) {
+                        return vec![Effect::VerifyBackup { place: entry.place, name: entry.name.clone() }];
+                    }
+                }
             }
             Action::RestorePart(k) => {
                 let (_, parts) = self.state.restore.as_mut().expect("the restore page shows a backup");
@@ -10260,6 +10297,67 @@ mod tests {
             slot: Some(Slot::B),
         };
         BackupEntry { place, name: fmt::stamp(made, 0), held: Ok(held) }
+    }
+
+    #[test]
+    fn lmi_verification_checks_a_backup_without_a_restore_selection() {
+        let (f, i) = (fonts(), info());
+        let mut app = opened(Screen::Restore, &f, &i);
+        app.use_lmi_backup();
+        app.data_waiting(None);
+        app.set_backups(vec![found(Place::Storage, 1_792_348_260, [false, false, true, false])]);
+        tap(&mut app, &f, &i, Action::OpenBackup(0));
+        tap(&mut app, &f, &i, Action::RestorePart(2));
+        assert_eq!(app.state.restore.as_ref().unwrap().1, [false; 4]);
+        let name = app.state.restore.as_ref().unwrap().0.name.clone();
+        assert_eq!(tap(&mut app, &f, &i, Action::VerifyBackup),
+                   vec![Effect::VerifyBackup { place: Place::Storage, name }]);
+        assert_eq!(app.screen(), Screen::RestoreBackup);
+    }
+
+    #[test]
+    fn lmi_verification_requires_owner_storage_but_can_diagnose_an_unreadable_manifest() {
+        let (f, i) = (fonts(), info());
+        let mut app = opened(Screen::Restore, &f, &i);
+        app.use_lmi_backup();
+        app.set_backups(vec![BackupEntry {
+            place: Place::Storage, name: "sample".into(), held: Err("invalid manifest".into()),
+        }]);
+        tap(&mut app, &f, &i, Action::OpenBackup(0));
+        assert!(!app.frame(&f, &i).hits.iter().any(|h| h.action == Action::VerifyBackup));
+        app.data_waiting(Some((10, Keys::Digits)));
+        assert_eq!(tap(&mut app, &f, &i, Action::VerifyBackup),
+                   vec![Effect::VerifyBackup { place: Place::Storage, name: "sample".into() }]);
+    }
+
+    #[test]
+    fn standalone_verification_can_stop_and_never_offers_a_restore_or_reboot() {
+        let (f, i) = (fonts(), info());
+        let mut app = opened(Screen::Restore, &f, &i);
+        app.use_lmi_backup();
+        app.data_waiting(None);
+        app.set_backups(vec![found(Place::Storage, 1_792_348_260, [false, false, true, false])]);
+        tap(&mut app, &f, &i, Action::OpenBackup(0));
+        for (outcome, title) in [
+            (BackupEnd::Stopped, "校验已停止"),
+            (BackupEnd::Failed("data.tar.lz4.001 is missing".into()), "校验失败"),
+            (BackupEnd::Verified, "校验通过"),
+        ] {
+            app.verification_started(Place::Storage);
+            app.backup_plan(vec![("data".into(), 100)]);
+            app.backup_at(BackupAt { item: 0, done: 70, of: 100, checking: true });
+            assert_eq!(app.frame(&f, &i).title, "正在校验");
+            app.key(Key::Back, 0);
+            assert_eq!(app.screen(), Screen::BackupJob);
+            assert_eq!(tap_at(&mut app, &f, &i, Action::StopBackup, 1000), vec![Effect::StopBackup]);
+            app.backup_ended(outcome, 0);
+            let frame = app.frame(&f, &i);
+            assert_eq!(frame.title, title);
+            assert!(frame.hits.iter().all(|h| !matches!(h.action, Action::RebootTo(_) | Action::Confirm(_))));
+            assert!(tap_at(&mut app, &f, &i, Action::Back, 1000).is_empty());
+            assert_eq!(app.screen(), Screen::RestoreBackup);
+            assert!(app.state.restore.is_some());
+        }
     }
 
     #[test]

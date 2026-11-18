@@ -408,6 +408,16 @@ pub(crate) fn backups_in(place: Place) -> PathBuf {
     in_place(place, skyward_backup::FOLDER)
 }
 
+/// A selected backup stays inside the canonical backup directory.
+pub(crate) fn checked_backup_folder(place: Place, name: &str) -> Result<PathBuf> {
+    ensure!(!name.is_empty() && !name.starts_with('.') && !name.contains('/'), "invalid backup folder name");
+    let parent = backups_in(place);
+    ensure!(parent.canonicalize()? == parent, "the backup directory contains a symbolic link");
+    let folder = parent.join(name);
+    ensure!(fs::symlink_metadata(&folder)?.is_dir(), "the selected backup is not a directory");
+    Ok(folder)
+}
+
 /// The backups in `place`: each folder in its backups folder, with what its
 /// manifest records or why that cannot be read. A place with no backups
 /// folder has none.
@@ -481,6 +491,7 @@ pub(crate) fn backup_end(end: backup::End) -> BackupEnd {
         backup::End::Saved(folder) => {
             BackupEnd::Saved(folder.file_name().expect("a backup's folder has a name").to_string_lossy().into_owned())
         }
+        backup::End::Verified => BackupEnd::Verified,
         backup::End::Restored { unmade } => BackupEnd::Restored { unmade: unmade.iter().map(|p| p.display().to_string()).collect() },
         backup::End::Stopped => BackupEnd::Stopped,
         backup::End::Refused(refusal) => BackupEnd::Refused(match refusal {
@@ -2459,6 +2470,20 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         };
                         backuper = Some(backup::Worker::start(backup::Task::Restore(task))?);
                         app.backup_started(true, place, true);
+                    }
+                    Effect::VerifyBackup { place, name } => {
+                        ensure!(backuper.is_none(), "a backup task is under way already");
+                        if installer.is_some() {
+                            app.report(app.state.lang.pick(INSTALL_UNFINISHED), now);
+                            continue;
+                        }
+                        ensure!(place == Place::Storage && app.state.data.storage_open(), "decrypt internal storage first");
+                        if !withhold(&mut transfer, &mut app, now)? {
+                            continue;
+                        }
+                        let folder = checked_backup_folder(place, &name)?;
+                        backuper = Some(backup::Worker::start(backup::Task::Verify(folder))?);
+                        app.verification_started(place);
                     }
                     Effect::FindBackups { storage, usb } => find_backups(&mut app, storage, usb, now),
                     Effect::DeleteBackup { place, name } => {

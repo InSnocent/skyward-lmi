@@ -28,7 +28,7 @@ The **ADB sideload preflight** verifies the matching Infinity-X update ZIP's sig
 
 ### Backup and restore
 
-Back up and verify the supported contents of `/data`. Backups appear on the Restore page. Shared storage, including photos and downloads, needs a separate backup. Restore has been tested with a sample app. Restoring all of `/data` is still awaiting device validation. [Backup details](docs/lmi.zh-CN.md#数据备份)
+Back up and verify the supported contents of `/data`. Backups appear on the Restore page. **Verify backup** independently checks the manifest, volume lengths and content digests without restoring data, and can be stopped. Stopping and a complete recheck have been validated on the supported lmi build. Shared storage, including photos and downloads, needs a separate backup. Restore has been tested with a sample app. Restoring all of `/data` is still awaiting device validation. [Backup details](docs/lmi.zh-CN.md#数据备份)
 
 ### Wallpaper and appearance
 
