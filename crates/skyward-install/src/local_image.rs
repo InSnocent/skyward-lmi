@@ -89,13 +89,11 @@ pub(crate) fn prepare_file(mut source: File, cancelled: &dyn Fn() -> bool, progr
         .context("create the image RAM snapshot")?);
     snapshot.write_all(&bytes).context("cache the image")?;
     snapshot.set_len(PARTITION_BYTES).context("pad the image to its partition")?;
-    if size < PARTITION_BYTES {
-        if let Some(footer) = footer {
-            snapshot.seek(SeekFrom::Start(size-64))?;
-            snapshot.write_all(&[0; 64])?;
-            snapshot.seek(SeekFrom::Start(PARTITION_BYTES-64))?;
-            snapshot.write_all(&footer)?;
-        }
+    if size < PARTITION_BYTES && let Some(footer) = footer {
+        snapshot.seek(SeekFrom::Start(size - 64))?;
+        snapshot.write_all(&[0; 64])?;
+        snapshot.seek(SeekFrom::Start(PARTITION_BYTES - 64))?;
+        snapshot.write_all(&footer)?;
     }
     fcntl_add_seals(&snapshot, SealFlags::WRITE | SealFlags::GROW | SealFlags::SHRINK | SealFlags::SEAL)
         .context("seal the accepted image against changes")?;

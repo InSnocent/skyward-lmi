@@ -101,7 +101,7 @@ fastboot reboot recovery
 
 ## 从源码构建
 
-在 Linux 或 WSL 中打开包含 `lmi` 改动的源码树。若从补丁复现，将补丁应用于上游提交 `ff1668fdb72a46f22152a6540f49728c42081aba`。实测工具链为 Rust 1.100.0（含 `aarch64-linux-android` 目标）和 Android NDK r29。先将 `ANDROID_NDK_HOME` 指向已解压的 NDK 目录。示例使用 Linux x86_64 主机。 [上游构建说明](https://github.com/kirklin/skyward/blob/ff1668fdb72a46f22152a6540f49728c42081aba/README.zh-CN.md#构建)
+在 Linux 或 WSL 中打开包含 lmi 改动的源码树。当前同步基线为上游 Skyward v0.3.1，工具链固定为 Rust 1.100.0，Android 目标为 `aarch64-linux-android`。先将 `ANDROID_NDK_HOME` 指向已解压的 Android NDK r29 目录。以下命令以 Linux x86_64 主机为例。lmi 使用本地 Infinity-X 输入单独打包，GitHub Actions 负责检查代码和编译。 [上游构建说明](https://github.com/kirklin/skyward/blob/bd34c054ba86a5a55c8a356d8e2769be6523c0a5/README.zh-CN.md#构建)
 
 ```sh
 : "${ANDROID_NDK_HOME:?请先设置 Android NDK r29 的目录}"

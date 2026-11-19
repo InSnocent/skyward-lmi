@@ -4,6 +4,7 @@
 //! what it opens holds every file, with the names and contents of the ones
 //! that are a user's own still encrypted.
 
+use crate::encryption::{key_dir, legacy_format, target, Encryption, LegacyEncryption};
 use crate::fscrypt::{self, Policy};
 use crate::gatekeeper::Gatekeeper;
 use crate::keymint::KeyMint;
@@ -13,7 +14,6 @@ use crate::user::Bound;
 use crate::weaver::Weaver;
 use anyhow::{Context, Result};
 use skyward_binder::driver::Binder;
-use skyward_block::dm::Target;
 use skyward_block::fsck::Checked;
 use skyward_block::fstab::Entry;
 use skyward_block::{dm, mount};
@@ -32,71 +32,6 @@ pub const SDCARD: &str = "/sdcard";
 
 /// The phone's owner, the first of its users.
 const OWNER: u32 = 0;
-
-/// The key is in a directory of this name under the one the phone names.
-const KEY_DIR: &str = "key";
-
-/// How the kernel knows the cipher a phone names.
-const CIPHERS: [(&str, &str); 2] = [("aes-256-xts", "aes-xts-plain64"), ("adiantum", "xchacha12,aes-adiantum-plain64")];
-
-/// The hardware reads and writes in 4096-byte units, so the partition is
-/// mapped in whole multiples of eight 512-byte sectors.
-const SECTORS_PER_UNIT: u64 = 8;
-
-/// How a phone says its data partition is encrypted: the cipher, and
-/// whether the key is one only the storage hardware can unwrap.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Encryption {
-    pub cipher: String,
-    pub wrapped: bool,
-    legacy_set_dun: Option<bool>,
-}
-
-impl Encryption {
-    /// Read what an entry of the phone's own table says.
-    pub fn of(entry: &Entry) -> Result<Encryption> {
-        let said = entry.extra("metadata_encryption").context("the phone says its data partition is not encrypted whole")?;
-        let (name, rest) = said.split_once(':').unwrap_or((said, ""));
-        let cipher = CIPHERS
-            .iter()
-            .find_map(|(theirs, kernels)| (*theirs == name).then_some(*kernels))
-            .with_context(|| format!("no cipher here is the {name} the phone names"))?;
-        Ok(Encryption { cipher: cipher.to_string(), wrapped: rest == "wrappedkey_v0", legacy_set_dun: None })
-    }
-
-    fn installed(entry: &Entry) -> Result<Self> {
-        let format = property("ro.crypto.dm_default_key.options_format.version")?.parse::<u32>().ok();
-        let first_api = property("ro.product.first_api_level")?.parse::<u32>().ok();
-        match format.or_else(|| first_api.map(|level| if level <= 29 { 1 } else { 2 })) {
-            Some(1) => {
-                anyhow::ensure!(entry.extra("metadata_encryption").is_none(), "legacy metadata encryption has explicit modern options");
-                key_dir(entry)?;
-                let set_dun = matches!(property("ro.crypto.set_dun")?.as_str(), "1" | "true" | "y" | "yes" | "on");
-                anyhow::ensure!(set_dun || !entry.extras.iter().any(|e| e == "checkpoint=block"), "legacy block checkpoints require DUN");
-                let metadata = skyward_block::fstab::read("/metadata")?;
-                let wrapped = metadata.first().is_some_and(|entry| entry.extras.iter().any(|extra| extra == "wrappedkey"));
-                // This flag requests an ephemeral storage key. Android's legacy
-                // libdm table still serializes only the optional set_dun flag.
-                Ok(Self { cipher: "AES-256-XTS".into(), wrapped, legacy_set_dun: Some(set_dun) })
-            }
-            Some(2) | None => Self::of(entry),
-            Some(version) => anyhow::bail!("unknown metadata encryption format {version}"),
-        }
-    }
-}
-
-fn property(name: &str) -> Result<String> {
-    let name = std::ffi::CString::new(name)?;
-    let mut value = [0u8; 92];
-    unsafe { libc::__system_property_get(name.as_ptr(), value.as_mut_ptr().cast()) };
-    Ok(std::ffi::CStr::from_bytes_until_nul(&value)?.to_str()?.into())
-}
-
-/// Where the phone keeps the key for the filesystem an entry describes.
-pub fn key_dir(entry: &Entry) -> Result<PathBuf> {
-    let dir = entry.extra("keydirectory").context("the phone says where the key for its data partition is not")?;
-    Ok(Path::new(dir).join(KEY_DIR))
-}
 
 /// Unwrap the key the phone keeps for its data partition and give the
 /// storage hardware the form of it that lasts until the phone is started
@@ -134,7 +69,7 @@ pub struct Opened {
 /// until that user's key is let in as well. A partition that does not
 /// mount leaves no device behind.
 fn open(service: &KeyMint) -> Result<Opened> {
-    let (entries, mapped) = map(service, false)?;
+    let (entries, mapped) = map(service, false, false)?;
     let mounted = (|| -> Result<(Option<Checked>, String)> {
         // A phone that names the partition once per filesystem it might
         // hold mounts it with the entry of the one it holds.
@@ -160,15 +95,37 @@ fn open(service: &KeyMint) -> Result<Opened> {
 /// Map the data partition decrypted, under the key the phone keeps for it,
 /// and give its table's entries, the first the one the key is found by,
 /// and the device the filesystem is read and written through.
-fn map(service: &KeyMint, readonly: bool) -> Result<(Vec<Entry>, PathBuf)> {
+fn map(service: &KeyMint, readonly: bool, allow_legacy: bool) -> Result<(Vec<Entry>, PathBuf)> {
     let entries = skyward_block::fstab::read(MOUNT)?;
     let entry = entries.first().with_context(|| format!("the phone's own table says nothing about {MOUNT}"))?;
-    let encryption = Encryption::installed(entry)?;
     let device = skyward_block::fstab::device(entry)?;
-    let key = storage_key(service, entry, &encryption)?;
     let sectors = skyward_block::size_bytes(&device)? / 512;
-    let mapped = dm::create(MAPPED, &[target(&device, sectors, &key, &encryption)], readonly)?;
+    let legacy = allow_legacy
+        && legacy_format(
+            property("ro.crypto.dm_default_key.options_format.version")?.parse().ok(),
+            property("ro.product.first_api_level")?.parse().ok(),
+        )?;
+    let table = if legacy {
+        let set_dun = matches!(property("ro.crypto.set_dun")?.as_str(), "1" | "true" | "y" | "yes" | "on");
+        let metadata = skyward_block::fstab::read("/metadata")?;
+        let encryption = LegacyEncryption::of(entry, &metadata, set_dun)?;
+        let key = hardware_key(service, &key_dir(entry)?, encryption.wrapped)?;
+        encryption.target(&device, sectors, &key)
+    } else {
+        let encryption = Encryption::of(entry)?;
+        let key = storage_key(service, entry, &encryption)?;
+        target(&device, sectors, &key, &encryption)
+    };
+    let mapped = dm::create(MAPPED, &[table], readonly)?;
     Ok((entries, mapped))
+}
+
+/// Read the installed ROM's Android crypto properties.
+fn property(name: &str) -> Result<String> {
+    let name = std::ffi::CString::new(name)?;
+    let mut value = [0u8; libc::PROP_VALUE_MAX as usize];
+    unsafe { libc::__system_property_get(name.as_ptr(), value.as_mut_ptr().cast()) };
+    Ok(std::ffi::CStr::from_bytes_until_nul(&value)?.to_str()?.into())
 }
 
 /// Map the data partition decrypted without mounting it, for its
@@ -176,7 +133,7 @@ fn map(service: &KeyMint, readonly: bool) -> Result<(Vec<Entry>, PathBuf)> {
 /// [`unmap`] takes it away again. The partition is to be closed.
 pub fn map_unmounted(service: &KeyMint) -> Result<PathBuf> {
     anyhow::ensure!(dm::status(MAPPED)?.is_none(), "the data partition is open");
-    map(service, false).map(|(_, mapped)| mapped)
+    map(service, false, false).map(|(_, mapped)| mapped)
 }
 
 /// Take away the mapping [`map_unmounted`] made.
@@ -250,7 +207,7 @@ pub fn open_lmi(service: &KeyMint, readonly: bool) -> Result<Opening> {
         return finish_opening(service, None);
     }
     anyhow::ensure!(dm::status(MAPPED)?.is_none(), "a data mapping already exists");
-    let (entries, mapped) = map(service, readonly)?;
+    let (entries, mapped) = map(service, readonly, true)?;
     let mounted = (|| {
         let entry = entries.iter().find(|entry| entry.filesystem == "f2fs").context("lmi data requires F2FS")?;
         let mut options = entry.options.clone();
@@ -350,8 +307,8 @@ fn open_shared(service: &KeyMint) -> Result<()> {
     let wrapped = fscrypt::hardware_wrapped(mode.trim());
     let policy = Policy::from_mode(mode.trim());
     let raw = hardware_key(service, Path::new(SHARED_KEY), wrapped)?;
-    let name = fscrypt::add_key(Path::new(MOUNT), &raw, wrapped, policy)?;
-    let recorded = fscrypt::recorded_name(Path::new(SHARED_NAME), policy)?;
+    let name = fscrypt::add_key_for_policy(Path::new(MOUNT), &raw, wrapped, policy)?;
+    let recorded = fscrypt::recorded_name_for_policy(Path::new(SHARED_NAME), policy)?;
     if name != recorded {
         anyhow::bail!("the key in {SHARED_KEY} is not the one {SHARED_NAME} names");
     }
@@ -381,7 +338,7 @@ fn open_users(service: &KeyMint) -> Result<Vec<u32>> {
     for user in &users {
         let dir = Path::new(USER_KEYS).join("de").join(user.to_string());
         let raw = hardware_key(service, &dir, wrapped)?;
-        fscrypt::add_key(Path::new(MOUNT), &raw, wrapped, policy)?;
+        fscrypt::add_key_for_policy(Path::new(MOUNT), &raw, wrapped, policy)?;
     }
     Ok(users)
 }
@@ -402,10 +359,10 @@ fn protector(user: u32) -> Result<crate::user::Protector> {
     let mut ids = Vec::new();
     for entry in std::fs::read_dir(&dir).with_context(|| format!("read {}", dir.display()))? {
         let path = entry.with_context(|| format!("read {}", dir.display()))?.path();
-        if path.extension().is_some_and(|e| e == "spblob") {
-            if let Some(id) = path.file_stem().and_then(|s| s.to_str()) {
-                ids.push(id.to_string());
-            }
+        if path.extension().is_some_and(|e| e == "spblob")
+            && let Some(id) = path.file_stem().and_then(|s| s.to_str())
+        {
+            ids.push(id.to_string());
         }
     }
     let id = match crate::locksettings::current_protector(Path::new(crate::locksettings::DATABASE), user)? {
@@ -592,7 +549,7 @@ fn open_user_files(service: &KeyMint, user: u32, credential: Option<&[u8]>, owne
         true => service.ephemeral_storage_key(&raw).with_context(|| format!("make the key in {} usable now", dir.display()))?,
         false => raw,
     };
-    fscrypt::add_key(Path::new(MOUNT), &raw, wrapped, policy)?;
+    fscrypt::add_key_for_policy(Path::new(MOUNT), &raw, wrapped, policy)?;
     if user == OWNER {
         let storage = Path::new(SHARED_STORAGE).join(OWNER.to_string());
         anyhow::ensure!(fscrypt::unlocked(&storage)?, "the owner's storage is still encrypted");
@@ -630,64 +587,4 @@ fn secret_note(user: u32, synthetic_password: &[u8]) -> Result<Note> {
         Ok(token) => Note { token: Some(token), refused: None },
         Err(e) => Note { token: None, refused: Some(format!("{e:#}")) },
     })
-}
-
-/// Build the device-mapper target that reads the partition through the
-/// storage hardware's decryption.
-pub fn target(device: &str, sectors: u64, key: &[u8], encryption: &Encryption) -> Target {
-    let sectors = sectors - sectors % SECTORS_PER_UNIT;
-    let device = device.to_string();
-    let key = key.iter().map(|b| format!("{b:02x}")).collect();
-    match encryption.legacy_set_dun {
-        Some(set_dun) => Target::DefaultKeyLegacy { sectors, device, key, set_dun },
-        None => Target::DefaultKey { sectors, device, cipher: encryption.cipher.clone(), key, wrapped: encryption.wrapped },
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn entry(extras: &str) -> Entry {
-        Entry {
-            device: "/dev/block/bootdevice/by-name/userdata".into(),
-            mount_point: MOUNT.into(),
-            filesystem: "f2fs".into(),
-            options: vec!["noatime".into(), "inlinecrypt".into()],
-            extras: extras.split(',').map(str::to_string).collect(),
-        }
-    }
-
-    #[test]
-    fn the_phones_own_words_for_the_cipher_become_the_kernels() {
-        let e = entry("metadata_encryption=aes-256-xts:wrappedkey_v0,keydirectory=/metadata/vold/metadata_encryption");
-        assert_eq!(Encryption::of(&e).unwrap(), Encryption { cipher: "aes-xts-plain64".into(), wrapped: true, legacy_set_dun: None });
-        let plain = entry("metadata_encryption=adiantum");
-        assert_eq!(Encryption::of(&plain).unwrap(), Encryption { cipher: "xchacha12,aes-adiantum-plain64".into(), wrapped: false, legacy_set_dun: None });
-    }
-
-    #[test]
-    fn a_cipher_or_a_key_the_phone_does_not_name_is_an_error() {
-        assert!(Encryption::of(&entry("quota")).is_err());
-        assert!(Encryption::of(&entry("metadata_encryption=rot13")).is_err());
-        assert!(key_dir(&entry("quota")).is_err());
-    }
-
-    #[test]
-    fn the_key_is_in_a_directory_under_the_one_the_phone_names() {
-        let e = entry("keydirectory=/metadata/vold/metadata_encryption");
-        assert_eq!(key_dir(&e).unwrap(), Path::new("/metadata/vold/metadata_encryption/key"));
-    }
-
-    #[test]
-    fn the_partition_is_mapped_in_whole_units_of_the_hardwares_reads() {
-        let e = Encryption { cipher: "aes-xts-plain64".into(), wrapped: true, legacy_set_dun: None };
-        let t = target("/dev/block/by-name/userdata", 969_825_751, &[0xAB, 0x01], &e);
-        let Target::DefaultKey { sectors, key, cipher, device, wrapped } = t else { panic!("a decrypting target") };
-        assert_eq!(sectors, 969_825_744, "a whole number of 4096-byte units");
-        assert_eq!(key, "ab01");
-        assert_eq!(cipher, "aes-xts-plain64");
-        assert_eq!(device, "/dev/block/by-name/userdata");
-        assert!(wrapped);
-    }
 }

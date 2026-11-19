@@ -6,6 +6,8 @@
 
 Skyward Recovery 的红米 K30 Pro（`lmi`）非官方移植，当前处于预览阶段。Skyward 是用 Rust 编写的 Android Recovery。下列功能描述当前源码；此前发布或已安装的镜像可能尚未包含最新改动。 [上游 Skyward](https://github.com/kirklin/skyward)
 
+本分支已合入上游 Skyward v0.3.1。同步版完成真机验证前，下文的功能实测记录对应 lmi v1.1.0 发行版。
+
 ## 截图
 
 图中依次为首页、壁纸设置和深色毛玻璃卡片。界面由电脑端渲染，使用示例壁纸。

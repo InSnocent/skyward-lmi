@@ -918,7 +918,7 @@ pub fn file_modified(l: Lang, file: &FileRow, zone: usize) -> String {
 
 /// The parts a backup holds: `启动分区、系统分区`.
 pub fn parts(l: Lang, held: &[bool; 4]) -> String {
-    list(l, BACKUP_PARTS.iter().zip(held).filter(|(_, &on)| on).map(|(name, _)| l.pick(*name)))
+    list(l, BACKUP_PARTS.iter().zip(held).filter(|&(_, &on)| on).map(|(name, _)| l.pick(*name)))
 }
 
 /// What an image is, and what it holds.

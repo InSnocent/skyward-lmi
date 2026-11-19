@@ -163,10 +163,11 @@ pub(crate) fn wrap(c: &Canvas, face: &Face, text: &str, px: f32, max_w: f32) -> 
                     None => {}
                 }
             }
-            if let Some((at, before)) = line[..split].char_indices().last() {
-                if at > 0 && NO_LINE_END.contains(before) {
-                    split = at;
-                }
+            if let Some((at, before)) = line[..split].char_indices().last()
+                && at > 0
+                && NO_LINE_END.contains(before)
+            {
+                split = at;
             }
             let rest = line.split_off(split);
             lines.push(line.trim_end().to_string());
@@ -2993,7 +2994,7 @@ mod tests {
             wallpaper_status_bar(&mut c, &t, &f, &bar);
             let ink = |side: usize, expected: u8| {
                 c.data.chunks_exact(t.m.w as usize * 4).take(80).any(|row| {
-                    row[side * 1080..(side + 1) * 1080].chunks_exact(4).any(|pixel| pixel[0].abs_diff(expected) < 20)
+                    row[side * 1080..(side + 1) * 1080].as_chunks::<4>().0.iter().any(|pixel| pixel[0].abs_diff(expected) < 20)
                 })
             };
             assert!(ink(0, right_bg), "the clock contrasts with the left side");

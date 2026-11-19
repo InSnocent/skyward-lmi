@@ -1,9 +1,8 @@
 name: Build
 
-# Every push is linted and tested, and the recovery is built for every
-# device in devices/, each image zipped. A tag starting with v publishes
-# those zips as a release, each shown as the phone it is for. Run by hand,
-# it can build for one device alone.
+# Every push is linted and tested. The upstream repository also builds
+# and publishes the devices with stock packages. On the fork, lmi images
+# are built locally from the matching Infinity-X recovery and ROM files.
 on:
   push:
     branches: ["**"]
@@ -11,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       device:
-        description: The codename of the one device to build for; every device when empty
+        description: Stock device codename. On the lmi fork, leaving this blank runs code and build checks.
         required: false
         default: ""
 
@@ -26,6 +25,25 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # A release goes by its tag to whoever downloads it, and a build by the
+  # version built into it, which is what it holds against the newest
+  # release's tag when it looks for an update: a tag naming another
+  # version than the one built would have every phone find an update in
+  # the very build it runs. Such a tag publishes nothing.
+  tag:
+    name: Check that the tag names the version built
+    if: github.repository == 'kirklin/skyward' && github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Hold the tag against the workspace's version
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::the tag is $GITHUB_REF_NAME, and the workspace builds version $version"
+            exit 1
+          fi
+
   check:
     name: Lint and test
     runs-on: ubuntu-24.04
@@ -37,7 +55,7 @@ jobs:
       - name: Test
         run: cargo test --locked --workspace
       - name: Lint what runs on the phone
-        run: cargo ndk -t arm64-v8a --platform 30 clippy --locked -p skyward -p skyward-install -p skyward-systems -p skyward-system-init -- -D warnings
+        run: cargo ndk -t arm64-v8a --platform 30 clippy --locked --workspace --all-targets -- -D warnings
 
   tools:
     name: Build the recovery service and the packer
@@ -69,6 +87,7 @@ jobs:
 
   devices:
     name: List the devices
+    if: github.repository == 'kirklin/skyward' || (github.event_name == 'workflow_dispatch' && inputs.device != '' && inputs.device != 'lmi')
     runs-on: ubuntu-24.04
     outputs:
       devices: ${{ steps.list.outputs.devices }}
@@ -79,10 +98,11 @@ jobs:
           DEVICE: ${{ inputs.device }}
         run: |
           if [ -n "$DEVICE" ]; then
+            test "$DEVICE" != lmi
             test -f "devices/$DEVICE.toml"
             echo "devices=$(jq -nc --arg device "$DEVICE" '[$device]')" >> "$GITHUB_OUTPUT"
           else
-            echo "devices=$(basename -s .toml devices/*.toml | jq -R . | jq -sc .)" >> "$GITHUB_OUTPUT"
+            echo "devices=$(basename -s .toml devices/*.toml | sed '/^lmi$/d' | jq -R . | jq -sc .)" >> "$GITHUB_OUTPUT"
           fi
 
   recovery:
@@ -149,8 +169,8 @@ jobs:
 
   release:
     name: Publish the release
-    if: github.ref_type == 'tag'
-    needs: [check, recovery]
+    if: github.repository == 'kirklin/skyward' && github.ref_type == 'tag'
+    needs: [tag, check, recovery]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -179,6 +199,7 @@ jobs:
           zips=()
           for config in devices/*.toml; do
             device=$(basename "$config" .toml)
+            if [ "$device" = lmi ]; then continue; fi
             model=$(python3 -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["device"]["model"])' "$config")
             zip=$(ls images/skyward-"$GITHUB_REF_NAME"-"$device"-*.zip)
             zips+=("$zip#$model ($device)")

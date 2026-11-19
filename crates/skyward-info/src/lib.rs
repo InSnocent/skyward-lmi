@@ -1,14 +1,15 @@
 use anyhow::{anyhow, bail, Context, Result};
 use skyward_config::DeviceConfig;
-use skyward_sys::prop;
+use skyward_sys::{prop, ToldOnce};
 use skyward_vab::{Slot, SnapshotState};
 use std::collections::HashMap;
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
 use std::fs;
 use std::io::ErrorKind;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::Mutex;
 
 /// Version of this build, shown on the About page.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -20,7 +21,10 @@ const SYS_BLOCK: &str = "/sys/class/block";
 /// What the recovery shows about the device. A source that may legitimately
 /// be absent (no battery driver loaded, build properties missing from the
 /// recovery ramdisk) is an `Option`; a source that exists but cannot be read
-/// or parsed is an error.
+/// or parsed is an error. The installed system's partitions are the one
+/// source the recovery has to do without: where their build properties
+/// cannot be read, the details are as where nothing is mounted, and the
+/// log says why.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeviceInfo {
     pub model: String,
@@ -134,16 +138,32 @@ pub struct Boot {
 }
 
 pub fn collect(cfg: &DeviceConfig) -> Result<DeviceInfo> {
-    collect_from(cfg, SystemProps::current()?)
+    collect_with(cfg, battery_now()?)
+}
+
+/// The phone's details with `battery` for the battery, read apart: by one
+/// who reads it oftener than the rest, or who goes on without it where it
+/// cannot be read, as the pages do when they come up.
+pub fn collect_with(cfg: &DeviceConfig, battery: Option<Battery>) -> Result<DeviceInfo> {
+    collect_from(cfg, SystemProps::current()?, battery)
 }
 
 /// The installed Android properties found during an A-only inspection.
 pub fn collect_unslotted(cfg: &DeviceConfig, parts: &[&skyward_vab::Mounted]) -> Result<DeviceInfo> {
-    let props = properties_from(parts.to_vec(), |m| m.partition.as_str(), true)?;
-    collect_from(cfg, SystemProps::Installed(props))
+    collect_unslotted_with(cfg, parts, battery_now()?)
 }
 
-fn collect_from(cfg: &DeviceConfig, system: SystemProps) -> Result<DeviceInfo> {
+/// The A-only device's details with the battery read separately.
+pub fn collect_unslotted_with(
+    cfg: &DeviceConfig,
+    parts: &[&skyward_vab::Mounted],
+    battery: Option<Battery>,
+) -> Result<DeviceInfo> {
+    let read = properties_from(parts.to_vec(), |m| m.partition.as_str(), true);
+    collect_from(cfg, SystemProps::installed(read), battery)
+}
+
+fn collect_from(cfg: &DeviceConfig, system: SystemProps, battery: Option<Battery>) -> Result<DeviceInfo> {
     let d = &cfg.display;
     let unlocked = match skyward_block::boot_param("androidboot.vbmeta.device_state")?.as_deref() {
         None => None,
@@ -164,10 +184,10 @@ fn collect_from(cfg: &DeviceConfig, system: SystemProps) -> Result<DeviceInfo> {
         os_version: system.get(&cfg.device.os_version_prop),
         android: system.get("ro.build.version.release"),
         locale: system.get("ro.product.locale"),
-        security_patch: system.get("ro.build.version.security_patch").map(|s| s.parse()).transpose()?,
+        security_patch: system.security_patch()?,
         kernel: kernel_release()?,
         storage: storage()?,
-        battery: battery(Path::new(POWER_SUPPLY))?,
+        battery,
         slot: skyward_vab::current_slot()?,
         snapshot: skyward_vab::snapshot_state()?,
         boot: Boot { unlocked, verified: skyward_block::boot_param("androidboot.verifiedbootstate")? },
@@ -183,16 +203,48 @@ enum SystemProps {
     Installed(HashMap<String, String>),
 }
 
+/// Why the installed system's properties could last not be read, as the
+/// log was told: the details are collected again and again.
+static PROPS_UNREAD: Mutex<ToldOnce> = Mutex::new(ToldOnce::new());
+static PATCH_UNREAD: Mutex<ToldOnce> = Mutex::new(ToldOnce::new());
+
 impl SystemProps {
+    /// A recovery has to come up whatever state the installed system's
+    /// partitions are in, so properties that cannot be read are none, as
+    /// where nothing is mounted, and the log is told why.
     fn current() -> Result<SystemProps> {
         if !skyward_config::ramdisk::in_recovery() {
             return Ok(SystemProps::Running);
         }
-        let props = match skyward_vab::current_slot()? {
-            Some(slot) => installed_props(slot)?,
-            None => HashMap::new(),
+        let read = match skyward_vab::current_slot()? {
+            Some(slot) => installed_props(slot),
+            None => Ok(HashMap::new()),
         };
-        Ok(SystemProps::Installed(props))
+        Ok(Self::installed(read))
+    }
+
+    fn installed(read: Result<HashMap<String, String>>) -> Self {
+        let why = read.as_ref().err().map(|e| format!("{e:#}"));
+        let untold = PROPS_UNREAD.lock().expect("nothing panics while it is held").untold(why.as_deref());
+        if untold && let Some(why) = why {
+            let _ = skyward_sys::kmsg(&format!("the installed system's properties could not be read, and the phone's details go without them: {why}"));
+        }
+        Self::Installed(read.unwrap_or_default())
+    }
+
+    /// Omit an unreadable date from the About page in recovery, without
+    /// dropping the other details or changing the installed properties.
+    fn security_patch(&self) -> Result<Option<PatchLevel>> {
+        let patch = self.get("ro.build.version.security_patch").map(|s| s.parse()).transpose();
+        if matches!(self, Self::Installed(_)) {
+            let why = patch.as_ref().err().map(|e| format!("{e:#}"));
+            let untold = PATCH_UNREAD.lock().expect("nothing panics while it is held").untold(why.as_deref());
+            if untold && let Some(why) = why {
+                let _ = skyward_sys::kmsg(&format!("the installed system's security patch could not be read: {why}"));
+            }
+            return Ok(patch.unwrap_or_default());
+        }
+        patch
     }
 
     fn get(&self, name: &str) -> Option<String> {
@@ -335,7 +387,8 @@ fn storage() -> Result<Storage> {
     let dev = fs::canonicalize(&link).with_context(|| format!("resolve {}", link.display()))?;
     let name = dev.file_name().ok_or_else(|| anyhow!("{} has no device name", dev.display()))?;
     let sectors: u64 = parse(&read(Path::new(SYS_BLOCK).join(name).join("size"))?, "block size")?;
-    let free = if is_mountpoint(Path::new("/data"))? { Some(free_bytes("/data")?) } else { None };
+    let data = Path::new("/data");
+    let free = if is_mountpoint(data)? { Some(skyward_block::mount::space(data).context("read the room in /data")?.free) } else { None };
     Ok(Storage { total: sectors * 512, free })
 }
 
@@ -346,18 +399,6 @@ fn is_mountpoint(path: &Path) -> Result<bool> {
     let here = fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
     let up = fs::metadata(parent).with_context(|| format!("stat {}", parent.display()))?;
     Ok(here.dev() != up.dev())
-}
-
-fn free_bytes(path: &str) -> Result<u64> {
-    let c = CString::new(path)?;
-    let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statvfs(c.as_ptr(), &mut s) } != 0 {
-        return Err(std::io::Error::last_os_error()).with_context(|| format!("statvfs {path}"));
-    }
-    // `fsblkcnt_t` is 32 bits on some hosts and 64 bits on Android.
-    #[allow(clippy::useless_conversion)]
-    let blocks = u64::from(s.f_bfree);
-    Ok(blocks * s.f_frsize)
 }
 
 /// The battery as it is now.
@@ -458,6 +499,21 @@ mod tests {
         assert!("2026-13-01".parse::<PatchLevel>().is_err());
         assert!("2026-10".parse::<PatchLevel>().is_err());
         assert!("October 2026".parse::<PatchLevel>().is_err());
+    }
+
+    #[test]
+    fn an_invalid_installed_patch_does_not_discard_the_other_device_details() {
+        let props = SystemProps::installed(Ok(HashMap::from([
+            ("ro.build.version.security_patch".into(), "2026-10".into()),
+            ("ro.build.version.release".into(), "16".into()),
+        ])));
+        assert_eq!(props.security_patch().unwrap(), None);
+        assert_eq!(props.get("ro.build.version.release").as_deref(), Some("16"));
+
+        let valid = SystemProps::installed(Ok(HashMap::from([
+            ("ro.build.version.security_patch".into(), "2026-10-01".into()),
+        ])));
+        assert_eq!(valid.security_patch().unwrap(), Some(PatchLevel { year: 2026, month: 10, day: 1 }));
     }
 
     #[test]

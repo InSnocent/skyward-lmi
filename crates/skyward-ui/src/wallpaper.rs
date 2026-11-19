@@ -411,7 +411,7 @@ mod tests {
         assert_eq!(rgba(8, 0), &[140, 140, 0, 255], "dimmed area above the frame");
         assert_eq!(rgba(8, 15), &[140, 0, 140, 255], "dimmed area below the frame");
         assert_eq!(rgba(8, 8), &[0, 255, 0, 255]);
-        assert!(crop.render().pixels.chunks_exact(4).all(|px| px == [0, 255, 0, 255]));
+        assert!(crop.render().pixels.as_chunks::<4>().0.iter().all(|px| *px == [0, 255, 0, 255]));
     }
 
     #[test]
@@ -434,7 +434,7 @@ mod tests {
             crop.preview(&mut preview, area, area, Rgba::rgb(0, 0, 0));
             let saved = crop.render();
             assert_eq!(preview.data.as_slice(), &*saved.pixels);
-            assert!(saved.pixels.chunks_exact(4).all(|px| px == [want.r, want.g, want.b, 255]));
+            assert!(saved.pixels.as_chunks::<4>().0.iter().all(|px| *px == [want.r, want.g, want.b, 255]));
         }
     }
 
@@ -496,7 +496,7 @@ mod tests {
         let (w, h) = (96, 160);
         let mut stripes = Canvas::new(w, h);
         stripes.shade_rows(0, h, |x, _| {
-            if (x as u32 / 4) % 2 == 0 {
+            if (x as u32 / 4).is_multiple_of(2) {
                 Rgba::rgb(0, 0, 0)
             } else {
                 Rgba::rgb(255, 255, 255)

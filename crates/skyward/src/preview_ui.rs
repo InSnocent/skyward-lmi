@@ -1,6 +1,7 @@
 use crate::backup::{self, BackupTask, DataScope, RestoreTask, Task};
 use crate::decrypt::{Decryptor, Ended, Job};
 use crate::haptics::Haptics;
+use crate::readings::{Reading, Readings};
 use crate::{filework, pty};
 use skyward_crypto::data::Closed;
 use crate::input::{monotonic_ms, Event, Inputs};
@@ -39,6 +40,7 @@ fn exercise(cfg: &DeviceConfig, inspect: bool) -> Result<()> {
     let fonts = Fonts::load(root.join(ramdisk::FONT), 0, root.join(ramdisk::MONO))?;
     let mut surface = KmsSurface::open("/dev/dri/card0")?;
     let (width, height) = surface.size();
+    crate::ui::wake_panel_on_restart(&mut surface, width, height)?;
     let mut inputs = Inputs::open(width, height, cfg.touch.writes.clone())?;
     let data_readonly = inspect && root.join(ramdisk::DATA_READONLY).is_file();
     let app_restore_test = data_readonly && root.join(ramdisk::LMI_APP_RESTORE_TEST).is_file();
@@ -46,17 +48,10 @@ fn exercise(cfg: &DeviceConfig, inspect: bool) -> Result<()> {
     let inspection = inspect.then(|| skyward_vab::inspect_unslotted(data_readonly));
     let parts: Vec<_> = inspection.as_ref().and_then(|r| r.as_ref().ok()).into_iter().flatten()
         .filter_map(|p| p.mounted.as_ref().ok()).collect();
-    let mut info = if inspect {
-        match skyward_info::collect_unslotted(cfg, &parts) {
-            Ok(info) => info,
-            Err(error) => {
-                let _ = skyward_sys::kmsg(&format!("installed system properties: {error:#}"));
-                skyward_info::collect(cfg)?
-            }
-        }
-    } else {
-        skyward_info::collect(cfg)?
-    };
+    let mut unread_battery = skyward_sys::ToldOnce::default();
+    let battery = skyward_info::battery_now();
+    crate::ui::untaken(&mut unread_battery, "the battery", battery.as_ref().err())?;
+    let mut info = skyward_info::collect_unslotted_with(cfg, &parts, battery.unwrap_or_default())?;
 
     let mut app = App::new(Screen::Home, width, height, cfg.display.density as f32 / 160.0);
     app.set_screen_corners(cfg.display.corner_radius as f32);
@@ -95,6 +90,7 @@ fn exercise(cfg: &DeviceConfig, inspect: bool) -> Result<()> {
     }
     let mut canvas = Canvas::new(width, height);
     let mut last_screen = None;
+    let readings = Readings::battery_only()?;
     let sideload_test = inspect && Path::new(sideload_test::CERTIFICATES).is_file();
     app.state.sideload_test = sideload_test;
     let block_preflight = inspect && root.join(block_preflight::ENABLED).is_file();
@@ -146,15 +142,15 @@ fn exercise(cfg: &DeviceConfig, inspect: bool) -> Result<()> {
                 let _ = skyward_sys::kmsg(&format!("UI preview showing {:?}", app.screen()));
             }
         }
-        if let Some(light) = &mut backlight {
-            if let Err(error) = light.show(app.panel(now)) {
-                hardware_error(&mut app, "亮度", &error, now);
-                backlight = None;
-            }
+        if let Some(light) = &mut backlight
+            && let Err(error) = light.show(app.panel(now))
+        {
+            hardware_error(&mut app, "亮度", &error, now);
+            backlight = None;
         }
         let max_wait = if data.wallpaper_job.is_some() { 50 } else { 1000 };
         let millis = app.deadline(now).map_or(max_wait, |due| due.saturating_sub(now).clamp(1, max_wait as u64) as i32);
-        let fds = [inputs.fd()].into_iter()
+        let fds = [inputs.fd(), readings.fd()].into_iter()
             .chain(installer.as_ref().map(Installer::fd))
             .chain(data.job.as_ref().map(Decryptor::fd))
             .chain(data.backuper.as_ref().map(backup::Worker::fd))
@@ -162,6 +158,17 @@ fn exercise(cfg: &DeviceConfig, inspect: bool) -> Result<()> {
             .chain(data.shell.as_ref().into_iter().flat_map(pty::Shell::fds))
             .collect::<Vec<_>>();
         crate::ui::wait(&fds, millis)?;
+        for reading in readings.taken() {
+            let Reading::Battery(battery, _) = reading else { continue };
+            crate::ui::untaken(&mut unread_battery, "the battery", battery.as_ref().err())?;
+            if let Ok(battery) = battery
+                && battery != info.battery
+            {
+                crate::ui::plug(&mut app, &info.battery, &battery, monotonic_ms())?;
+                info.battery = battery;
+                app.refresh();
+            }
+        }
         for event in installer.as_ref().map(Installer::events).unwrap_or_default() {
             let finished = matches!(event, InstallEvent::Finished(_));
             app.install(event, monotonic_ms());
@@ -371,7 +378,7 @@ fn verify_sample() -> Result<()> {
     if unsafe { libc::statfs(c"/dev".as_ptr(), info.as_mut_ptr()) } != 0 {
         return Err(std::io::Error::last_os_error()).context("check the recovery scratch filesystem");
     }
-    ensure!(unsafe { info.assume_init() }.f_type as u64 == 0x0102_1994, "the recovery scratch filesystem is not tmpfs");
+    ensure!(unsafe { info.assume_init() }.f_type == 0x0102_1994, "the recovery scratch filesystem is not tmpfs");
     let destination = tempfile::tempdir_in("/dev").context("create a scratch directory on tmpfs")?;
     let cancel = AtomicBool::new(false);
     let skipped = Skipped::new(&[]);
@@ -775,11 +782,11 @@ fn handle(
                     (true, None) => {
                         let started = (|| -> Result<_> {
                             let transfer = crate::ui::Transfer::start(cfg, info, app.state.time_zone)?;
-                            if installer.is_none() {
-                                if let Err(error) = skyward_sys::usb::switch(skyward_sys::usb::resting(), crate::ui::USB_TIMEOUT) {
-                                    let _ = transfer.stop(true);
-                                    return Err(error);
-                                }
+                            if installer.is_none()
+                                && let Err(error) = skyward_sys::usb::switch(skyward_sys::usb::resting(), crate::ui::USB_TIMEOUT)
+                            {
+                                let _ = transfer.stop(true);
+                                return Err(error);
                             }
                             Ok(transfer)
                         })();
@@ -844,10 +851,10 @@ fn handle(
                 }
             }
             Effect::TermInput(bytes) => {
-                if let Some(shell) = &mut data.shell {
-                    if let Err(error) = shell.write(&bytes) {
-                        hardware_error(app, "终端", &error, now);
-                    }
+                if let Some(shell) = &mut data.shell
+                    && let Err(error) = shell.write(&bytes)
+                {
+                    hardware_error(app, "终端", &error, now);
                 }
             }
             Effect::Screenshot { storage } => {
@@ -991,11 +998,11 @@ fn handle(
                 }
             }
             Effect::Haptic => {
-                if let Some(motor) = haptics {
-                    if let Err(error) = motor.click(app.state.vibration) {
-                        hardware_error(app, "振动", &error, now);
-                        *haptics = None;
-                    }
+                if let Some(motor) = haptics
+                    && let Err(error) = motor.click(app.state.vibration)
+                {
+                    hardware_error(app, "振动", &error, now);
+                    *haptics = None;
                 }
             }
             Effect::Sideload | Effect::SideloadPreflight
@@ -1084,11 +1091,11 @@ fn handle(
                 }
             }
             Effect::Ticks => {
-                if let Some(motor) = haptics {
-                    if let Err(error) = motor.ticks() {
-                        hardware_error(app, "振动", &error, now);
-                        *haptics = None;
-                    }
+                if let Some(motor) = haptics
+                    && let Err(error) = motor.ticks()
+                {
+                    hardware_error(app, "振动", &error, now);
+                    *haptics = None;
                 }
             }
             Effect::ReadSlots | Effect::ReadMounts => {}

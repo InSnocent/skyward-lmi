@@ -7,7 +7,7 @@ const START_OF_1971: i64 = 31_536_000;
 
 // These transient filesystems can create entries before Recovery has set the
 // wall clock. An early-1970 timestamp there is not a useful modification date.
-fn meaningful(filesystem: u64, modified: i64) -> bool {
+fn meaningful(filesystem: u32, modified: i64) -> bool {
     let ephemeral = matches!(
         filesystem,
         0x6265_6570 // configfs
@@ -31,7 +31,7 @@ pub fn known(path: &Path, modified: i64) -> bool {
     if unsafe { libc::statfs(path.as_ptr(), info.as_mut_ptr()) } != 0 {
         return true;
     }
-    let filesystem = unsafe { info.assume_init() }.f_type as u64 & 0xffff_ffff;
+    let filesystem = unsafe { info.assume_init() }.f_type as u32;
     meaningful(filesystem, modified)
 }
 

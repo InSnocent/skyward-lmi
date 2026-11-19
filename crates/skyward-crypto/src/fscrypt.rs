@@ -4,23 +4,19 @@
 
 #[cfg(target_os = "android")]
 use anyhow::bail;
-#[cfg(any(target_os = "android", test))]
 use anyhow::{Context, Result};
-#[cfg(any(target_os = "android", test))]
 use std::path::Path;
 
 /// How long the name the kernel gives a key is.
 pub const NAME_BYTES: usize = 16;
 
 /// Android's file encryption policy version.
-#[cfg(any(target_os = "android", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Policy {
     V1,
     V2,
 }
 
-#[cfg(any(target_os = "android", test))]
 impl Policy {
     pub fn from_mode(mode: &str) -> Self {
         if mode.split(['+', ':']).any(|part| part == "v1") { Self::V1 } else { Self::V2 }
@@ -59,9 +55,16 @@ fn key_arg(raw: &[u8], wrapped: bool, policy: Policy) -> Vec<u8> {
     arg
 }
 
-/// Let a key into the filesystem and return the key reference it uses.
+/// Let a version-two key into the filesystem and return its identifier.
 #[cfg(target_os = "android")]
-pub fn add_key(mount: &Path, raw: &[u8], wrapped: bool, policy: Policy) -> Result<Vec<u8>> {
+pub fn add_key(mount: &Path, raw: &[u8], wrapped: bool) -> Result<[u8; NAME_BYTES]> {
+    let key = add_key_for_policy(mount, raw, wrapped, Policy::V2)?;
+    Ok(key.try_into().expect("version two gives a full identifier"))
+}
+
+/// Let a key into the filesystem and give the descriptor or identifier it uses.
+#[cfg(target_os = "android")]
+pub(crate) fn add_key_for_policy(mount: &Path, raw: &[u8], wrapped: bool, policy: Policy) -> Result<Vec<u8>> {
     use std::os::fd::AsRawFd;
     const ADD_KEY: u32 = 0xc050_6617;
 
@@ -123,10 +126,14 @@ pub fn hardware_wrapped(mode: &str) -> bool {
     mode.split(['+', ':']).any(|part| part == "wrappedkey_v0")
 }
 
-/// Read the name the phone recorded for a key it let in, to check against
-/// the name the kernel works out now.
-#[cfg(any(target_os = "android", test))]
-pub fn recorded_name(path: &Path, policy: Policy) -> Result<Vec<u8>> {
+/// Read the identifier the phone recorded for a version-two key it let in.
+pub fn recorded_name(path: &Path) -> Result<[u8; NAME_BYTES]> {
+    let name = recorded_name_for_policy(path, Policy::V2)?;
+    Ok(name.try_into().expect("version two gives a full identifier"))
+}
+
+/// Check the recorded reference length against the phone's chosen policy.
+pub(crate) fn recorded_name_for_policy(path: &Path, policy: Policy) -> Result<Vec<u8>> {
     let raw = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
     let expected = policy.reference_bytes();
     anyhow::ensure!(raw.len() == expected, "{} holds {} bytes, expected {expected}", path.display(), raw.len());
@@ -176,11 +183,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let good = dir.join("ref");
         std::fs::write(&good, [7u8; NAME_BYTES]).unwrap();
-        assert_eq!(recorded_name(&good, Policy::V2).unwrap(), [7u8; NAME_BYTES]);
+        assert_eq!(recorded_name(&good).unwrap(), [7u8; NAME_BYTES]);
         let short = dir.join("short");
         std::fs::write(&short, [7u8; 8]).unwrap();
-        assert!(recorded_name(&short, Policy::V2).is_err());
+        assert!(recorded_name(&short).is_err());
         std::fs::write(&short, [3u8; 8]).unwrap();
-        assert_eq!(recorded_name(&short, Policy::V1).unwrap(), [3u8; 8]);
+        assert_eq!(recorded_name_for_policy(&short, Policy::V1).unwrap(), [3u8; 8]);
     }
 }

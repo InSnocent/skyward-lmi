@@ -6,6 +6,8 @@ English | [简体中文](README.zh-CN.md)
 
 An unofficial preview of Skyward Recovery for the Redmi K30 Pro (`lmi`). This port builds on Skyward, the Android recovery written in Rust. The features below describe the current source; previously released or installed images may not include the latest changes. [Upstream Skyward](https://github.com/kirklin/skyward)
 
+This branch incorporates upstream Skyward v0.3.1. The lmi features and device test results below refer to the v1.1.0 release until the synchronized build has been tested on the phone.
+
 ## Screenshots
 
 The Home screen, wallpaper settings and frosted cards in dark mode, rendered on a computer with a sample wallpaper.
