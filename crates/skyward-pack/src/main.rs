@@ -164,7 +164,7 @@ struct PreviewAssets {
     /// Enable A-only data decryption with the matching ROM libraries.
     #[arg(long, requires = "read_only", conflicts_with = "sideload_test_certs")]
     data_readonly: bool,
-    /// Directory containing the Runtime and ICU APEX files extracted from the lmi ROM.
+    /// Optional Runtime and ICU files for a fixed ROM. Otherwise lmi opens the installed APEX files.
     #[arg(long, requires = "data_readonly")]
     lmi_apex_files: Option<PathBuf>,
     /// Expected contents of the synthetic lmi backup sample.
@@ -341,8 +341,9 @@ fn build_probe(base: &Path, binary: &Path, out: &Path, assets: Option<&PreviewAs
         }
         if assets.data_readonly {
             ensure!(cfg.device.codename == "lmi", "the legacy decryption test is configured for lmi");
-            let apex = assets.lmi_apex_files.as_deref().context("the lmi decryption test requires --lmi-apex-files")?;
-            add_lmi_apex(&mut ramdisk, apex)?;
+            if let Some(apex) = assets.lmi_apex_files.as_deref() {
+                add_lmi_apex(&mut ramdisk, apex)?;
+            }
             // The Recovery service manager caches its manifest at boot.
             ramdisk.add(
                 "system/etc/vintf/manifest/android.system.keystore2-service.xml",

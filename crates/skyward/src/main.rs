@@ -7,6 +7,8 @@ use skyward_sys::{bcb, Power};
 use skyward_vab::SnapshotState;
 use std::path::{Path, PathBuf};
 
+#[cfg(any(target_os = "android", test))]
+mod apex;
 #[cfg(target_os = "android")]
 mod backup;
 #[cfg(target_os = "android")]

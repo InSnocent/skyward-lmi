@@ -29,6 +29,7 @@
 | 独立校验备份 | 临时启动后，原备份可以开始校验、显示进度并停止；原备份仍可打开，重新完整校验通过。只校验，未执行恢复 |
 | 本地 IMG 与 ZIP 确认 | 临时启动候选版后，匹配 ROM ZIP 验签通过并在确认前取消；无效 IMG 被拒绝，现用 boot 镜像可在确认前返回取消。用现用镜像原样写回 boot 和 recovery，均完成完整分区回读。返回 Android 后两个分区 SHA-256 与原件一致，SukiSU Root 可用 |
 | 格式化 Data、刷入 LOS 与首次开机 | Redmi K30 Pro 临时启动通用安装候选后，完整格式化 Data 成功。官方 LineageOS 23.2（2026-11-18，lmi）经 ADB sideload 验签并实际安装。首次开机进入桌面，ADB 核对 Android 16、开机结束、F2FS 可读写和文件级加密生效 |
+| LOS 无锁屏凭据解密 | 使用同版 LOS 官方 Recovery 和匹配的 Runtime、ICU APEX 构建只读候选。保持设备原有的无 PIN 设置，点击解密后能直接进入内部存储 |
 
 实机验证覆盖 Redmi K30 Pro 上的 Infinity-X 3.12 和上述 LineageOS 23.2 构建。早期安装版验证了 Infinity-X 同版重装，通用安装候选验证了从 Infinity-X 切换到 LineageOS。未接通的菜单和完整恢复的限制见首页。 [当前限制](../README.zh-CN.md#当前限制)
 
@@ -100,6 +101,8 @@ cargo test --release --locked -p skyward-install --test lmi_preflight -- --ignor
 
 准备清除用户数据时，请保留一份已校验的外部备份。重置后解密新系统的内部存储，在恢复页只勾选「共享文件」；原 `data` 归档仍要求原加密密钥。
 
+v1.2.3 的更新镜像以 LineageOS 23.2（2026 年 11 月 18 日）的官方 `lmi` Recovery 为底包，从手机上已安装的系统读取 Runtime 和 ICU APEX。已在这版 LineageOS 的无 PIN 环境下验证解密和访问内部存储。遇到元数据密钥升级返回 `-38` 时，先核对 Recovery 和系统的安全补丁级别。
+
 ### 独立校验备份
 
 在「恢复」中打开一份备份，选择「校验备份」。校验会读取备份清单和全部编号分卷，核对文件长度、解压后的长度和 SHA-256。页面显示进度并支持停止；停止不会删除原备份。校验期间暂时撤出 MTP 存储，结束后恢复原文件传输设置。
@@ -158,7 +161,7 @@ cargo build --locked --release -p skyward-pack
 cargo build --locked --target aarch64-linux-android --release -p skyward
 ```
 
-在仓库根目录准备 `inputs/recovery.img`，即同版配套的 Infinity-X Recovery 镜像，并准备从同版 ROM 还原出的 `inputs/vendor.img`。ROM 内的 `vendor.new.dat.br` 需要先用 Brotli 解压，再用 `vendor.transfer.list` 和解压得到的 `vendor.new.dat` 还原为 EROFS 镜像。若已准备 `inputs/vendor.img`，可直接提取固件。从同一 ROM 提取 Runtime 和 ICU APEX 文件到 `inputs/lmi-apex`，保留 `com.android.runtime/` 与 `com.android.i18n/` 的内部路径。所需文件由 `skyward-pack` 的 `add_lmi_apex` 列出。 [sdat2img](https://github.com/xpirt/sdat2img)
+把构建日期为 2026 年 11 月 18 日的 LineageOS 23.2 官方 `lmi` Recovery 放到 `inputs/recovery.img`。振动固件取自 Infinity-X 3.12 的 `vendor.img`。如需从 ROM 的 `vendor.new.dat.br` 还原该镜像，先用 Brotli 解压，再用 `sdat2img` 和 `vendor.transfer.list` 还原为 EROFS 镜像。 [sdat2img](https://github.com/xpirt/sdat2img)
 
 ```sh
 mkdir -p inputs/aw8697
@@ -176,7 +179,7 @@ done
 
 target/release/skyward-pack preview-ui \
   --read-only --lmi-zip-install \
-  --data-readonly --lmi-data-backup --lmi-apex-files inputs/lmi-apex \
+  --data-readonly --lmi-data-backup \
   --base inputs/recovery.img \
   --binary target/aarch64-linux-android/release/skyward \
   --config devices/lmi.toml \
@@ -198,7 +201,7 @@ sha256sum skyward-lmi.img
 
 | 文件 | 实机测试或构建输入的 SHA-256 |
 | --- | --- |
-| `lmi-skyward-1.2.3.img`（v1.2.3） | `78e4174d31091d42deea923af789af3476b567c0b3a5bcdc8841757ebde9f7fe` |
+| `lmi-skyward-1.2.3.img`（v1.2.3） | `e46901c5432c96a076bdcc155f0335a8ce9c709dfa1742fd22477c6a8469a0a1` |
 | `lmi-skyward-1.1.0.img`（v1.1.0） | `05ec4ad8ccdb54415df0d45eaf23d0b240fbc111badb4de384dd383659958661` |
 | `lmi-skyward-backup-verify-test-v1-20261118.img`（独立备份校验版） | `816e4fc083b8588322fed39d731c8da46f3e66dc95940d48b03a3e024e4be850` |
 | `lmi-skyward-settings-preunlock-test-v4-20261118.img`（解密前基础设置版） | `522d5f1251a4fef00e29d811c7263c96474bb906a7ee11b734b10b6c9074b365` |
@@ -212,7 +215,8 @@ sha256sum skyward-lmi.img
 | `lmi-skyward-block-ota-install-remapped.img`（旧版回退） | `e90c22c0ee6998b09f7305e8242fd8d7668a9cd10695b5f29ffa06d7168e0933` |
 | `lmi-skyward-block-ota-install.img` | `7c8c9cb450e5b70ccf35b6d69f0a2cb31a654f407790d9597e1bc1fc16d75e0c` |
 | `Project_Infinity-X-3.12-lmi-29.10.2026-GAPPS-UNOFFICIAL.zip` | `9cf66b7fa39e1f5afd2b22dfdb13739bbba6140c9456ab659e1df2434933843e` |
-| `recovery.img` | `35935b135376b51a6dc1eb673d0329ee84c81672cb24add4ef1192fa59f1e331` |
+| LineageOS 23.2 官方 `recovery.img`（2026 年 11 月 18 日，v1.2.3 底包） | `35852955bb49f11c66a521114c98c5bdf7c930f6c73195ce9ccca8452a648c24` |
+| Infinity-X 3.12 原版 `recovery.img` | `35935b135376b51a6dc1eb673d0329ee84c81672cb24add4ef1192fa59f1e331` |
 | `boot.img`（ROM 自带） | `21283479f70c40ee77b7b74b953d85072b78ab52e7def464d918aa0356b22cb7` |
 | `boot-lmi-infinityx-sukisu-v4.3.0.img` | `898749b73f7daf4c37dcdc98e0cfa8671caa8b4d99c4abc9f15c2cf807aa39c3` |
 | `aw8697_haptic.bin` | `c85799567cb7e6842a9968e97f2438a5b0797f260d1dc64d4becd765c088cafd` |

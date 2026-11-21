@@ -13,6 +13,7 @@ use crate::{data_wipe, wipe};
 use anyhow::{ensure, Context, Result};
 use skyward_config::{ramdisk, DeviceConfig};
 use skyward_install::{block_preflight, sideload_test, Event as InstallEvent, Installer};
+use skyward_sys::bcb;
 use skyward_ui::app::{BackupAt, Data, Effect, FileOp, FileTask, JobEnd, MountRow, Place, RenameRefused, Screen, Target, USB_DRIVE, Wipe};
 use skyward_ui::settings::{Kept, Keeper};
 use skyward_ui::surface::kms::KmsSurface;
@@ -767,6 +768,26 @@ fn handle(
             Effect::Reboot(target) if target != Target::Fastboot && data.tasks_idle() && installer.is_none() => {
                 if !crate::ui::withhold(&mut data.transfer, app, now)? {
                     continue;
+                }
+                // The A-only launcher leaves misc alone on entry. Honor an
+                // explicit system reboot in the full lmi image by retiring a
+                // pending recovery request. Inspection images only read misc.
+                if target == Target::System && app.state.lmi_zip_install {
+                    match bcb::clear_recovery_request(&bcb::misc()) {
+                        Ok(true) => {
+                            let _ = skyward_sys::kmsg("lmi: cleared a pending recovery request before rebooting to Android");
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            let name = app.state.lang.pick([
+                                "无法清除 Recovery 启动请求",
+                                "無法清除 Recovery 啟動請求",
+                                "Could not clear the recovery boot request",
+                            ]);
+                            hardware_error(app, name, &error, now);
+                            continue;
+                        }
+                    }
                 }
                 data.keep_settings(app, now, true);
                 if data.enabled {

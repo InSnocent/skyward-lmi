@@ -56,7 +56,7 @@ impl Bcb {
     /// Whether the message asks the bootloader for the recovery: for work of
     /// its own, its fastboot, or rescue.
     pub fn asks_for_recovery(&self) -> bool {
-        matches!(self.command.as_str(), "boot-recovery" | "boot-fastboot" | "boot-rescue")
+        recovery_command(&self.command)
     }
 
     /// What the message asks the recovery to do, read the way Android's
@@ -299,6 +299,10 @@ fn text(field: &[u8]) -> Result<&str> {
     std::str::from_utf8(&field[..end]).context("not UTF-8")
 }
 
+fn recovery_command(command: &str) -> bool {
+    matches!(command, "boot-recovery" | "boot-fastboot" | "boot-rescue")
+}
+
 pub fn read(misc: &Path) -> Result<Bcb> {
     let mut raw = [0u8; SIZE];
     File::open(misc)
@@ -313,6 +317,20 @@ pub fn clear(misc: &Path) -> Result<()> {
     let f = OpenOptions::new().write(true).open(misc).with_context(|| format!("open {}", misc.display()))?;
     f.write_all_at(&[0u8; SIZE], 0).with_context(|| format!("write {}", misc.display()))?;
     f.sync_all().with_context(|| format!("sync {}", misc.display()))
+}
+
+/// Clear a recovery request when the user explicitly chooses to boot Android.
+/// The bootloader reads the command even if the recovery arguments are invalid.
+pub fn clear_recovery_request(misc: &Path) -> Result<bool> {
+    let mut command = [0u8; COMMAND.end];
+    File::open(misc)
+        .and_then(|f| f.read_exact_at(&mut command, 0))
+        .with_context(|| format!("read the bootloader command from {}", misc.display()))?;
+    if !text(&command).is_ok_and(recovery_command) {
+        return Ok(false);
+    }
+    clear(misc)?;
+    Ok(true)
 }
 
 /// Write `bcb` over the bootloader message in misc, its status and stage
@@ -618,6 +636,37 @@ mod tests {
         assert_eq!((start, end - start), (32832, 64));
         assert!(after[start..end].iter().all(|&b| b == 0));
         assert!(after[..start].iter().chain(&after[end..]).all(|&b| b == 0xff));
+    }
+
+    #[test]
+    fn normal_boot_releases_the_recovery_request() {
+        for command in ["boot-recovery", "boot-fastboot", "boot-rescue"] {
+            let mut before = vec![0xffu8; 2 * SIZE];
+            // The bootloader only needs the command. A stale recovery field
+            // must not prevent the user from explicitly booting Android.
+            before[..SIZE].copy_from_slice(&message(command.as_bytes(), b"\xff"));
+            let path = scratch(command, &before);
+            let cleared = clear_recovery_request(&path);
+            let after = std::fs::read(&path).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            assert!(cleared.unwrap(), "{command}");
+            assert_eq!(&after[..SIZE], &[0u8; SIZE], "{command}");
+            assert_eq!(&after[SIZE..], &before[SIZE..]);
+        }
+    }
+
+    #[test]
+    fn normal_boot_preserves_misc_without_a_recovery_request() {
+        for command in ["", "bootonce-bootloader", "boot-recovery-test"] {
+            let mut before = vec![0xffu8; 2 * SIZE];
+            before[..SIZE].copy_from_slice(&message(command.as_bytes(), b""));
+            let path = scratch(&format!("keep-{command}"), &before);
+            let cleared = clear_recovery_request(&path);
+            let after = std::fs::read(&path).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            assert!(!cleared.unwrap(), "{command}");
+            assert_eq!(after, before, "{command}");
+        }
     }
 
     #[test]

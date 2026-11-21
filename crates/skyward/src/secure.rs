@@ -12,10 +12,6 @@ use std::time::{Duration, Instant};
 /// were built against.
 const BUNDLE_DIRS: [&str; 4] = ["/mnt/system_ext/apex", "/mnt/system/system/apex", "/mnt/product/apex", "/vendor/apex"];
 
-/// The file inside a bundle that holds its filesystem. It is stored whole,
-/// so the bundle can be opened where it lies.
-const BUNDLE_IMAGE: &str = "apex_payload.img";
-
 /// Where Android opens its bundles, and the directory of 64-bit libraries
 /// inside one.
 const BUNDLE_MOUNT: &str = "/apex";
@@ -88,19 +84,57 @@ pub fn prepare_hardware_directory(wanted: &[String]) -> Result<()> {
     prepare_hardware_directory_with(wanted, bundle(RUNTIME_BUNDLE)?)
 }
 
-pub fn prepare_legacy_hardware_directory(wanted: &[String]) -> Result<()> {
+/// Installed APEX mounts stay open while the lmi services use them.
+#[derive(Default)]
+pub struct LegacyApexes(Vec<crate::apex::Mounted>);
+
+impl LegacyApexes {
+    fn mount(&mut self, name: &str, target: PathBuf) -> Result<()> {
+        let file = installed_bundle(name).with_context(|| format!("the installed system carries no {name} APEX"))?;
+        let mounted = crate::apex::Mounted::open(&file, target)
+            .with_context(|| format!("load the installed {name} APEX from {}", file.display()))?;
+        self.0.push(mounted);
+        Ok(())
+    }
+
+    pub fn close(&mut self) -> Result<()> {
+        while let Some(apex) = self.0.last_mut() {
+            apex.close()?;
+            self.0.pop();
+        }
+        Ok(())
+    }
+}
+
+impl Drop for LegacyApexes {
+    fn drop(&mut self) {
+        if let Err(error) = self.close() {
+            let _ = skyward_sys::kmsg(&format!("lmi APEX cleanup failed: {error:#}"));
+        }
+    }
+}
+
+pub fn prepare_legacy_hardware_directory(wanted: &[String], apexes: &mut LegacyApexes) -> Result<()> {
     use skyward_block::mount;
-    for name in [RUNTIME_BUNDLE, "com.android.i18n"] {
-        let source = Path::new("/skyward/apex").join(name);
+
+    let names = [RUNTIME_BUNDLE, "com.android.i18n"];
+    let staged = Path::new("/skyward/apex");
+    let has_staged = names.iter().any(|name| staged.join(name).exists());
+    for name in names {
         let target = Path::new(BUNDLE_MOUNT).join(name);
-        ensure!(source.is_dir(), "the recovery image is missing staged files for {name}");
         fs::create_dir_all(&target)?;
-        if !mount::is_mount_point(&target)? {
-            mount::bind(&source, &target)?;
+        if has_staged {
+            let source = staged.join(name);
+            ensure!(source.is_dir(), "the recovery image is missing staged files for {name}");
+            if !mount::is_mount_point(&target)? {
+                mount::bind(&source, &target)?;
+            }
+        } else {
+            apexes.mount(name, target)?;
         }
     }
     let runtime = Path::new(BUNDLE_MOUNT).join(RUNTIME_BUNDLE);
-    ensure!(runtime.join(BUNDLE_LOADER).is_file(), "the staged runtime loader is not visible after binding");
+    ensure!(runtime.join(BUNDLE_LOADER).is_file(), "the Runtime APEX loader is not visible");
     let program = Path::new("/system/bin/hwservicemanager");
     if !program.exists() {
         std::os::unix::fs::symlink("/mnt/system_ext/bin/hwservicemanager", program)
@@ -196,26 +230,19 @@ fn bundle(name: &str) -> Result<Option<PathBuf>> {
     if skyward_block::mount::is_mount_point(&at)? {
         return Ok(Some(at));
     }
-    let Some(file) = BUNDLE_DIRS.iter().map(|d| Path::new(d).join(format!("{name}.apex"))).find(|p| p.is_file()) else {
+    let Some(file) = installed_bundle(name) else {
         return Ok(None);
     };
-    let (offset, length) = image(&file)?;
+    let (offset, length) = crate::apex::image(&file)?;
     let device = skyward_block::loopdev::attach(&file, offset, length)?;
     fs::create_dir_all(&at).with_context(|| format!("make {}", at.display()))?;
     skyward_block::mount::mount_ro(&device, &at)?;
     Ok(Some(at))
 }
 
-/// Where the filesystem lies inside a bundle.
-fn image(file: &Path) -> Result<(u64, u64)> {
-    let f = fs::File::open(file).with_context(|| format!("open {}", file.display()))?;
-    let mut bundle = zip::ZipArchive::new(f).with_context(|| format!("read what is in {}", file.display()))?;
-    let entry = bundle.by_name(BUNDLE_IMAGE).with_context(|| format!("{} holds no {BUNDLE_IMAGE}", file.display()))?;
-    if entry.compression() != zip::CompressionMethod::Stored {
-        anyhow::bail!("{} keeps its {BUNDLE_IMAGE} packed, which cannot be opened where it lies", file.display());
-    }
-    let start = entry.data_start().with_context(|| format!("{BUNDLE_IMAGE} in {} says where it is not", file.display()))?;
-    Ok((start, entry.size()))
+fn installed_bundle(name: &str) -> Option<PathBuf> {
+    let filename = format!("{name}.apex");
+    BUNDLE_DIRS.iter().map(|dir| Path::new(dir).join(&filename)).find(|file| file.is_file())
 }
 
 /// Tell the phone's service directory of the services in `wanted`, which

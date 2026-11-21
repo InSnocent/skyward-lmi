@@ -9,7 +9,12 @@ use std::sync::Mutex;
 
 const COMPAT: &str = "android.security.compat";
 
-static SERVICES: Mutex<Option<crate::services::Managed>> = Mutex::new(None);
+struct Active {
+    managed: crate::services::Managed,
+    apexes: crate::secure::LegacyApexes,
+}
+
+static SERVICES: Mutex<Option<Active>> = Mutex::new(None);
 
 /// Start the installed system's own security services for lmi decryption.
 pub fn prepare() -> Result<()> {
@@ -23,7 +28,8 @@ pub fn prepare() -> Result<()> {
 fn stop_services() -> Result<()> {
     let mut services = SERVICES.lock().expect("the lmi services lock is not poisoned");
     if let Some(active) = services.as_mut() {
-        active.stop()?;
+        active.managed.stop()?;
+        active.apexes.close()?;
         *services = None;
     }
     Ok(())
@@ -61,14 +67,14 @@ pub(crate) fn clear_app_keys(
 
     let mut services = SERVICES.lock().expect("the lmi services lock is not poisoned");
     let active = services.as_mut().context("the lmi decryption services are not active")?;
-    let old = active.last_pid()?;
+    let old = active.managed.last_pid()?;
     require_keystore_process(old, Path::new(TEMP_STORE))?;
     let binder = Binder::open()?;
     drop(checked_service(&binder, KEYSTORE_SERVICE, KEYSTORE_INTERFACE, old)?);
     drop(checked_service(&binder, MAINTENANCE, MAINTENANCE_INTERFACE, old)?);
 
     before_stopping();
-    active.stop_last(old)?;
+    active.managed.stop_last(old)?;
     let timeout = Instant::now() + Duration::from_secs(5);
     loop {
         if service::find(&binder, KEYSTORE_SERVICE)?.is_none()
@@ -190,10 +196,10 @@ pub fn finish() -> Result<()> {
     unmount_partition("metadata", "/metadata")
 }
 
-fn start() -> Result<crate::services::Managed> {
+fn start() -> Result<Active> {
     let cfg = skyward_config::DeviceConfig::load("/skyward/device.toml")?;
     ensure!(cfg.device.codename == "lmi", "legacy decryption is configured for lmi");
-    // The same ROM's Recovery already carries the correct OS and vendor patch levels.
+    // Keep the genuine build and patch levels of the booted recovery.
     for point in ["/mnt/system", "/mnt/system_ext", "/vendor", "/odm"] {
         ensure!(mount::is_mount_point(Path::new(point))?, "{point} is not mounted");
     }
@@ -211,7 +217,8 @@ fn start() -> Result<crate::services::Managed> {
     std::os::unix::fs::chown(key_db, Some(1017), Some(1017))?;
 
     let hardware: Vec<_> = cfg.services.iter().filter_map(|s| s.ready_hardware_service.clone()).collect();
-    crate::secure::prepare_legacy_hardware_directory(&hardware)?;
+    let mut apexes = crate::secure::LegacyApexes::default();
+    crate::secure::prepare_legacy_hardware_directory(&hardware, &mut apexes)?;
     let fragments = Path::new("/skyward/framework-manifest-fragments");
     fs::create_dir_all(fragments)?;
     fs::set_permissions(fragments, fs::Permissions::from_mode(0o755))?;
@@ -239,7 +246,7 @@ fn start() -> Result<crate::services::Managed> {
     ensure!(crate::services::registered(COMPAT), "the Keystore compatibility service did not register");
     let binder = skyward_binder::driver::Binder::open()?;
     skyward_crypto::keymint::KeyMint::open(&binder)?.hardware()?;
-    Ok(started)
+    Ok(Active { managed: started, apexes })
 }
 
 /// In recovery without logd, keep just the hardware directory's startup
