@@ -623,7 +623,7 @@ fn set_project(_path: &Path, _project: u32, _inherits: bool) -> Result<()> {
 
 /// Give an entry an extended attribute, a link its own. One the filesystem
 /// keeps none of is let go.
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", all(test, target_os = "linux")))]
 fn set_xattr(path: &Path, name: &str, value: &[u8]) -> Result<()> {
     let c = cstr(path)?;
     let n = std::ffi::CString::new(name).with_context(|| format!("the attribute {name} holds a NUL"))?;
@@ -637,7 +637,7 @@ fn set_xattr(path: &Path, name: &str, value: &[u8]) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", all(test, target_os = "linux"))))]
 fn set_xattr(_path: &Path, _name: &str, _value: &[u8]) -> Result<()> {
     unreachable!("only the phone's archives hold extended attributes")
 }
@@ -709,6 +709,69 @@ mod tests {
 
     fn skipped() -> Skipped {
         Skipped::new(&["media".into(), "system_de/*/spblob".into()])
+    }
+
+    #[test]
+    fn binary_extended_attributes_survive_restore() {
+        let to = tempfile::tempdir().unwrap();
+        let cancel = AtomicBool::new(false);
+        let attr = b"first\n\n10 mtime=0\n=\0\xff\n";
+        let mut builder = Builder::new(Vec::new());
+        builder.append_pax_extensions([("SCHILY.xattr.user.skyward", attr.as_slice()), (MTIME, b"20.123456789")]).unwrap();
+        let mut header = Header::new_gnu();
+        header.set_entry_type(EntryType::Directory);
+        header.set_mode(0o700);
+        header.set_uid(u64::from(unsafe { libc::geteuid() }));
+        header.set_gid(u64::from(unsafe { libc::getegid() }));
+        header.set_mtime(20);
+        header.set_size(0);
+        builder.append_data(&mut header, "app-ephemeral", io::empty()).unwrap();
+        let tar = builder.into_inner().unwrap();
+
+        let mut archive = Archive::new(tar.as_slice());
+        let mut entries = archive.entries().unwrap();
+        let mut entry = entries.next().unwrap().unwrap();
+        assert_eq!(records(&mut entry).unwrap().xattrs, vec![("user.skyward".to_string(), attr.to_vec())]);
+        assert!(entries.next().is_none());
+
+        #[cfg(any(target_os = "android", target_os = "linux"))]
+        {
+            unpack(tar.as_slice(), to.path(), &skipped(), &cancel, &mut |_| {}).unwrap();
+            let restored = to.path().join("app-ephemeral");
+            let meta = fs::metadata(&restored).unwrap();
+            assert_eq!((meta.mtime(), meta.mtime_nsec()), (20, 123_456_789));
+            let path = cstr(&restored).unwrap();
+            let mut value = [0_u8; 128];
+            let len = unsafe {
+                libc::lgetxattr(path.as_ptr(), c"user.skyward".as_ptr(), value.as_mut_ptr().cast(), value.len())
+            };
+            assert_eq!(len, attr.len() as isize);
+            assert_eq!(&value[..len as usize], attr);
+        }
+    }
+
+    #[test]
+    fn records_with_invalid_pax_lengths_are_rejected() {
+        let mut builder = Builder::new(Vec::new());
+        let incomplete = b"20 mtime=20\n";
+        let mut pax = Header::new_ustar();
+        pax.set_entry_type(EntryType::XHeader);
+        pax.set_size(incomplete.len() as u64);
+        builder.append_data(&mut pax, "PaxHeader", &incomplete[..]).unwrap();
+        let mut dir = Header::new_gnu();
+        dir.set_entry_type(EntryType::Directory);
+        dir.set_mode(0o700);
+        dir.set_uid(0);
+        dir.set_gid(0);
+        dir.set_mtime(20);
+        dir.set_size(0);
+        builder.append_data(&mut dir, "app-ephemeral", io::empty()).unwrap();
+
+        let tar = builder.into_inner().unwrap();
+        let mut archive = Archive::new(tar.as_slice());
+        let mut entry = archive.entries().unwrap().next().unwrap().unwrap();
+        let error = records(&mut entry).err().unwrap();
+        assert_eq!(error.root_cause().to_string(), "malformed pax extension");
     }
 
     #[test]
