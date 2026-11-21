@@ -6,6 +6,12 @@ use super::*;
 /// What an install is told while the last one has not ended.
 pub const INSTALL_UNFINISHED: Text = ["上一次安装尚未结束，请稍后再试", "上一次安裝尚未結束，請稍後再試", "The last install hasn't ended. Try again shortly"];
 
+pub const INSTALL_USB_DISCONNECTED: Text = [
+    "U 盘已断开，请重新选择 ZIP。",
+    "USB 隨身碟已拔除，請重新選擇 ZIP。",
+    "USB drive disconnected. Choose the ZIP again.",
+];
+
 /// Where the package being installed comes from.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Source {
@@ -21,6 +27,13 @@ pub enum Source {
     Asked { security: bool },
     /// The computer, with `adb rescue`.
     Rescue,
+}
+
+impl Source {
+    /// Whether the package lives on the attached USB drive.
+    pub fn uses_usb_drive(self) -> bool {
+        matches!(self, Self::File(Place::UsbDrive) | Self::Opened { drive: true })
+    }
 }
 
 /// What the system asked of the recovery before it started, as the pages
@@ -89,6 +102,8 @@ pub enum Install {
     Flashing { partition: &'static str, stage: Option<Stage> },
     /// A zip with an install script waits for the user to agree to run it.
     ConfirmingScript,
+    /// The exception is kept in this confirmation page and discarded when it ends.
+    ConfirmingLmiZip { report: skyward_install::lmi_zip::Report, allowed: bool },
     /// A system to install beside the installed one waits for the room its
     /// root takes to be chosen.
     SystemChoosing(SystemChoice),
@@ -228,7 +243,7 @@ impl App {
         if matches!(ev, Event::Wipe | Event::Reboot(_)) {
             return;
         }
-        if matches!(ev, Event::Image { .. } | Event::LocalImage { .. } | Event::Ready { .. } | Event::BlockReady(_) | Event::Script | Event::System { .. } | Event::Done(_) | Event::Finished(_)) {
+        if matches!(ev, Event::Image { .. } | Event::LocalImage { .. } | Event::Ready { .. } | Event::BlockReady(_) | Event::LmiZipReady(_) | Event::Script | Event::System { .. } | Event::Done(_) | Event::Finished(_)) {
             self.wake(now);
         }
         let install = &mut self.state.install;
@@ -253,6 +268,7 @@ impl App {
                 self.state.block_ota_targets = Some(report);
                 *install = Install::ConfirmingScript;
             }
+            Event::LmiZipReady(report) => *install = Install::ConfirmingLmiZip { report, allowed: false },
             Event::System { name, version, sizes } => *install = Install::SystemChoosing(SystemChoice { name, version, sizes, size: 0 }),
             Event::Running => {
                 *install = Install::Scripting { stage: None, running: true };
@@ -529,7 +545,9 @@ mod tests {
         }
         assert_eq!(app.state.script_output.len(), SCRIPT_LINES);
         assert_eq!(app.state.script_output[0], "line 2");
-        assert_eq!(app.frame(&f, &i).rows.as_ref().map(Rows::count), Some(SCRIPT_LINES));
+        assert_eq!(app.frame(&f, &i).rows.as_ref().map(Rows::count), Some(8), "the running page shows the latest lines without a long scroll");
+        app.install(Event::Finished(Outcome::Ran { wipe_cache: false }), 0);
+        assert_eq!(app.frame(&f, &i).rows.as_ref().map(Rows::count), Some(SCRIPT_LINES), "the result keeps the full on-screen history");
     }
 
     #[test]
@@ -715,12 +733,113 @@ mod tests {
     }
 
     #[test]
+    fn lmi_usb_unplug_discards_pending_zip_and_approval() {
+        use skyward_install::lmi_zip::{Kind, Report, ZipSignature};
+
+        let (f, i) = (fonts(), DeviceInfo { slot: None, ..info() });
+        let picker = Screen::Choose(Place::UsbDrive);
+        let mut app = App::new(picker, W, H, PPD);
+        app.state.lmi_zip_install = true;
+        app.state.block_ota_install = true;
+        app.set_usb_drive(Some(UsbDrive::Shown), 0);
+        let path = "ROMs/addon.zip";
+        let report = Report { kind: Kind::Script, sha256: [1; 32], signature: ZipSignature::Unsigned };
+        app.install_file(Place::UsbDrive, path.into(), 1024, 0);
+        app.install(Event::LmiZipReady(report.clone()), 0);
+        assert!(tap_at(&mut app, &f, &i, Action::AllowUnverifiedZip, 1000).is_empty());
+        let track = app.frame(&f, &i).hits.iter().find(|hit| hit.action == Action::Confirm(Confirm::RunScript)).unwrap().rect;
+        let y = track.centre().1 - app.top().1;
+        app.touch(Touch::Down(track.x + track.h / 2.0, y), &f, 1500);
+        app.touch(Touch::Move(track.x + track.w, y), &f, 1510);
+
+        assert_eq!(app.set_usb_drive(None, 1515), vec![Effect::Cancel]);
+        assert_eq!(app.screen(), picker);
+        assert!(app.touch(Touch::Up, &f, 1520).is_empty());
+        app.install(Event::LmiZipReady(report.clone()), 1530);
+        assert_eq!(app.state.install, Install::Ending);
+        app.install(Event::Finished(Outcome::Cancelled), 1540);
+
+        app.set_usb_drive(Some(UsbDrive::Shown), 1900);
+        app.install_file(Place::UsbDrive, path.into(), 1024, 2000);
+        app.install(Event::LmiZipReady(Report { sha256: [2; 32], ..report }), 2010);
+        assert!(app.frame(&f, &i).hits.iter().any(|hit| hit.action == Action::AllowUnverifiedZip));
+        assert!(app.confirmed(Confirm::RunScript, 2020).is_empty());
+    }
+
+    #[test]
+    fn lmi_usb_unplug_cancels_inspection_and_leaves_an_active_script_alone() {
+        use skyward_install::lmi_zip::{Kind, Report, ZipSignature};
+
+        let picker = Screen::Choose(Place::UsbDrive);
+        let mut app = App::new(picker, W, H, PPD);
+        app.state.lmi_zip_install = true;
+        app.state.block_ota_install = true;
+        app.set_usb_drive(Some(UsbDrive::Shown), 0);
+        app.install_opened("/mnt/usb/update.zip".into(), 1024, 10);
+        assert_eq!(app.set_usb_drive(None, 20), vec![Effect::Cancel]);
+        assert_eq!(app.screen(), picker);
+        app.install(Event::Finished(Outcome::Cancelled), 30);
+
+        app.set_usb_drive(Some(UsbDrive::Shown), 100);
+        app.install_file(Place::UsbDrive, "update.zip".into(), 1024, 110);
+        app.install(Event::LmiZipReady(Report {
+            kind: Kind::Script,
+            sha256: [1; 32],
+            signature: ZipSignature::Trusted,
+        }), 120);
+        assert_eq!(app.confirmed(Confirm::RunScript, 130), vec![Effect::Install]);
+        app.install(Event::Running, 140);
+        assert!(app.set_usb_drive(None, 150).is_empty());
+        assert_eq!(app.state.install, Install::Scripting { stage: None, running: true });
+    }
+
+    #[test]
+    fn unverified_zip_requires_approval_and_a_full_swipe_for_each_file() {
+        use skyward_install::lmi_zip::{Kind, Report, ZipSignature};
+        let (f, i) = (fonts(), DeviceInfo { slot: None, ..info() });
+        let mut app = App::new(Screen::Install, W, H, PPD);
+        app.state.lmi_zip_install = true;
+        app.state.block_ota_install = true;
+        let start = |app: &mut App, signature, byte, now| {
+            assert_eq!(tap_at(app, &f, &i, Action::Sideload, now), vec![Effect::Sideload]);
+            app.install(Event::Checking { size: 1024 }, now);
+            app.install(Event::LmiZipReady(Report { kind: Kind::Script, sha256: [byte; 32], signature }), now);
+        };
+        let swipe = |app: &mut App, fraction, now| {
+            let track = app.frame(&f, &i).hits.iter().find(|h| h.action == Action::Confirm(Confirm::RunScript)).unwrap().rect;
+            let y = track.centre().1 - app.top().1;
+            let x = track.x + track.h / 2.0;
+            app.touch(Touch::Down(x, y), &f, now);
+            app.touch(Touch::Move(x + (track.x + track.w - x) * fraction, y), &f, now);
+            app.touch(Touch::Up, &f, now)
+        };
+        start(&mut app, ZipSignature::Unsigned, 1, 0);
+        assert!(app.frame(&f, &i).hits.iter().all(|h| h.action != Action::Confirm(Confirm::RunScript)));
+        assert!(app.confirmed(Confirm::RunScript, 1000).is_empty());
+        assert!(tap_at(&mut app, &f, &i, Action::AllowUnverifiedZip, 1000).is_empty());
+        assert!(swipe(&mut app, 0.5, 1500).is_empty());
+        assert_eq!(app.key(Key::Back, 2000), vec![Effect::Cancel]);
+        app.install(Event::Finished(Outcome::Cancelled), 2000);
+
+        start(&mut app, ZipSignature::PublicTest, 2, 3000);
+        assert!(app.frame(&f, &i).hits.iter().all(|h| h.action != Action::Confirm(Confirm::RunScript)));
+        assert!(tap_at(&mut app, &f, &i, Action::AllowUnverifiedZip, 4000).is_empty());
+        assert_eq!(swipe(&mut app, 1.0, 5000), vec![Effect::InstallUnverifiedZip]);
+        app.install(Event::Finished(Outcome::Ran { wipe_cache: false }), 6000);
+        app.key(Key::Back, 7000);
+
+        start(&mut app, ZipSignature::Trusted, 3, 8000);
+        assert!(app.frame(&f, &i).hits.iter().all(|h| h.action != Action::AllowUnverifiedZip));
+        assert_eq!(swipe(&mut app, 1.0, 9000), vec![Effect::Install]);
+    }
+
+    #[test]
     fn a_local_image_uses_its_single_target_without_slot_controls() {
         let (f, i) = (fonts(), DeviceInfo { slot: None, ..info() });
         let mut app = App::new(Screen::Home, W, H, PPD);
         app.open(Screen::Installing);
         app.state.block_ota_install = true;
-        assert!(!app.state.data_backup_only, "local image confirmation does not depend on backups");
+        assert!(!app.state.lmi_backup, "local image confirmation does not depend on backups");
         app.state.source = Source::Opened { drive: false };
         let kind = ImageKind::Boot { kernel: true, ramdisk: skyward_install::Ramdisk::Generic };
         app.install(Event::LocalImage { kind, size: 1 << 20, partition: "boot", sha256: "ab".repeat(32) }, 0);

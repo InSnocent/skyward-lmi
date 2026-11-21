@@ -11,6 +11,7 @@ use crate::ffs::{Endpoints, Shared, Usb};
 use crate::fuse::{self, Fault, LocalFile, Mount};
 use crate::image::{self, ImageKind};
 use crate::keep::Kept;
+use crate::lmi_zip;
 use crate::ota::{self, Log, Status};
 use crate::package::{self, Build, Package, Phone, Update};
 use crate::script::{self, Bar, Request};
@@ -106,6 +107,23 @@ impl Installer {
         Installer::spawn(Origin::BlockFileInstall(digest), detach, Options::default(), move |ctx| run_file(ctx, &path))
     }
 
+    /// Receive an lmi ZIP, either for read-only preflight or for confirmation.
+    pub fn start_lmi_zip(preflight: bool, detach: Detach) -> Result<Installer> {
+        check_lmi_zip_target()?;
+        Installer::spawn(Origin::LmiZip { local: false, preflight }, detach, Options::default(), run)
+    }
+
+    /// Read an lmi ZIP through the descriptor opened by the file picker.
+    pub fn open_lmi_zip(file: File, detach: Detach) -> Result<Installer> {
+        check_lmi_zip_target()?;
+        Installer::spawn(Origin::LmiZip { local: true, preflight: false }, detach, Options::default(), move |ctx| {
+            match LocalFile::from_file(file) {
+                Ok((source, offer)) => serve_local(ctx, source, offer, Path::new("local ZIP")),
+                Err(e) => Outcome::Failed(Failure::Unreadable(format!("{e:#}"))),
+            }
+        })
+    }
+
     /// Prepare an IMG for lmi's independent boot or recovery partition.
     /// No sideload, OTA script or dynamic-partition detach is involved.
     pub fn open_lmi_image(file: File) -> Result<Installer> {
@@ -180,6 +198,11 @@ impl Installer {
         let _ = self.commands.send(Command::Install);
     }
 
+    /// Confirm only the lmi ZIP whose signature could not be verified.
+    pub fn install_unverified_zip(&self) {
+        let _ = self.commands.send(Command::InstallUnverifiedZip);
+    }
+
     /// Install the system the installer holds with a root of `size` bytes.
     pub fn install_system(&self, size: u64) {
         let _ = self.commands.send(Command::InstallSystem { size });
@@ -218,6 +241,7 @@ enum Origin {
     BlockPreflight(Option<[u8; 32]>),
     BlockInstall([u8; 32]),
     BlockFileInstall([u8; 32]),
+    LmiZip { local: bool, preflight: bool },
     LocalImage,
     /// A file on the phone.
     File,
@@ -511,7 +535,9 @@ fn conclude(done: Done, served: Result<Option<Fault>>, origin: Origin) -> Outcom
         }
         // A script that ended well read what it needed, whatever it tried
         // to read past.
-        (Done::Script { code: 0, wipe_cache }, served) => {
+        (Done::Script { code: 0, wipe_cache }, served)
+            if !matches!(origin, Origin::LmiZip { .. }) || matches!(served, Ok(None)) =>
+        {
             if !matches!(served, Ok(None)) {
                 let _ = kmsg(&format!("install: the package stopped being readable while the script ran: {served:?}"));
             }
@@ -519,8 +545,10 @@ fn conclude(done: Done, served: Result<Option<Fault>>, origin: Origin) -> Outcom
         }
         (_, Err(e)) => failed(e.context("serve the package")),
         (_, Ok(Some(Fault::Transfer(why)))) => Outcome::Failed(match origin {
-            Origin::Computer | Origin::SideloadTest | Origin::BlockPreflight(_) | Origin::BlockInstall(_) => Failure::Disconnected,
-            Origin::File | Origin::LocalImage | Origin::BlockFileInstall(_) | Origin::Asked { .. } => Failure::Unreadable(why),
+            Origin::Computer | Origin::SideloadTest | Origin::BlockPreflight(_) | Origin::BlockInstall(_)
+            | Origin::LmiZip { local: false, .. } => Failure::Disconnected,
+            Origin::File | Origin::LocalImage | Origin::BlockFileInstall(_) | Origin::Asked { .. }
+            | Origin::LmiZip { local: true, .. } => Failure::Unreadable(why),
         }),
         (_, Ok(Some(Fault::Changed(_)))) => Outcome::Failed(Failure::Changed),
         (Done::Engine(code), Ok(None)) => Outcome::Failed(Failure::Engine(code)),
@@ -535,6 +563,9 @@ fn install<S>(ctx: &mut Context, mount: &Mount<S>, size: u64) -> Result<Done> {
     }
     if let Origin::BlockPreflight(digest) = ctx.origin {
         return run_block_preflight(ctx, size, digest);
+    }
+    if let Origin::LmiZip { preflight, .. } = ctx.origin {
+        return run_lmi_zip(ctx, size, preflight);
     }
     if ctx.origin == Origin::SideloadTest {
         return run_sideload_test(ctx, size);
@@ -621,7 +652,7 @@ fn install_system(ctx: &Context, contents: &skyward_systems::package::Contents) 
 /// to itself, as with Android's own recovery.
 fn waits(origin: Origin, wipe: bool) -> bool {
     match origin {
-        Origin::File | Origin::LocalImage | Origin::BlockFileInstall(_) => true,
+        Origin::File | Origin::LocalImage | Origin::BlockFileInstall(_) | Origin::LmiZip { .. } => true,
         Origin::Computer | Origin::SideloadTest | Origin::BlockPreflight(_) | Origin::BlockInstall(_) => wipe,
         Origin::Asked { .. } => false,
     }
@@ -1025,6 +1056,74 @@ fn run_block_install(ctx: &mut Context, size: u64, digest: [u8; 32]) -> Result<D
     Ok(Done::Script { code, wipe_cache: false })
 }
 
+fn check_lmi_zip_target() -> Result<()> {
+    ensure!(prop("ro.product.device").as_deref() == Some("lmi") && skyward_vab::current_slot()?.is_none(),
+        "this ZIP installer requires the single-slot lmi device");
+    Ok(())
+}
+
+/// Use the same checked package filesystem for hashing, inspecting and
+/// running a ZIP. Preflight always ends before the confirmation or detach.
+fn run_lmi_zip(ctx: &mut Context, size: u64, preflight: bool) -> Result<Done> {
+    use skyward_config::ramdisk::LMI_OTA_CERTS;
+    let stopped = || Ok(Done::Decided(Outcome::Cancelled));
+    let refused = |reason| Ok(Done::Decided(Outcome::Refused(reason)));
+    let mut keys = read_keys(Path::new(signature::CERTIFICATES))?;
+    let extra = Path::new("/").join(LMI_OTA_CERTS);
+    if extra.try_exists()? {
+        keys.extend(read_keys(&extra)?);
+    }
+    let source = File::open(fuse::PACKAGE).context("open the ZIP for verification")?;
+    let mut told: Option<Instant> = None;
+    let checked = signature::verify_and_hash(source, size, &keys, |done, total| {
+        if done == total || told.is_none_or(|t| t.elapsed() >= PROGRESS_EVERY) {
+            ctx.send(Event::Progress(Stage::Signature { done, total }));
+            told = Some(Instant::now());
+        }
+        !ctx.shared.cancelled()
+    })?;
+    let Some((signature, sha256)) = checked else { return stopped() };
+    if ctx.shared.cancelled() { return stopped(); }
+    if preflight && !signature.matches_included_key() {
+        return refused(Refusal::LmiPreflightSignature { unsigned: signature == lmi_zip::ZipSignature::Unsigned });
+    }
+    let source = BufReader::new(File::open(fuse::PACKAGE).context("open the checked ZIP")?);
+    let kind = lmi_zip::inspect(source, "lmi")?;
+    let is_script = matches!(kind, lmi_zip::Kind::Script);
+    let report = lmi_zip::Report { kind, sha256, signature };
+    if ctx.shared.cancelled() { return stopped(); }
+    if preflight {
+        return Ok(Done::Decided(Outcome::LmiZipPreflight(report)));
+    }
+    if let Some(reason) = battery()? { return refused(reason); }
+    ctx.send(Event::LmiZipReady(report.clone()));
+    match ctx.commands.recv() {
+        Ok(Command::Cancel) | Err(_) => return stopped(),
+        Ok(command) => ensure!(report.accepts(&command), "the confirmation does not match this ZIP's signature status"),
+    }
+    if ctx.shared.cancelled() { return stopped(); }
+    check_lmi_zip_target()?;
+    if let Some(reason) = battery()? { return refused(reason); }
+    extract_script()?;
+    shell_at_sbin()?;
+    detach_once(ctx)?;
+    let mounts = skyward_block::mount::mount_ids()?;
+    // A complete OTA manages super itself. A script ZIP can use the
+    // regular mapper names to find the installed system's partitions.
+    let maps = if is_script { Some(skyward_vab::map_unslotted()?) } else { None };
+    let ran = run_binary(ctx);
+    let unmounted = unmount_script_mounts(&mounts);
+    let unmapped = maps.as_ref().map_or(Ok(()), skyward_vab::unmap_slot);
+    if let Err(error) = &unmounted { let _ = kmsg(&format!("install: clean up ZIP mounts: {error:#}")); }
+    if let Err(error) = &unmapped { let _ = kmsg(&format!("install: release ZIP mappings: {error:#}")); }
+    let (code, wipe_cache) = ran?;
+    if code == 0 {
+        unmounted.context("unmount the ZIP's filesystems")?;
+        unmapped.context("release the ZIP's logical partitions")?;
+    }
+    Ok(Done::Script { code, wipe_cache })
+}
+
 fn run_block_preflight(ctx: &Context, size: u64, digest: Option<[u8; 32]>) -> Result<Done> {
     let outcome = match verify_signature_at(ctx, size, signature::CERTIFICATES, digest)? {
         Verdict::Signed if !ctx.shared.cancelled() => {
@@ -1083,9 +1182,13 @@ fn verify_signature_with(ctx: &Context, size: u64, path: &str) -> Result<Verdict
     verify_signature_at(ctx, size, path, None)
 }
 
+fn read_keys(path: &Path) -> Result<Vec<signature::Key>> {
+    let certificates = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    signature::keys(BufReader::new(certificates)).with_context(|| format!("read {}", path.display()))
+}
+
 fn verify_signature_at(ctx: &Context, size: u64, path: &str, digest: Option<[u8; 32]>) -> Result<Verdict> {
-    let certificates = File::open(path).with_context(|| format!("open {path}"))?;
-    let keys = signature::keys(BufReader::new(certificates)).with_context(|| format!("read {path}"))?;
+    let keys = read_keys(Path::new(path))?;
     let package = File::open(fuse::PACKAGE).context("open the package")?;
     let mut told: Option<Instant> = None;
     let read = |done, total| {
@@ -1152,6 +1255,16 @@ impl Drop for Group {
         // A group that has ended already is no one's to end.
         unsafe { libc::kill(-self.0, libc::SIGKILL) };
     }
+}
+
+/// Keep the original line on disk and a short printable copy in the UI.
+fn script_log_line(ctx: &Context, log: &mut File, line: &str) -> Result<()> {
+    writeln!(log, "{line}").context("write the log")?;
+    let shown: String = line.chars().filter(|ch| !ch.is_control()).take(240).collect();
+    if !shown.trim().is_empty() {
+        ctx.send(Event::Print(shown));
+    }
+    Ok(())
 }
 
 /// Run the install script: show what it prints and how far it says it is,
@@ -1238,11 +1351,11 @@ fn run_binary(ctx: &Context) -> Result<(i32, bool)> {
                 writeln!(log, "[asked for the cache partition to be erased after]").context("write the log")?;
                 wipe_cache = true;
             }
-            Ok(Said::Request(Request::Log(text))) => writeln!(log, "{text}").context("write the log")?,
+            Ok(Said::Request(Request::Log(text))) => script_log_line(ctx, &mut log, &text)?,
             Ok(Said::Request(Request::Other(what))) => writeln!(log, "[asked for {what}]").context("write the log")?,
             Ok(Said::Request(moving)) => bar.hear(&moving, started.elapsed()),
             Ok(Said::Unknown(line)) => writeln!(log, "[unknown request] {line}").context("write the log")?,
-            Ok(Said::Output(line)) => writeln!(log, "{line}").context("write the log")?,
+            Ok(Said::Output(line)) => script_log_line(ctx, &mut log, &line)?,
             Err(RecvTimeoutError::Timeout) => {}
             // Every output has closed: the script, and all it ran, are done.
             Err(RecvTimeoutError::Disconnected) => break,

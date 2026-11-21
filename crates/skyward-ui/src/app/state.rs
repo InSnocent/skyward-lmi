@@ -36,6 +36,12 @@ pub struct State {
     pub reboot: usize,
     /// What the wipe page has chosen, by place in [`WIPES`].
     pub wipe: [bool; WIPES.len()],
+    /// This runtime can wipe app and system cache contents.
+    pub lmi_wipe: bool,
+    /// The image enables the lmi Data wipe that retains shared storage.
+    pub lmi_data_keep_media: bool,
+    pub lmi_wipe_locked_profiles: bool,
+    pub lmi_format_data: bool,
     /// The phone has a cache partition, which the wipe page then offers.
     pub cache_partition: bool,
     /// How many folders of its own the phone keeps logs in on the data
@@ -70,12 +76,13 @@ pub struct State {
     pub sideload_test: bool,
     pub block_ota_preflight: bool,
     pub block_ota_install: bool,
+    pub lmi_zip_install: bool,
     pub sideload_preflight: bool,
     pub block_ota_targets: Option<skyward_install::block_preflight::BlockPreflight>,
     pub mount_failure: Option<MountFailure>,
     /// Which of [`BACKUP_PARTS`] a backup takes.
-    pub backup: [bool; 4],
-    pub data_backup_only: bool,
+    pub backup: [bool; 5],
+    pub lmi_backup: bool,
     /// Where a backup goes.
     pub backup_to: Place,
     pub compress: bool,
@@ -84,7 +91,7 @@ pub struct State {
     pub backups: Vec<BackupEntry>,
     /// The backup the restore page shows, as it was found, and which of its
     /// parts to restore.
-    pub restore: Option<(BackupEntry, [bool; 4])>,
+    pub restore: Option<(BackupEntry, [bool; 5])>,
     /// Backing up or restoring under way, or how it last ended.
     pub backup_job: Option<BackupJob>,
     /// Which logs to export: the recovery's, the kernel's.
@@ -223,6 +230,10 @@ impl Default for State {
             file_transfer: true,
             reboot: 0,
             wipe: [false; WIPES.len()],
+            lmi_wipe: false,
+            lmi_data_keep_media: false,
+            lmi_wipe_locked_profiles: false,
+            lmi_format_data: false,
             cache_partition: false,
             phone_logs: 0,
             pattern: Vec::new(),
@@ -240,11 +251,12 @@ impl Default for State {
             sideload_test: false,
             block_ota_preflight: false,
             block_ota_install: false,
+            lmi_zip_install: false,
             sideload_preflight: false,
             block_ota_targets: None,
             mount_failure: None,
-            backup: [true, true, false, true],
-            data_backup_only: false,
+            backup: [true, true, false, true, false],
+            lmi_backup: false,
             backup_to: Place::Storage,
             compress: false,
             verify: true,
@@ -388,7 +400,9 @@ impl State {
     }
 
     pub(crate) fn local_zip_name(&self) -> Option<&str> {
-        if !self.block_ota_install || !matches!(self.source, Source::File(Place::Storage) | Source::Opened { drive: false }) {
+        let local = matches!(self.source, Source::File(Place::Storage) | Source::Opened { drive: false })
+            || (self.lmi_zip_install && self.source.uses_usb_drive());
+        if !self.block_ota_install || !local {
             return None;
         }
         self.package_name.as_deref().filter(|name| std::path::Path::new(name).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("zip")))

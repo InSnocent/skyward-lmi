@@ -155,6 +155,12 @@ struct PreviewAssets {
     /// Allow installation of this exact signed A-only OTA by SHA-256.
     #[arg(long, requires = "read_only", conflicts_with = "sideload_test_certs")]
     block_ota_install: Option<String>,
+    /// Enable full lmi ROM and install-script ZIPs with per-package confirmation.
+    #[arg(long, requires = "data_readonly", conflicts_with_all = ["block_ota_install", "sideload_test_certs", "lmi_data_sample", "lmi_app_restore_test"])]
+    lmi_zip_install: bool,
+    /// Additional public OTA certificates for lmi ZIPs, as a ZIP of .x509.pem files.
+    #[arg(long, requires = "lmi_zip_install")]
+    lmi_ota_certs: Option<PathBuf>,
     /// Enable A-only data decryption with the matching ROM libraries.
     #[arg(long, requires = "read_only", conflicts_with = "sideload_test_certs")]
     data_readonly: bool,
@@ -170,6 +176,9 @@ struct PreviewAssets {
     /// Enable the lmi Data backup and restore pages with the matching ROM libraries.
     #[arg(long, requires = "data_readonly", conflicts_with_all = ["lmi_data_sample", "lmi_app_restore_test"])]
     lmi_data_backup: bool,
+    /// Enable Data (keep internal storage) on the opt-in lmi recovery image.
+    #[arg(long, requires = "lmi_data_backup")]
+    lmi_data_keep_media: bool,
     /// Directory with the AW8697 RAM and RTP firmware extracted from the ROM.
     #[arg(long)]
     aw8697_firmware: Option<PathBuf>,
@@ -319,6 +328,17 @@ fn build_probe(base: &Path, binary: &Path, out: &Path, assets: Option<&PreviewAs
             ensure!(ramdisk.find("system/etc/security/otacerts.zip").is_some(), "the base recovery has no OTA certificates");
             ramdisk.add(paths::BLOCK_OTA_DIGEST, 0o644, parse_sha256(sha256)?.to_vec())?;
         }
+        if assets.lmi_zip_install {
+            ensure!(cfg.device.codename == "lmi", "the single-slot ZIP installer is configured for lmi");
+            ensure!(ramdisk.find("system/etc/security/otacerts.zip").is_some(), "the base recovery has no OTA certificates");
+            ramdisk.add(paths::LMI_ZIP_INSTALL, 0o644, Vec::new())?;
+            if let Some(certs) = &assets.lmi_ota_certs {
+                let data = std::fs::read(certs).with_context(|| format!("read {}", certs.display()))?;
+                skyward_install::signature::keys(std::io::Cursor::new(&data))
+                    .with_context(|| format!("read public OTA keys from {}", certs.display()))?;
+                ramdisk.add(paths::LMI_OTA_CERTS, 0o644, data)?;
+            }
+        }
         if assets.data_readonly {
             ensure!(cfg.device.codename == "lmi", "the legacy decryption test is configured for lmi");
             let apex = assets.lmi_apex_files.as_deref().context("the lmi decryption test requires --lmi-apex-files")?;
@@ -335,6 +355,9 @@ fn build_probe(base: &Path, binary: &Path, out: &Path, assets: Option<&PreviewAs
             }
             if assets.lmi_data_backup {
                 ramdisk.add(paths::LMI_DATA_BACKUP, 0o644, Vec::new())?;
+                if assets.lmi_data_keep_media {
+                    ramdisk.add(paths::LMI_DATA_KEEP_MEDIA, 0o644, Vec::new())?;
+                }
             }
             if let Some(sample) = &assets.lmi_data_sample {
                 let expected = std::fs::read(sample)?;

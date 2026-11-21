@@ -470,6 +470,9 @@ fn backups_at(place: Place) -> Result<Vec<BackupEntry>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e).with_context(|| format!("read {}", folder.display())),
     };
+    if place == Place::UsbDrive {
+        ensure!(folder.canonicalize()? == folder, "the USB backup directory contains a symbolic link");
+    }
     let mut found = Vec::new();
     for entry in entries {
         let entry = entry.with_context(|| format!("read {}", folder.display()))?;
@@ -478,7 +481,12 @@ fn backups_at(place: Place) -> Result<Vec<BackupEntry>> {
         if !entry.file_type().with_context(|| format!("look at {}", entry.path().display()))?.is_dir() {
             continue;
         }
-        let held = skyward_backup::Manifest::read(&entry.path()).map(|m| held(&m)).map_err(|e| format!("{e:#}"));
+        let manifest = if place == Place::UsbDrive {
+            skyward_backup::verify::read_manifest_at(&entry.path())
+        } else {
+            skyward_backup::Manifest::read(&entry.path())
+        };
+        let held = manifest.map(|m| held(&m)).map_err(|e| format!("{e:#}"));
         found.push(BackupEntry { place, name: name.to_owned(), held });
     }
     Ok(found)
@@ -534,7 +542,10 @@ pub(crate) fn backup_end(end: backup::End) -> BackupEnd {
             BackupEnd::Saved(folder.file_name().expect("a backup's folder has a name").to_string_lossy().into_owned())
         }
         backup::End::Verified => BackupEnd::Verified,
-        backup::End::Restored { unmade } => BackupEnd::Restored { unmade: unmade.iter().map(|p| p.display().to_string()).collect() },
+        backup::End::Restored { unmade, shared } => BackupEnd::Restored {
+            unmade: unmade.iter().map(|p| p.display().to_string()).collect(),
+            shared: shared.map(|path| path.display().to_string()),
+        },
         backup::End::Stopped => BackupEnd::Stopped,
         backup::End::Refused(refusal) => BackupEnd::Refused(match refusal {
             backup::Refusal::Room { needed, free } => BackupRefusal::Room { needed, free },
@@ -559,50 +570,77 @@ fn unix_ms_now() -> Result<i64> {
 
 /// The USB drive plugged in, and whether it is shown at [`USB_DRIVE`] or
 /// why it could not be.
-struct Plugged {
+pub(crate) struct Plugged {
     drive: Drive,
-    shown: Result<(), String>,
+    shown: Result<i32, String>,
 }
+
+impl Plugged {
+    pub(crate) fn readable_drive(&self) -> Option<(Drive, i32)> {
+        self.shown.as_ref().ok().map(|&id| (self.drive.clone(), id))
+    }
+}
+
+pub(crate) type DriveMount = fn(&Drive, &Path) -> Result<(String, &'static str)>;
 
 /// Look for the USB drive plugged in: one gone is taken away from where it
 /// was shown, even with files on it still open, and one found in two looks
 /// running is shown, the kernel having listed its partitions by then.
 /// `seen` is a drive found by the look before that is not shown yet. What
 /// the pages are told comes back when it changed.
-fn look_for_drive(plugged: &mut Option<Plugged>, seen: &mut Option<String>) -> Result<Option<Option<UsbDrive>>> {
-    let found = usb::drives()?.into_iter().find(Drive::ready);
+pub(crate) fn look_for_drive(
+    plugged: &mut Option<Plugged>, seen: &mut Option<Drive>, mount: Option<DriveMount>,
+) -> Result<Option<Option<UsbDrive>>> {
+    let drives = usb::drives()?;
+    let point = Path::new(USB_DRIVE);
+    let current = crate::usb_mount::mount_at(point)?;
     if let Some(p) = plugged {
-        if found.is_some_and(|d| d.disk == p.drive.disk) {
+        let present = drives.contains(&p.drive);
+        let shown = current.is_some() && p.shown.as_ref().ok().copied() == current;
+        if present && (p.shown.is_err() || shown) {
             return Ok(None);
         }
-        if p.shown.is_ok() {
-            skyward_block::mount::umount_detach(Path::new(USB_DRIVE))?;
+        if shown {
+            // The backup worker may also detach after a failed read-only remount.
+            if let Err(error) = skyward_block::mount::umount_detach(Path::new(USB_DRIVE))
+                && skyward_block::mount::is_mount_point(Path::new(USB_DRIVE))?
+            {
+                return Err(error);
+            }
         }
-        skyward_sys::kmsg(&format!("USB drive {} is gone", p.drive.disk))?;
+        skyward_sys::kmsg(&format!("USB drive {} is no longer shown", p.drive.disk))?;
         *plugged = None;
         *seen = None;
         return Ok(Some(None));
     }
-    let Some(drive) = found else {
+    let Some(mount) = mount else {
+        // Keep watching for removal, but leave new media alone during a job.
         *seen = None;
         return Ok(None);
     };
-    if seen.as_deref() != Some(drive.disk.as_str()) {
-        *seen = Some(drive.disk.clone());
+    let Some(drive) = drives.into_iter().find(Drive::ready) else {
+        *seen = None;
+        return Ok(None);
+    };
+    if seen.as_ref() != Some(&drive) {
+        *seen = Some(drive);
         return Ok(None);
     }
-    let shown = match usb::mount(&drive, Path::new(USB_DRIVE)) {
-        Ok((part, filesystem)) => {
-            skyward_sys::kmsg(&format!("USB drive {part} shown at {USB_DRIVE} as {filesystem}"))?;
-            Ok(())
-        }
-        Err(e) => {
-            skyward_sys::kmsg(&format!("USB drive {} not shown: {e:#}", drive.disk))?;
-            Err(format!("{e:#}"))
-        }
+    let shown = match current {
+        Some(_) => Err("another filesystem is already mounted at the USB location".into()),
+        None => match mount(&drive, point) {
+            Ok((part, filesystem)) => {
+                skyward_sys::kmsg(&format!("USB drive {part} shown at {USB_DRIVE} as {filesystem}"))?;
+                crate::usb_mount::mount_at(point)?.ok_or_else(|| "the mounted USB drive disappeared".to_string())
+            }
+            Err(e) => {
+                skyward_sys::kmsg(&format!("USB drive {} not shown: {e:#}", drive.disk))?;
+                Err(format!("{e:#}"))
+            }
+        },
     };
     let told = match &shown {
-        Ok(()) => UsbDrive::Shown,
+        Ok(_) => UsbDrive::Shown,
         Err(why) => UsbDrive::Unreadable(why.clone()),
     };
     *plugged = Some(Plugged { drive, shown });
@@ -639,9 +677,10 @@ pub(crate) fn ownership(into: &Path) -> Result<Ownership> {
 }
 
 /// The page's name for a part erasing goes through.
-fn part(step: Step) -> Part {
+pub(crate) fn part(step: Step) -> Part {
     match step {
         Step::Data => Part::Data,
+        Step::DataKeepMedia => Part::DataKeepMedia,
         Step::Cache => Part::Cache,
         Step::Metadata => Part::Metadata,
         Step::AppData => Part::AppData,
@@ -658,6 +697,7 @@ fn part(step: Step) -> Part {
 /// erases.
 fn step(choice: Wipe) -> Step {
     match choice {
+        Wipe::DataKeepMedia => Step::DataKeepMedia,
         Wipe::AppData => Step::AppData,
         Wipe::Media => Step::Media,
         Wipe::AppCaches => Step::AppCaches,
@@ -671,12 +711,14 @@ fn step(choice: Wipe) -> Step {
 }
 
 /// How erasing stopped, as its page tells it.
-fn erase_stop(stop: wipe::Stop) -> EraseStop {
+pub(crate) fn erase_stop(stop: wipe::Stop) -> EraseStop {
     match stop {
         wipe::Stop::Refused(wipe::Refusal::Update(hold)) => EraseStop::Update(hold),
         wipe::Stop::Refused(wipe::Refusal::NotRebuilt) => EraseStop::NotRebuilt,
         wipe::Stop::Refused(wipe::Refusal::NoCache) => EraseStop::NoCache,
         wipe::Stop::Closed(why) => EraseStop::Closed(why),
+        wipe::Stop::Preflight(why) => EraseStop::Preflight(why),
+        wipe::Stop::KeyCleanup(why) => EraseStop::KeyCleanup(why),
         wipe::Stop::Locked(users) => EraseStop::Locked(users),
         wipe::Stop::Failed(step, e) => EraseStop::Failed(part(step), format!("{e:#}")),
     }
@@ -898,6 +940,9 @@ pub(crate) fn show_closed(app: &mut App, closed: &[Closed]) -> Result<()> {
         if let Some(why) = &c.why {
             skyward_sys::kmsg(&format!("the files of user {} stay closed: {why}", c.user))?;
         }
+    }
+    if app.state.lmi_wipe {
+        app.state.lmi_wipe_locked_profiles = !closed.is_empty();
     }
     let waiting = closed.iter().find(|c| !c.made_up).map(|c| {
         let keys = match c.lock {
@@ -1247,7 +1292,7 @@ struct Pages<'a> {
     shell: Option<pty::Shell>,
     /// The USB drive plugged in, looked for each second.
     plugged: Option<Plugged>,
-    seen: Option<String>,
+    seen: Option<Drive>,
     drive_at: Instant,
 }
 
@@ -1609,7 +1654,7 @@ impl<'a> Pages<'a> {
         }
         let mut drive_told = None;
         if self.drive_at.elapsed().as_secs() >= 1 {
-            drive_told = look_for_drive(&mut self.plugged, &mut self.seen)?;
+            drive_told = look_for_drive(&mut self.plugged, &mut self.seen, Some(usb::mount))?;
             self.drive_at = Instant::now();
         }
         self.installer_told(now)?;
@@ -1968,6 +2013,7 @@ impl Pages<'_> {
                 wipe::Event::At(_) | wipe::Event::Progress(..) if self.rescue_erasing => {}
                 wipe::Event::At(step) => self.app.erase_at(part(step)),
                 wipe::Event::Progress(done, total) => self.app.erase_progress(done, total),
+                wipe::Event::NeedsReboot => unreachable!("the normal runtime cannot start the lmi data wipe"),
                 // Rescue stays on: its request stays in misc, and the
                 // computer hears how erasing went.
                 wipe::Event::Ended(outcome) if self.rescue_erasing => {
@@ -2115,6 +2161,7 @@ impl Pages<'_> {
         let mut backed = false;
         for ev in told {
             match ev {
+                backup::Event::Staging { done, of } => self.app.backup_staging(done, of),
                 backup::Event::Plan(plan) => self.app.backup_plan(plan),
                 backup::Event::At { item, done, of, checking } => self.app.backup_at(BackupAt { item, done, of, checking }),
                 backup::Event::Ended(end) => {
@@ -2471,7 +2518,7 @@ impl Pages<'_> {
         for came in incoming {
             let effects = match came {
                 Incoming::Arrived => self.app.arrive(),
-                Incoming::Drive(drive) => self.app.set_usb_drive(drive),
+                Incoming::Drive(drive) => self.app.set_usb_drive(drive, now),
                 Incoming::Asked(asked) => {
                     skyward_sys::kmsg(&format!("asked on the recovery socket: {asked:?}"))?;
                     answer(asked, self.fastboot)
@@ -2526,8 +2573,8 @@ impl Pages<'_> {
                 eprintln!("screenshot {saved:?} in {} ms", t0.elapsed().as_millis());
                 self.app.screenshot_saved(saved, now);
             }
-            Effect::SideloadPreflight => {
-                let why = skyward_install::Failure::Error("BLOCK OTA preflight is only available on lmi".into());
+            Effect::SideloadPreflight | Effect::InstallUnverifiedZip => {
+                let why = skyward_install::Failure::Error("this ZIP option is only available on lmi".into());
                 self.app.install(skyward_install::Event::Finished(skyward_install::Outcome::Failed(why)), now);
             }
             Effect::Sideload => {
@@ -2911,7 +2958,7 @@ impl Pages<'_> {
 
     /// Back the parts chosen up into `place`. An install still stopping may
     /// yet write; a backup waits for it.
-    fn back_up(&mut self, parts: [bool; 4], place: Place, compress: bool, verify: bool, now: u64) -> Result<()> {
+    fn back_up(&mut self, parts: [bool; 5], place: Place, compress: bool, verify: bool, now: u64) -> Result<()> {
         ensure!(self.backuper.is_none(), "a backup or restore is under way already");
         if self.installer.is_some() {
             self.app.report(self.app.state.lang.pick(INSTALL_UNFINISHED), now);
@@ -2936,6 +2983,7 @@ impl Pages<'_> {
             compress,
             verify,
             remount: (place == Place::UsbDrive).then(|| PathBuf::from(USB_DRIVE)),
+            usb: None,
             made,
             device: self.cfg.device.codename.clone(),
             system: self.info.os_version.clone(),
@@ -2949,7 +2997,7 @@ impl Pages<'_> {
 
     /// Restore the parts chosen of the backup `name` in `place`. An install
     /// still stopping may yet write; a restore waits for it.
-    fn restore(&mut self, place: Place, name: &str, parts: [bool; 4], now: u64) -> Result<()> {
+    fn restore(&mut self, place: Place, name: &str, parts: [bool; 5], now: u64) -> Result<()> {
         ensure!(self.backuper.is_none(), "a backup or restore is under way already");
         if self.installer.is_some() {
             self.app.report(self.app.state.lang.pick(INSTALL_UNFINISHED), now);
@@ -2958,6 +3006,7 @@ impl Pages<'_> {
         let task = backup::RestoreTask {
             data_scope: backup::DataScope::Partition,
             folder: backups_in(place).join(name),
+            usb: None,
             parts,
             device: self.cfg.device.codename.clone(),
             skipped: backup::data_skipped(&self.cfg.backup.data_skipped),

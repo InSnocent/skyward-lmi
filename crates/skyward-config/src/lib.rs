@@ -10,11 +10,17 @@ pub mod ramdisk {
     pub const CONFIG: &str = "skyward/device.toml";
     /// Binary SHA-256 of the ROM accepted by a temporary A-only installer.
     pub const BLOCK_OTA_DIGEST: &str = "skyward/block-ota-install.sha256";
+    /// Enable the single-slot lmi installer with per-package confirmation.
+    pub const LMI_ZIP_INSTALL: &str = "skyward/lmi-zip-install";
+    /// Optional additional build-time trust anchors for lmi ZIPs.
+    pub const LMI_OTA_CERTS: &str = "skyward/lmi-ota-certs.zip";
     /// Enable the A-only read-only data decryption test.
     pub const DATA_READONLY: &str = "skyward/data-readonly";
     pub const DATA_SAMPLE: &str = "skyward/data-sample";
     pub const LMI_APP_RESTORE_TEST: &str = "skyward/lmi-app-restore-test";
     pub const LMI_DATA_BACKUP: &str = "skyward/lmi-data-backup";
+    /// Offer the lmi Data wipe that preserves shared storage.
+    pub const LMI_DATA_KEEP_MEDIA: &str = "skyward/lmi-data-keep-media";
     /// The UI typeface.
     pub const FONT: &str = "skyward/MiSansVF.ttf";
     /// The terminal's monospaced typeface.

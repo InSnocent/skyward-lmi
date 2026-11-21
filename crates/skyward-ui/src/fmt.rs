@@ -486,6 +486,7 @@ pub fn data(l: Lang, d: &Data) -> &'static str {
 pub fn part(l: Lang, p: Part) -> &'static str {
     l.pick(match p {
         Part::Data => ["data 分区", "data 分割區", "data partition"],
+        Part::DataKeepMedia => ["Data（保留内部存储）", "Data（保留內部儲存空間）", "Data (keep internal storage)"],
         Part::Cache => ["cache 分区", "cache 分割區", "cache partition"],
         Part::Metadata => ["metadata 分区", "metadata 分割區", "metadata partition"],
         Part::AppData => ["应用数据", "應用程式資料", "App data"],
@@ -503,6 +504,7 @@ pub fn part(l: Lang, p: Part) -> &'static str {
 fn part_in_sentence(p: Part) -> &'static str {
     match p {
         Part::Data => "the data partition",
+        Part::DataKeepMedia => "data contents",
         Part::Cache => "the cache partition",
         Part::Metadata => "the metadata partition",
         Part::AppData => "app data",
@@ -609,6 +611,18 @@ pub fn erase_stop(l: Lang, s: &EraseStop) -> (String, Option<String>) {
         ),
         EraseStop::Closed(why) => (
             said(["无法打开 data 分区，未清除任何内容。", "無法開啟 data 分割區，未清除任何內容。", "Couldn't open the data partition, so nothing was wiped."]),
+            Some(why.clone()),
+        ),
+        EraseStop::Preflight(why) => (
+            said(["清除前检查未通过，未清除任何内容。", "清除前檢查未通過，未清除任何內容。", "The checks before wiping failed. All data was kept."]),
+            Some(why.clone()),
+        ),
+        EraseStop::KeyCleanup(why) => (
+            said([
+                "应用密钥清理中断，已停在删除文件之前。部分应用密钥可能已移除，请重启系统。",
+                "應用程式金鑰清理中斷，已停在刪除檔案之前。部分應用程式金鑰可能已移除，請重新啟動系統。",
+                "App key cleanup stopped before file deletion. Some app keys may have been removed. Reboot to Android.",
+            ]),
             Some(why.clone()),
         ),
         EraseStop::Locked(locked) => {
@@ -917,7 +931,7 @@ pub fn file_modified(l: Lang, file: &FileRow, zone: usize) -> String {
 }
 
 /// The parts a backup holds: `启动分区、系统分区`.
-pub fn parts(l: Lang, held: &[bool; 4]) -> String {
+pub fn parts(l: Lang, held: &[bool; 5]) -> String {
     list(l, BACKUP_PARTS.iter().zip(held).filter(|&(_, &on)| on).map(|(name, _)| l.pick(*name)))
 }
 
@@ -1103,6 +1117,11 @@ pub fn refusal(l: Lang, r: &Refusal, codename: &str, source: Source, zone: usize
                 "This zip isn't signed. Turn off “Verify zip signatures”, then try again.",
             ])
             .into(),
+        Refusal::LmiPreflightSignature { unsigned } => if *unsigned {
+            l.pick(["该 ZIP 未签名，无法通过只读预检。", "這個 ZIP 未簽署，無法通過唯讀預檢。", "This ZIP has no signature and cannot pass read-only preflight."])
+        } else {
+            l.pick(["该 ZIP 的签名未通过验证。请核对下载来源和文件完整性。", "這個 ZIP 的簽章未通過驗證。請核對下載來源和檔案完整性。", "The ZIP signature did not verify. Check the download source and file integrity."])
+        }.into(),
         Refusal::Unverified => l
             .pick([
                 "该刷机包未通过签名验证，请关闭「验证刷机包签名」后重试。",
@@ -1750,9 +1769,9 @@ mod tests {
 
     #[test]
     fn a_backup_lists_its_parts() {
-        assert_eq!(parts(HANS, &[true, true, false, true]), "启动分区、系统分区、基带与 EFS");
-        assert_eq!(parts(Lang::Hant, &[true, true, false, true]), "啟動分割區、系統分割區、基頻與 EFS");
-        assert_eq!(parts(Lang::En, &[true, true, true, true]), "Boot partitions, system partitions, data partition, modem and EFS");
+        assert_eq!(parts(HANS, &[true, true, false, true, false]), "启动分区、系统分区、基带与 EFS");
+        assert_eq!(parts(Lang::Hant, &[true, true, false, true, false]), "啟動分割區、系統分割區、基頻與 EFS");
+        assert_eq!(parts(Lang::En, &[true, true, true, true, false]), "Boot partitions, system partitions, data partition, modem and EFS");
     }
 
     #[test]

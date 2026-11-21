@@ -1,4 +1,5 @@
 use crate::backup::{self, BackupTask, DataScope, RestoreTask, Task};
+use crate::usb_mount::UsbMount;
 use crate::decrypt::{Decryptor, Ended, Job};
 use crate::haptics::Haptics;
 use crate::readings::{Reading, Readings};
@@ -6,12 +7,13 @@ use crate::{filework, pty};
 use skyward_crypto::data::Closed;
 use crate::input::{monotonic_ms, Event, Inputs};
 use crate::ui::Backlight;
-use crate::storage::{open_owner_image, OWNER_STORAGE};
+use crate::storage::{open_owner_file, OWNER_STORAGE};
 use crate::wallpaper;
+use crate::{data_wipe, wipe};
 use anyhow::{ensure, Context, Result};
 use skyward_config::{ramdisk, DeviceConfig};
 use skyward_install::{block_preflight, sideload_test, Event as InstallEvent, Installer};
-use skyward_ui::app::{BackupAt, Data, Effect, FileOp, FileTask, JobEnd, MountRow, Place, RenameRefused, Screen, Target};
+use skyward_ui::app::{BackupAt, Data, Effect, FileOp, FileTask, JobEnd, MountRow, Place, RenameRefused, Screen, Target, USB_DRIVE, Wipe};
 use skyward_ui::settings::{Kept, Keeper};
 use skyward_ui::surface::kms::KmsSurface;
 use skyward_ui::wallpaper::{Wallpaper, WallpaperCrop};
@@ -68,6 +70,13 @@ fn exercise(cfg: &DeviceConfig, inspect: bool) -> Result<()> {
     };
     // The A-only runtime starts MTP when the user enables it.
     app.state.file_transfer = false;
+    app.state.lmi_wipe = data_backup && cfg.device.codename == "lmi";
+    app.state.lmi_data_keep_media =
+        app.state.lmi_wipe && root.join(ramdisk::LMI_DATA_KEEP_MEDIA).is_file();
+    if app.state.lmi_wipe {
+        app.state.cache_partition = wipe::lmi_cache_plan().is_ok_and(|plan| plan.is_some());
+        app.state.lmi_format_data = wipe::lmi_format_plan().is_ok();
+    }
     if data_backup {
         app.use_lmi_backup();
         app.enable_wallpaper();
@@ -93,19 +102,23 @@ fn exercise(cfg: &DeviceConfig, inspect: bool) -> Result<()> {
     let readings = Readings::battery_only()?;
     let sideload_test = inspect && Path::new(sideload_test::CERTIFICATES).is_file();
     app.state.sideload_test = sideload_test;
-    let block_preflight = inspect && root.join(block_preflight::ENABLED).is_file();
+    let lmi_zip = inspect && cfg.device.codename == "lmi" && root.join(ramdisk::LMI_ZIP_INSTALL).is_file();
+    app.state.lmi_zip_install = lmi_zip;
+    let block_preflight = lmi_zip || (inspect && root.join(block_preflight::ENABLED).is_file());
     app.state.block_ota_preflight = block_preflight;
-    let block_install = inspect && root.join(ramdisk::BLOCK_OTA_DIGEST).is_file();
+    let block_install = lmi_zip || (inspect && root.join(ramdisk::BLOCK_OTA_DIGEST).is_file());
     app.state.block_ota_install = block_install;
     app.state.check_signature = sideload_test || block_preflight || block_install;
     let mut installer = None;
     let mut data = DataWork {
         enabled: data_readonly,
-        install_committed: false,
+        needs_reboot: false,
         app_restore_test,
         data_backup,
         system: info.os_version.clone(),
         backuper: None,
+        eraser: None,
+        usb_drive: None,
         transfer: None,
         files: None,
         shell: None,
@@ -127,8 +140,32 @@ fn exercise(cfg: &DeviceConfig, inspect: bool) -> Result<()> {
             .ok()
     });
 
+    let watch_usb = (data_backup || lmi_zip) && cfg.device.codename == "lmi";
+    let mut plugged = None;
+    let mut usb_seen = None;
+    let mut next_usb = 0;
+    let mut unread_usb = skyward_sys::ToldOnce::default();
     loop {
         let now = monotonic_ms();
+        if watch_usb && now >= next_usb {
+            next_usb = now.saturating_add(1000);
+            let may_mount = data.idle() && !data.needs_reboot && installer.is_none();
+            let probe = crate::ui::look_for_drive(
+                &mut plugged, &mut usb_seen, may_mount.then_some(skyward_block::usb::mount_fat as crate::ui::DriveMount),
+            );
+            crate::ui::untaken(&mut unread_usb, "the USB drive", probe.as_ref().err())?;
+            if let Ok(Some(drive)) = probe {
+                if drive.is_none()
+                    && app.state.backup_job.as_ref().is_some_and(|job| job.place == Place::UsbDrive)
+                    && let Some(worker) = &data.backuper
+                {
+                    worker.stop();
+                }
+                data.usb_drive = plugged.as_ref().and_then(crate::ui::Plugged::readable_drive);
+                let effects = app.set_usb_drive(drive, now);
+                handle(&mut app, &mut haptics, &mut installer, &mut data, cfg, &info, &fonts, &canvas, effects, now)?;
+            }
+        }
         let effects = app.tick(now);
         handle(&mut app, &mut haptics, &mut installer, &mut data, cfg, &info, &fonts, &canvas, effects, now)?;
         if app.take_dirty() {
@@ -154,6 +191,7 @@ fn exercise(cfg: &DeviceConfig, inspect: bool) -> Result<()> {
             .chain(installer.as_ref().map(Installer::fd))
             .chain(data.job.as_ref().map(Decryptor::fd))
             .chain(data.backuper.as_ref().map(backup::Worker::fd))
+            .chain(data.eraser.as_ref().map(wipe::Eraser::fd))
             .chain(data.files.as_ref().map(filework::Worker::fd))
             .chain(data.shell.as_ref().into_iter().flat_map(pty::Shell::fds))
             .collect::<Vec<_>>();
@@ -179,6 +217,7 @@ fn exercise(cfg: &DeviceConfig, inspect: bool) -> Result<()> {
         if let Some(worker) = &data.backuper {
             for event in worker.events() {
                 match event {
+                    backup::Event::Staging { done, of } => app.backup_staging(done, of),
                     backup::Event::Plan(plan) => app.backup_plan(plan),
                     backup::Event::At { item, done, of, checking } => app.backup_at(BackupAt { item, done, of, checking }),
                     backup::Event::Ended(end) => {
@@ -186,6 +225,28 @@ fn exercise(cfg: &DeviceConfig, inspect: bool) -> Result<()> {
                         data.backuper = None;
                         info.storage.free = backup::free_bytes(Path::new(skyward_crypto::data::MOUNT)).ok();
                     }
+                }
+            }
+        }
+        for event in data.eraser.as_ref().map(wipe::Eraser::events).unwrap_or_default() {
+            match event {
+                wipe::Event::At(step) => app.erase_at(crate::ui::part(step)),
+                wipe::Event::Progress(done, total) => app.erase_progress(done, total),
+                wipe::Event::NeedsReboot => {
+                    data.needs_reboot = true;
+                    app.data_failed(app.state.lang.pick([
+                        "为完成本次 Data 清除，请重启系统",
+                        "為完成本次 Data 清除，請重新啟動系統",
+                        "Reboot to Android to finish wiping data",
+                    ]).to_string());
+                }
+                wipe::Event::Opened(_) => unreachable!("advanced wipe opens its data root before running"),
+                wipe::Event::Ended(outcome) => {
+                    let summary = outcome.as_ref().map_or_else(wipe::said, |_| "done".into());
+                    let _ = skyward_sys::kmsg(&format!("lmi advanced wipe: {summary}"));
+                    app.erase_ended(outcome.map_err(crate::ui::erase_stop), monotonic_ms());
+                    data.eraser = None;
+                    info.storage.free = backup::free_bytes(Path::new(skyward_crypto::data::MOUNT)).ok();
                 }
             }
         }
@@ -322,7 +383,7 @@ fn exercise(cfg: &DeviceConfig, inspect: bool) -> Result<()> {
                 }
             }
         }
-        let offer_storage = app.state.data.storage_open() && !data.install_committed
+        let offer_storage = app.state.data.storage_open() && !data.needs_reboot
             && data.idle() && installer.is_none() && app.state.editor.is_none();
         let transfer_status = match &mut data.transfer {
             Some(transfer) if !transfer.service.running() => Err(anyhow::anyhow!("the file transfer service ended")),
@@ -420,11 +481,13 @@ fn wallpaper_result<T>(app: &App, job: JoinHandle<Result<T>>) -> Result<T, Strin
 
 struct DataWork {
     enabled: bool,
-    install_committed: bool,
+    needs_reboot: bool,
     app_restore_test: bool,
     data_backup: bool,
     system: Option<String>,
     backuper: Option<backup::Worker>,
+    eraser: Option<wipe::Eraser>,
+    usb_drive: Option<(skyward_block::usb::Drive, i32)>,
     transfer: Option<crate::ui::Transfer>,
     files: Option<filework::Worker>,
     shell: Option<pty::Shell>,
@@ -440,7 +503,7 @@ struct DataWork {
 
 impl DataWork {
     fn keep_settings(&mut self, app: &mut App, now: u64, flush: bool) {
-        if !self.data_backup || self.install_committed || !self.tasks_idle() {
+        if !self.data_backup || self.needs_reboot || !self.tasks_idle() {
             return;
         }
         let settings = app.settings().appearance();
@@ -482,26 +545,31 @@ impl DataWork {
     }
 
     fn wallpaper_storage(&self, app: &App, installer: &Option<Installer>) -> Result<&'static Path> {
-        ensure!(app.state.data.storage_open() && !self.install_committed, "decrypt internal storage first");
+        ensure!(app.state.data.storage_open() && !self.needs_reboot, "decrypt internal storage first");
         ensure!(self.idle() && installer.is_none(), "finish the current operation first");
         Ok(Path::new(OWNER_STORAGE))
     }
 
-    fn start_backup(&mut self, app: &mut App, place: Place, compress: bool, verify: bool) -> Result<()> {
-        ensure!(self.can_backup(app) && place == Place::Storage, "decrypt all users before backing up");
-        let into = crate::ui::backups_in(place);
-        let there = into.ancestors().find(|path| path.exists()).context("no backup destination")?;
+    fn start_backup(&mut self, app: &mut App, parts: [bool; 5], place: Place, compress: bool, verify: bool) -> Result<()> {
+        self.check_backup_scope(app, parts)?;
+        let usb = self.backup_usb(app, place)?;
+        let visible = crate::ui::backups_in(place);
+        let there = visible.ancestors().find(|path| path.exists()).context("no backup destination")?;
         ensure!(there.canonicalize()? == there, "the backup directory contains a symbolic link");
+        let ownership = if usb.is_some() { skyward_files::Ownership::Kept } else { crate::ui::ownership(there)? };
+        let into = usb.as_ref().map_or(visible, UsbMount::backups);
+        let verify = verify || usb.is_some();
         let made = crate::ui::unix_now()?;
         let task = BackupTask {
             data_scope: DataScope::Partition,
-            parts: [false, false, true, false],
-            into: into.clone(),
+            parts,
+            into,
             stamp: skyward_ui::fmt::stamp(made, app.state.time_zone),
-            ownership: crate::ui::ownership(there)?,
+            ownership,
             compress,
             verify,
             remount: None,
+            usb,
             made,
             device: "lmi".into(),
             system: self.system.clone(),
@@ -513,12 +581,16 @@ impl DataWork {
         Ok(())
     }
 
-    fn start_restore(&mut self, app: &mut App, place: Place, name: &str) -> Result<()> {
-        ensure!(self.can_backup(app) && place == Place::Storage, "decrypt all users before restoring");
+    fn start_restore(&mut self, app: &mut App, parts: [bool; 5], place: Place, name: &str) -> Result<()> {
+        self.check_backup_scope(app, parts)?;
+        let usb = self.backup_usb(app, place)?;
+        let folder = lmi_backup_folder(place, name)?;
+        let folder = usb.as_ref().map_or(folder, |drive| drive.backups().join(name));
         let task = RestoreTask {
             data_scope: DataScope::Partition,
-            folder: lmi_backup_folder(place, name)?,
-            parts: [false, false, true, false],
+            folder,
+            usb,
+            parts,
             device: "lmi".into(),
             skipped: backup::data_skipped(&[]),
             detach: Box::new(|| Ok(())),
@@ -529,21 +601,114 @@ impl DataWork {
     }
 
     fn start_verification(&mut self, app: &mut App, place: Place, name: &str) -> Result<()> {
-        ensure!(self.data_backup && !self.install_committed && self.idle(), "finish the current operation first");
-        ensure!(place == Place::Storage && app.state.data.storage_open(), "decrypt internal storage first");
+        ensure!(self.data_backup && !self.needs_reboot && self.idle(), "finish the current operation first");
+        if place == Place::Storage {
+            ensure!(app.state.data.storage_open(), "decrypt internal storage first");
+        }
+        let usb = self.backup_usb(app, place)?;
         let folder = lmi_backup_folder(place, name)?;
-        self.backuper = Some(backup::Worker::start(Task::Verify(folder))?);
+        let folder = usb.as_ref().map_or(folder, |drive| drive.backups().join(name));
+        self.backuper = Some(backup::Worker::start(Task::Verify { folder, usb })?);
         app.verification_started(place);
         Ok(())
     }
 
-    fn can_backup(&self, app: &App) -> bool {
-        self.data_backup && !self.install_committed && self.idle()
-            && self.closed.is_empty() && app.state.data == Data::Open
+    fn backup_usb(&self, app: &App, place: Place) -> Result<Option<UsbMount>> {
+        if place == Place::Storage {
+            return Ok(None);
+        }
+        self.open_usb(app).map(Some)
+    }
+
+    fn open_usb(&self, app: &App) -> Result<UsbMount> {
+        ensure!(app.state.place_open(Place::UsbDrive), "connect a readable FAT32 or exFAT USB drive");
+        let (drive, id) = self.usb_drive.clone().context("the USB drive is no longer mounted")?;
+        UsbMount::open(drive, Path::new(USB_DRIVE), id)
+    }
+
+    fn check_backup_scope(&self, app: &App, parts: [bool; 5]) -> Result<()> {
+        ensure!(self.data_backup && !self.needs_reboot && self.idle(), "finish the current operation first");
+        let [boot, system, data, efs, shared] = parts;
+        ensure!(!(boot || system || efs) && (data || shared), "choose data or shared files");
+        ensure!(!data || (self.closed.is_empty() && app.state.data == Data::Open), "decrypt all users before processing data");
+        ensure!(!shared || app.state.data.storage_open(), "decrypt owner internal storage first");
+        Ok(())
+    }
+
+    fn start_advanced_wipe(&mut self, app: &mut App, selected: Vec<Wipe>, now: u64) -> Result<()> {
+        ensure!(!self.needs_reboot && self.idle(), "finish the current operation before wiping");
+        ensure!(!selected.is_empty(), "choose what to wipe");
+        let mut choices = Vec::new();
+        let mut cache = None;
+        for item in selected {
+            let choice = match item {
+                Wipe::DataKeepMedia => {
+                    ensure!(app.state.lmi_data_keep_media, "Data wipe is not enabled in this image");
+                    (wipe::Step::DataKeepMedia, data_wipe::Group::DataKeepMedia)
+                },
+                Wipe::AppData => (wipe::Step::AppData, data_wipe::Group::AppData),
+                Wipe::Media => (wipe::Step::Media, data_wipe::Group::Media),
+                Wipe::AppCaches => (wipe::Step::AppCaches, data_wipe::Group::AppCaches),
+                Wipe::SystemCaches => (wipe::Step::SystemCaches, data_wipe::Group::SystemCaches),
+                Wipe::Art => (wipe::Step::Art, data_wipe::Group::Art),
+                Wipe::Cache if app.state.cache_partition => {
+                    cache = Some(wipe::lmi_cache_plan().map_err(|stop| anyhow::anyhow!(wipe::said(&stop)))?
+                        .context("the cache partition disappeared")?);
+                    continue;
+                }
+                _ => anyhow::bail!("the selected item cannot be wiped on lmi"),
+            };
+            choices.push(choice);
+        }
+        if !choices.is_empty() {
+            ensure!(self.closed.is_empty() && app.state.data == Data::Open, "decrypt all users before wiping items in data");
+        }
+        if !crate::ui::withhold(&mut self.transfer, app, now)? {
+            return Ok(());
+        }
+        let root = (!choices.is_empty()).then(data_wipe::DataRoot::open_lmi_data).transpose()?;
+        let parts = choices.iter().map(|&(step, _)| step)
+            .chain(cache.as_ref().map(|_| wipe::Step::Cache)).map(crate::ui::part).collect();
+        self.eraser = Some(wipe::Eraser::start(move |tell| {
+            if let Some(root) = root {
+                wipe::clear_lmi_groups(root, choices, tell)?;
+            }
+            if let Some(cache) = cache {
+                cache.carry_out(tell)?;
+            }
+            Ok(())
+        })?);
+        app.state.wipe.fill(false);
+        app.erase_started(false, false, parts);
+        Ok(())
+    }
+
+    fn start_format_data(&mut self, app: &mut App, now: u64) -> Result<()> {
+        ensure!(self.idle() && (!self.needs_reboot || app.state.erase.reset), "finish the current operation before formatting");
+        let plan = wipe::lmi_format_plan().map_err(|stop| anyhow::anyhow!(wipe::said(&stop)))?;
+        if !crate::ui::withhold(&mut self.transfer, app, now)? {
+            return Ok(());
+        }
+        let parts = plan.steps().into_iter().map(crate::ui::part).collect();
+        let eraser = wipe::Eraser::start(move |tell| {
+            crate::legacy_data::finish().map_err(|error| wipe::Stop::Closed(format!("{error:#}")))?;
+            plan.carry_out(true, tell)
+        })?;
+        self.needs_reboot = true;
+        self.closed.clear();
+        self.eraser = Some(eraser);
+        app.data_failed(app.state.lang.pick([
+            "格式化后需重启系统以重建 data",
+            "格式化後需重啟系統以重建 data",
+            "Reboot to Android after formatting to recreate data",
+        ]).to_string());
+        app.state.wipe.fill(false);
+        app.erase_started(true, false, parts);
+        Ok(())
     }
 
     fn tasks_idle(&self) -> bool {
-        self.backuper.is_none() && self.files.is_none() && self.job.is_none() && self.wallpaper_job.is_none()
+        self.backuper.is_none() && self.eraser.is_none() && self.files.is_none() && self.job.is_none() && self.wallpaper_job.is_none()
     }
 
     fn idle(&self) -> bool {
@@ -605,7 +770,7 @@ fn handle(
                 }
                 data.keep_settings(app, now, true);
                 if data.enabled {
-                    let closed = if data.install_committed {
+                    let closed = if data.needs_reboot {
                         crate::legacy_data::finish()
                     } else {
                         release_for_block_install(true)
@@ -620,21 +785,42 @@ fn handle(
                 app.report("当前操作完成后可重启", now);
             }
             Effect::OpenData if data.enabled && data.idle() && !data.fixture_started
-                && !data.install_committed && installer.is_none() => {
+                && !data.needs_reboot && installer.is_none() => {
                 data.keep_settings(app, now, true);
                 data.job = Some(Decryptor::start(Job::OpenLmi { readonly: !(data.app_restore_test || data.data_backup) })?);
             }
             Effect::OpenData if data.enabled => {
                 app.data_failed("请先结束当前操作，或重启 Recovery 后解密".into());
             }
-            Effect::Unlock { user, code } if data.enabled && data.idle() && installer.is_none() && !data.install_committed => {
+            Effect::Unlock { user, code } if data.enabled && data.idle() && installer.is_none() && !data.needs_reboot => {
                 data.keep_settings(app, now, true);
                 data.job = Some(Decryptor::start(Job::Unlock { closed: data.closed.clone(), user, credential: code.into_bytes() })?);
             }
             Effect::Unlock { .. } if data.enabled => {
                 app.unlock_failed("请先结束当前操作，或重启 Recovery 后解密".into(), now);
             }
-            Effect::Backup { parts: [false, false, true, false], place, compress, verify } if data.data_backup => {
+            Effect::Wipe(selected) if app.state.lmi_wipe => {
+                let title = app.state.lang.pick(["高级清除", "進階清除", "Advanced wipe"]);
+                let result = (|| {
+                    ensure!(installer.is_none(), "finish the installation before wiping");
+                    data.start_advanced_wipe(app, selected, now)
+                })();
+                if let Err(error) = result {
+                    hardware_error(app, title, &error, now);
+                }
+            }
+            Effect::FactoryReset if app.state.lmi_format_data && app.screen() == Screen::FormatData => {
+                let result = (|| {
+                    ensure!(installer.is_none(), "finish the installation before formatting");
+                    data.start_format_data(app, now)
+                })();
+                if let Err(error) = result {
+                    let title = app.state.lang.pick(["格式化 data", "格式化 data", "Format data"]);
+                    hardware_error(app, title, &error, now);
+                }
+            }
+            Effect::Dismiss if app.state.lmi_wipe && app.state.erase.outcome.is_some() => {}
+            Effect::Backup { parts, place, compress, verify } if data.data_backup => {
                 if data.shell.is_some() || !data.terminal_sessions.is_empty() {
                     app.report(app.state.lang.pick([
                         "请先结束终端及其后台任务",
@@ -646,12 +832,12 @@ fn handle(
                 if let Err(error) = (|| {
                     ensure!(installer.is_none(), "an installation is in progress");
                     ensure!(crate::ui::withhold(&mut data.transfer, app, now)?, "file transfer still holds internal storage");
-                    data.start_backup(app, place, compress, verify)
+                    data.start_backup(app, parts, place, compress, verify)
                 })() {
                     hardware_error(app, "备份", &error, now);
                 }
             }
-            Effect::Restore { place, name, parts: [false, false, true, false] } if data.data_backup => {
+            Effect::Restore { place, name, parts } if data.data_backup => {
                 if data.shell.is_some() || !data.terminal_sessions.is_empty() {
                     app.report(app.state.lang.pick([
                         "请先结束终端及其后台任务",
@@ -663,7 +849,7 @@ fn handle(
                 if let Err(error) = (|| {
                     ensure!(installer.is_none(), "an installation is in progress");
                     ensure!(crate::ui::withhold(&mut data.transfer, app, now)?, "file transfer still holds internal storage");
-                    data.start_restore(app, place, &name)
+                    data.start_restore(app, parts, place, &name)
                 })() {
                     hardware_error(app, "恢复", &error, now);
                 }
@@ -686,8 +872,9 @@ fn handle(
                     hardware_error(app, title, &error, now);
                 }
             }
-            Effect::FindBackups { storage, .. } if data.data_backup => {
-                crate::ui::find_backups(app, storage, false, now);
+            Effect::FindBackups { storage, usb } if data.data_backup => {
+                let usb = usb && app.state.place_open(Place::UsbDrive);
+                crate::ui::find_backups(app, storage, usb, now);
             }
             Effect::DeleteBackup { place: Place::Storage, name } if data.data_backup && data.idle() && installer.is_none() => {
                 if !crate::ui::withhold(&mut data.transfer, app, now)? {
@@ -697,7 +884,8 @@ fn handle(
                     .and_then(|folder| crate::ui::delete_backup(Place::Storage, &folder))
                     .map_err(|error| format!("{error:#}"));
                 if !app.backup_deleted(result, now).is_empty() {
-                    crate::ui::find_backups(app, true, false, now);
+                    let usb = app.state.place_open(Place::UsbDrive);
+                    crate::ui::find_backups(app, true, usb, now);
                 }
             }
             Effect::StopBackup if data.data_backup => {
@@ -807,7 +995,7 @@ fn handle(
                 app.set_filesystems(crate::ui::read_filesystems().map_err(|error| format!("{error:#}")));
             }
             Effect::ReadDir(folder) => crate::ui::list(app, folder)?,
-            Effect::ReadPlace(Place::Storage, folder) => crate::ui::list_place(app, Place::Storage, folder)?,
+            Effect::ReadPlace(place, folder) => crate::ui::list_place(app, place, folder)?,
             Effect::StartShell(folder) => {
                 if data.shell.is_some() {
                     app.report("终端已经启动", now);
@@ -858,12 +1046,12 @@ fn handle(
                 }
             }
             Effect::Screenshot { storage } => {
-                let saved = crate::ui::save_screenshot(canvas, storage, app.state.time_zone)
+                let saved = crate::ui::save_screenshot(canvas, storage && data.eraser.is_none(), app.state.time_zone)
                     .map_err(|error| format!("{error:#}"));
                 app.screenshot_saved(saved, now);
             }
             Effect::ExportLogs { recovery, kernel, storage } => {
-                let into = if storage {
+                let into = if storage && data.eraser.is_none() {
                     Path::new(skyward_crypto::data::SDCARD).join(crate::ui::STORAGE_LOGS)
                 } else {
                     std::path::PathBuf::from(crate::ui::TMP_LOGS)
@@ -1012,7 +1200,11 @@ fn handle(
                     ensure!(data.shell.is_none() && data.terminal_sessions.is_empty(), "finish the terminal and its background jobs before installing");
                     ensure!(data.tasks_idle() && installer.is_none(), "finish the current operation before sideload");
                     ensure!(crate::ui::withhold(&mut data.transfer, app, now)?, "file transfer still holds internal storage");
-                    if effect == Effect::SideloadPreflight {
+                    let preflight = effect == Effect::SideloadPreflight;
+                    if app.state.lmi_zip_install {
+                        let use_services = data.enabled;
+                        Installer::start_lmi_zip(preflight, Box::new(move || release_for_block_install(use_services)))
+                    } else if preflight {
                         ensure!(app.state.block_ota_preflight, "the preflight entry is unavailable");
                         Installer::start_block_preflight()
                     } else if app.state.block_ota_install {
@@ -1030,26 +1222,43 @@ fn handle(
                     }
                 }
             }
-            Effect::InstallPath(_) | Effect::InstallFile(Place::Storage, _) => {
+            Effect::InstallPath(_) | Effect::InstallFile(_, _) => {
                 let full = match effect {
-                    Effect::InstallFile(_, path) => crate::ui::in_place(Place::Storage, &path),
+                    Effect::InstallFile(place, path) => crate::ui::in_place(place, &path),
                     Effect::InstallPath(path) => std::path::PathBuf::from(path),
                     _ => unreachable!("only local installation reaches this branch"),
                 };
                 let started = (|| -> Result<Installer> {
                     ensure!(app.state.block_ota_install, "local installation is unavailable");
                     ensure!(data.shell.is_none() && data.terminal_sessions.is_empty(), "finish the terminal and its background jobs before installing");
-                    ensure!(data.tasks_idle() && !data.install_committed && installer.is_none(), "finish the current operation first");
+                    ensure!(data.tasks_idle() && !data.needs_reboot && installer.is_none(), "finish the current operation first");
                     let is_image = full.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("img"));
-                    ensure!(is_image || full.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("zip")), "choose an IMG or the supported full ROM ZIP");
+                    let is_zip = full.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("zip"));
+                    if let Ok(relative) = full.strip_prefix(USB_DRIVE) {
+                        ensure!(app.state.lmi_zip_install && is_zip, "choose a ZIP on the USB drive");
+                        let usb = data.open_usb(app)?;
+                        let file = usb.open_zip(relative)?;
+                        ensure!(crate::ui::withhold(&mut data.transfer, app, now)?, "file transfer is still active");
+                        let use_services = data.enabled;
+                        return Installer::open_lmi_zip(file, Box::new(move || {
+                            usb.attached()?;
+                            release_for_block_install(use_services)?;
+                            usb.attached()
+                        }));
+                    }
+                    ensure!(is_image || is_zip, "choose an IMG or an install ZIP");
                     ensure!(app.state.data.storage_open(), "decrypt internal storage first");
                     ensure!(crate::ui::withhold(&mut data.transfer, app, now)?, "file transfer still holds internal storage");
                     ensure!(skyward_block::mount::is_mount_point(Path::new("/data"))?, "decrypt internal storage first");
                     let data_device = std::fs::metadata("/data")?.dev();
-                    if is_image {
-                        let file = open_owner_image(Path::new(OWNER_STORAGE), Path::new(skyward_crypto::data::SDCARD), &full)?;
-                        ensure!(file.metadata()?.dev() == data_device, "the image is not on the data partition");
-                        Installer::open_lmi_image(file)
+                    if is_image || app.state.lmi_zip_install {
+                        let file = open_owner_file(Path::new(OWNER_STORAGE), Path::new(skyward_crypto::data::SDCARD), &full)?;
+                        ensure!(file.metadata()?.dev() == data_device, "the file is not on the data partition");
+                        if is_image {
+                            Installer::open_lmi_image(file)
+                        } else {
+                            Installer::open_lmi_zip(file, Box::new(release_for_local_block_install))
+                        }
                     } else {
                         ensure!(std::fs::metadata(&full)?.dev() == data_device, "choose the supported ROM ZIP from internal storage");
                         Installer::open_block_install(full, Box::new(release_for_local_block_install))
@@ -1073,16 +1282,33 @@ fn handle(
                     )), now);
                 }
             }
-            Effect::Install if app.state.sideload_test || app.state.block_ota_install => {
+            Effect::Install | Effect::InstallUnverifiedZip if app.state.sideload_test || app.state.block_ota_install => {
+                if app.state.sideload_preflight || (effect == Effect::InstallUnverifiedZip && !app.state.lmi_zip_install) {
+                    continue;
+                }
                 if let Some(active) = installer.as_ref() {
-                    if app.state.block_ota_install && !app.state.sideload_preflight {
+                    // A swipe can arrive between USB probes. Check the drive before
+                    // marking data and logical partitions as unavailable.
+                    if app.state.source.uses_usb_drive()
+                        && let Err(error) = data.open_usb(app)
+                    {
+                        active.cancel()?;
+                        skyward_sys::kmsg(&format!("install: USB ZIP confirmation cancelled: {error:#}"))?;
+                        app.report(app.state.lang.pick(skyward_ui::app::INSTALL_USB_DISCONNECTED), now);
+                        continue;
+                    }
+                    if app.state.block_ota_install {
                         data.keep_settings(app, now, true);
-                        data.install_committed = true;
+                        data.needs_reboot = true;
                         data.closed.clear();
                         app.data_failed("请重启 Recovery 后再解密".into());
                         app.set_mounts(Err("安装开始后请重启 Recovery 以重新检查挂载".into()));
                     }
-                    active.install();
+                    if effect == Effect::InstallUnverifiedZip {
+                        active.install_unverified_zip();
+                    } else {
+                        active.install();
+                    }
                 }
             }
             Effect::Cancel => {

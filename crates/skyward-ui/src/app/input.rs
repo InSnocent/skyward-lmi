@@ -227,6 +227,9 @@ impl App {
                     if let Some(p) = &mut self.row_press {
                         p.lift(now);
                     }
+                    if self.state.vibrate && self.screen() == Screen::Terminal && matches!(a, Action::Type(_) | Action::TermKey(_)) {
+                        fx.push(Effect::Haptic);
+                    }
                     fx.extend(self.act(a, now));
                 }
                 Drag::Press { x, y, action: None, .. } if self.screen() == Screen::Editor => self.place_caret(f, x, y + scroll),

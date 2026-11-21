@@ -6,6 +6,7 @@ use crate::mount;
 use anyhow::{bail, Context, Result};
 use std::fs;
 use std::io::ErrorKind;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path};
 
 /// Where the kernel lists its disks, each a link to the device it is.
@@ -18,8 +19,10 @@ const DEV_BLOCK: &str = "/dev/block";
 /// what each is mounted with to give names as the drive keeps them: FAT
 /// and exFAT keep long names in UTF-16, which the kernel otherwise turns
 /// into a code page without Chinese.
+const FAT32: (&str, &str) = ("vfat", "utf8");
+const EXFAT: (&str, &str) = ("exfat", "iocharset=utf8");
 const FILESYSTEMS: [(&str, &str); 5] =
-    [("vfat", "utf8"), ("exfat", "iocharset=utf8"), ("ntfs3", "iocharset=utf8"), ("ext4", ""), ("f2fs", "")];
+    [FAT32, EXFAT, ("ntfs3", "iocharset=utf8"), ("ext4", ""), ("f2fs", "")];
 
 /// A USB drive as the kernel lists it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +31,8 @@ pub struct Drive {
     pub disk: String,
     /// Its partitions by name, each with its size in bytes.
     pub parts: Vec<(String, u64)>,
+    /// A replacement can have the same disk name and partition sizes.
+    instance: u64,
 }
 
 impl Drive {
@@ -64,6 +69,7 @@ fn drives_in(listed: &Path) -> Result<Vec<Drive>> {
         if !on_usb(&device) {
             continue;
         }
+        let Some(instance) = present(fs::metadata(&device)).with_context(|| format!("look at {}", device.display()))? else { continue };
         // A card reader with no card in it is a disk of no size.
         let Some(size) = sectors(&device)? else { continue };
         if size == 0 {
@@ -80,7 +86,7 @@ fn drives_in(listed: &Path) -> Result<Vec<Drive>> {
             parts.push((name(&dir)?, size * 512));
         }
         parts.sort();
-        found.push(Drive { disk: name(&link)?, parts });
+        found.push(Drive { disk: name(&link)?, parts, instance: instance.ino() });
     }
     found.sort_by(|a, b| a.disk.cmp(&b.disk));
     Ok(found)
@@ -125,11 +131,20 @@ fn present<T>(r: std::io::Result<T>) -> std::io::Result<Option<T>> {
 /// disk, that holds a filesystem the kernel reads. Gives the partition and
 /// the filesystem shown.
 pub fn mount(drive: &Drive, at: &Path) -> Result<(String, &'static str)> {
+    mount_with(drive, at, &FILESYSTEMS)
+}
+
+/// The lmi read-only path accepts filesystems without journal replay.
+pub fn mount_fat(drive: &Drive, at: &Path) -> Result<(String, &'static str)> {
+    mount_with(drive, at, &[FAT32, EXFAT])
+}
+
+fn mount_with(drive: &Drive, at: &Path, filesystems: &[(&'static str, &str)]) -> Result<(String, &'static str)> {
     fs::create_dir_all(at).with_context(|| format!("create {}", at.display()))?;
     let mut tried = Vec::new();
     for name in drive.candidates() {
         let device = Path::new(DEV_BLOCK).join(name);
-        for (filesystem, own) in FILESYSTEMS {
+        for &(filesystem, own) in filesystems {
             let options: Vec<String> = ["ro", "nosuid", "nodev", "noexec", own].map(str::to_string).into();
             match mount::mount(&device, at, filesystem, &options) {
                 Ok(()) => return Ok((name.to_string(), filesystem)),
@@ -171,16 +186,19 @@ mod tests {
         disk(&root, &format!("{usb}/1-1/1-1:1.0/host1/target1:0:0/1:0:0:0/block/sdg"), 60_437_492, &[("sdg2", 60_000_000), ("sdg1", 409_600)]);
         disk(&root, &format!("{usb}/1-2/1-2:1.0/host2/target2:0:0/2:0:0:0/block/sdh"), 0, &[]);
         let found = drives_in(&root.join("block")).unwrap();
-        let sdg = Drive { disk: "sdg".into(), parts: vec![("sdg1".into(), 409_600 * 512), ("sdg2".into(), 60_000_000 * 512)] };
+        let sdg = Drive {
+            disk: "sdg".into(), parts: vec![("sdg1".into(), 409_600 * 512), ("sdg2".into(), 60_000_000 * 512)],
+            instance: fs::metadata(root.join("block/sdg")).unwrap().ino(),
+        };
         assert_eq!(found, [sdg], "the phone's storage, a loop device and an empty card reader are left out");
         fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
     fn the_largest_partition_is_tried_first_and_a_disk_without_any_whole() {
-        let mac = Drive { disk: "sdg".into(), parts: vec![("sdg1".into(), 209_715_200), ("sdg2".into(), 63_000_000_000)] };
+        let mac = Drive { disk: "sdg".into(), parts: vec![("sdg1".into(), 209_715_200), ("sdg2".into(), 63_000_000_000)], instance: 0 };
         assert_eq!(mac.candidates(), ["sdg2", "sdg1"], "the data before the EFI partition in front of it");
-        let floppy = Drive { disk: "sdh".into(), parts: Vec::new() };
+        let floppy = Drive { disk: "sdh".into(), parts: Vec::new(), instance: 0 };
         assert_eq!(floppy.candidates(), ["sdh"]);
     }
 }

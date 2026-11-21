@@ -15,6 +15,14 @@ use std::path::{Path, PathBuf};
 /// of 4 GiB or more.
 pub const FILE_BYTES: u64 = 1 << 30;
 
+/// Publish a complete, verified backup without replacing any earlier one.
+/// Both directories are on the same filesystem.
+pub fn publish(pending: &Path, ready: &Path) -> Result<()> {
+    use rustix::fs::{renameat_with, RenameFlags, CWD};
+    renameat_with(CWD, pending, CWD, ready, RenameFlags::NOREPLACE)
+        .with_context(|| format!("publish backup {}", ready.file_name().unwrap_or_default().to_string_lossy()))
+}
+
 /// A part as its files keep it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Stored {
@@ -234,6 +242,25 @@ pub fn digest(mut from: impl Read, len: u64, progress: &mut dyn FnMut(u64)) -> i
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn publishing_a_complete_backup_never_overwrites_an_existing_folder() {
+        use std::fs;
+
+        let root = tempfile::tempdir().unwrap();
+        let pending = root.path().join(".skyward-incomplete-test");
+        let completed = root.path().join("20261119-220000");
+        fs::create_dir(&pending).unwrap();
+        fs::write(pending.join("data.tar.000"), b"new volume").unwrap();
+        fs::create_dir(&completed).unwrap();
+        assert!(super::publish(&pending, &completed).is_err());
+        assert!(pending.join("data.tar.000").is_file());
+        assert_eq!(fs::read_dir(&completed).unwrap().count(), 0);
+        fs::remove_dir(&completed).unwrap();
+        super::publish(&pending, &completed).unwrap();
+        assert!(!pending.exists());
+        assert_eq!(fs::read(completed.join("data.tar.000")).unwrap(), b"new volume");
+    }
+
     use super::*;
     use std::fs;
 

@@ -5,9 +5,9 @@ use std::io::{Read, Seek};
 use zip::ZipArchive;
 
 pub const ENABLED: &str = "skyward/block-ota-preflight";
-const METADATA: &str = "META-INF/com/android/metadata";
+pub(crate) const METADATA: &str = "META-INF/com/android/metadata";
 const SCRIPT: &str = "META-INF/com/google/android/updater-script";
-const OPERATIONS: &str = "dynamic_partitions_op_list";
+pub(crate) const OPERATIONS: &str = "dynamic_partitions_op_list";
 const MAX_TEXT: u64 = 128 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -20,12 +20,20 @@ pub struct BlockPreflight {
 pub fn inspect(source: impl Read + Seek, device: &str) -> Result<BlockPreflight> {
     let mut zip = ZipArchive::new(source).context("open the OTA zip")?;
     let metadata = Metadata::parse(&text(&mut zip, METADATA)?);
+    inspect_archive(&mut zip, &metadata, device)
+}
+
+pub(crate) fn inspect_archive(
+    zip: &mut ZipArchive<impl Read + Seek>, metadata: &Metadata, device: &str,
+) -> Result<BlockPreflight> {
     ensure!(metadata.get("ota-type") == Some("BLOCK"), "expected a non-A/B BLOCK OTA");
+    ensure!(metadata.get("pre-build").is_none() && metadata.get("pre-build-incremental").is_none(),
+        "incremental BLOCK OTAs are not supported");
     ensure!(!device.is_empty() && metadata.get("pre-device").is_some_and(|names| names.split('|').any(|name| name == device)),
         "the OTA declares {:?} and this device is {device}", metadata.get("pre-device"));
     ensure!(zip.index_for_name(UPDATE_BINARY).is_some(), "the OTA is missing its updater");
-    let script = text(&mut zip, SCRIPT)?;
-    let operations = text(&mut zip, OPERATIONS)?;
+    let script = text(zip, SCRIPT)?;
+    let operations = text(zip, OPERATIONS)?;
     ensure!(script.contains("update_dynamic_partitions("), "the OTA script does not declare a dynamic partition update");
 
     let mut logical = Vec::new();
@@ -61,7 +69,7 @@ fn valid_name(name: &str) -> bool {
     !name.is_empty() && name.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-'))
 }
 
-fn text(zip: &mut ZipArchive<impl Read + Seek>, name: &str) -> Result<String> {
+pub(crate) fn text(zip: &mut ZipArchive<impl Read + Seek>, name: &str) -> Result<String> {
     let entry = zip.by_name(name).with_context(|| format!("open {name}"))?;
     ensure!(entry.size() <= MAX_TEXT, "{name} is too large to inspect");
     let mut text = String::new();
@@ -101,6 +109,12 @@ package_extract_file("extra.img", "/tmp/extra.img");"#),
         let report = inspect(archive("BLOCK", "lmi"), "lmi").unwrap();
         assert_eq!(report.logical, ["system"]);
         assert_eq!(report.physical, ["boot"]);
+    }
+
+    #[test]
+    fn refuses_an_incremental_block_ota() {
+        let delta = archive("BLOCK", "lmi\npre-build-incremental=old");
+        assert!(inspect(delta, "lmi").is_err());
     }
 
     #[test]

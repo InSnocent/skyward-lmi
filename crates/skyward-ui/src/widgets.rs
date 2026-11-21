@@ -2735,10 +2735,18 @@ pub enum Layer {
     Letters,
     /// Capitals, for the next letter typed.
     Shifted,
+    /// Capitals until the terminal's Shift key is pressed again.
+    CapsLocked,
     /// Digits and the common symbols.
     Digits,
     /// The rest of the ASCII symbols.
     Symbols,
+}
+
+impl Layer {
+    pub(crate) fn uppercase(self) -> bool {
+        matches!(self, Self::Shifted | Self::CapsLocked)
+    }
 }
 
 /// A key of the on-screen keyboard.
@@ -2757,7 +2765,7 @@ pub enum Cap {
 /// digit and symbol layers hold every printable ASCII character.
 fn rows(layer: Layer) -> [&'static str; 3] {
     match layer {
-        Layer::Letters | Layer::Shifted => ["qwertyuiop", "asdfghjkl", "zxcvbnm"],
+        Layer::Letters | Layer::Shifted | Layer::CapsLocked => ["qwertyuiop", "asdfghjkl", "zxcvbnm"],
         Layer::Digits => ["1234567890", "-/:;()$&@\"", ".,?!'"],
         Layer::Symbols => ["[]{}#%^*+=", "_\\|~<>`", ".,?!'"],
     }
@@ -2812,7 +2820,7 @@ pub fn keyboard(c: &mut Canvas, t: &Theme, f: &Fonts, l: Lang, top: f32, layer: 
     }
     let (left, right) = (pad, w - pad - side_w);
     let shift = match layer {
-        Layer::Letters | Layer::Shifted => Cap::Shift,
+        Layer::Letters | Layer::Shifted | Layer::CapsLocked => Cap::Shift,
         Layer::Digits => Cap::Show(Layer::Symbols),
         Layer::Symbols => Cap::Show(Layer::Digits),
     };
@@ -2826,7 +2834,7 @@ pub fn keyboard(c: &mut Canvas, t: &Theme, f: &Fonts, l: Lang, top: f32, layer: 
     }
     keys.push((Rect::new(right, row_top(2), side_w, kh), Cap::Backspace));
     let switch = match layer {
-        Layer::Letters | Layer::Shifted => Cap::Show(Layer::Digits),
+        Layer::Letters | Layer::Shifted | Layer::CapsLocked => Cap::Show(Layer::Digits),
         Layer::Digits | Layer::Symbols => Cap::Show(Layer::Letters),
     };
     let enter_w = kw * 2.2;
@@ -2844,7 +2852,7 @@ pub fn keyboard(c: &mut Canvas, t: &Theme, f: &Fonts, l: Lang, top: f32, layer: 
         let plain = matches!(cap, Cap::Char(_) | Cap::Space);
         let base = match cap {
             Cap::Enter => t.pal.accent,
-            Cap::Shift if layer == Layer::Shifted => key,
+            Cap::Shift if layer.uppercase() => key,
             _ if plain => key,
             _ => side,
         };
@@ -2856,7 +2864,7 @@ pub fn keyboard(c: &mut Canvas, t: &Theme, f: &Fonts, l: Lang, top: f32, layer: 
         let (cx, cy) = (r.x + r.w / 2.0, r.y + r.h / 2.0);
         match cap {
             Cap::Char(ch) => {
-                let label = if layer == Layer::Shifted { ch.to_ascii_uppercase() } else { ch };
+                let label = if layer.uppercase() { ch.to_ascii_uppercase() } else { ch };
                 c.text_center(&f.heading, &label.to_string(), cx, cy, glyph_px, ink);
             }
             Cap::Space => c.text_center(&f.body, l.pick(["空格", "空格", "Space"]), cx, cy, m.sub_px, ink),
@@ -2865,7 +2873,7 @@ pub fn keyboard(c: &mut Canvas, t: &Theme, f: &Fonts, l: Lang, top: f32, layer: 
             Cap::Show(Layer::Symbols) => c.text_center(&f.heading, "#+=", cx, cy, m.sub_px, ink),
             Cap::Show(_) => c.text_center(&f.heading, "abc", cx, cy, m.sub_px, ink),
             Cap::Shift => {
-                // An upward arrow, solid while the next letter is a capital.
+                // An upward arrow, solid for a capital and underlined while locked.
                 let s = m.dp(9.0);
                 let pts = [
                     (cx, cy - s),
@@ -2876,10 +2884,13 @@ pub fn keyboard(c: &mut Canvas, t: &Theme, f: &Fonts, l: Lang, top: f32, layer: 
                     (cx - s * 0.45, cy),
                     (cx - s, cy),
                 ];
-                if layer == Layer::Shifted {
+                if layer.uppercase() {
                     c.fill_convex(&pts[..3], ink);
                     c.fill_convex(&[pts[0], pts[6], pts[5]], ink);
                     c.fill_rect(cx - s * 0.45, cy - m.dp(0.5), s * 0.9, s * 0.9 + m.dp(0.5), ink);
+                    if layer == Layer::CapsLocked {
+                        c.fill_rect(cx - s * 0.65, cy + s * 1.2, s * 1.3, m.dp(1.7), ink);
+                    }
                 } else {
                     for k in 0..pts.len() {
                         let (a, b) = (pts[k], pts[(k + 1) % pts.len()]);

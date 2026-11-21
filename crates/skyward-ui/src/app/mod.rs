@@ -93,6 +93,7 @@ pub enum Screen {
     CropWallpaper,
     Reboot,
     Wipe,
+    FormatData,
     /// Mounting and unmounting the slot's partitions.
     Mount,
     Install,
@@ -258,6 +259,8 @@ pub enum Action {
     Sideload,
     /// Inspect a signed non-A/B OTA over USB.
     SideloadPreflight,
+    /// Acknowledge the unverified signature of the current ZIP only.
+    AllowUnverifiedZip,
     /// Send the image to one of the partitions it fits.
     FlashPartition(usize),
     /// Send the image to these slots.
@@ -513,6 +516,8 @@ pub enum Effect {
     Wipe(Vec<Wipe>),
     /// Install the update held for the user to agree to.
     Install,
+    /// Run the current ZIP after its unverified-signature confirmation.
+    InstallUnverifiedZip,
     /// Forget what the system asked of the recovery, so that the next start
     /// goes where its reboot reason says.
     Dismiss,
@@ -571,10 +576,10 @@ pub enum Effect {
     /// a folder of their own in `place`, telling how it goes with
     /// [`App::backup_started`], [`App::backup_plan`], [`App::backup_at`]
     /// and [`App::backup_ended`].
-    Backup { parts: [bool; 4], place: Place, compress: bool, verify: bool },
+    Backup { parts: [bool; 5], place: Place, compress: bool, verify: bool },
     /// Restore the parts ticked of the backup in the folder `name` of
     /// `place`, telling how it goes as a backup does.
-    Restore { place: Place, name: String, parts: [bool; 4] },
+    Restore { place: Place, name: String, parts: [bool; 5] },
     /// Read and check the whole selected backup without starting a restore.
     VerifyBackup { place: Place, name: String },
     /// Look for backups in the places that can be read, telling what is

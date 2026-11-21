@@ -25,6 +25,9 @@ impl App {
     /// `rows` by `cols`.
     pub fn term_started(&mut self, rows: u16, cols: u16) {
         self.term = Some(Term::new(rows, cols));
+        if self.screen() == Screen::Terminal {
+            self.term_letters();
+        }
         self.refresh();
     }
 
@@ -49,30 +52,25 @@ impl App {
         }
     }
 
+    pub(super) fn term_letters(&mut self) {
+        self.state.layer = self.term.as_mut().map_or(Layer::Letters, Term::letter_layer);
+    }
+
     /// A key of the keyboard on the terminal page. The layer keys change
     /// the keyboard; every other key goes to the shell, and once the shell
     /// has ended, Enter starts another.
-    pub(super) fn term_typed(&mut self, cap: Cap) -> Vec<Effect> {
-        match cap {
-            Cap::Shift => self.state.layer = if self.state.layer == Layer::Shifted { Layer::Letters } else { Layer::Shifted },
-            Cap::Show(layer) => self.state.layer = layer,
-            _ => {}
-        }
-        let shifted = self.state.layer == Layer::Shifted;
-        if shifted && matches!(cap, Cap::Char(_)) {
-            self.state.layer = Layer::Letters;
-        }
-        self.refresh();
+    pub(super) fn term_typed(&mut self, cap: Cap, now: u64) -> Vec<Effect> {
         let Some(term) = self.term.as_mut() else { return Vec::new() };
-        if !term.running {
-            return if cap == Cap::Enter { vec![Effect::StartShell(self.shell_folder.clone())] } else { Vec::new() };
-        }
-        let bytes = term.typed(cap, shifted);
-        if bytes.is_empty() {
-            Vec::new()
+        let layer = self.state.layer;
+        self.state.layer = term.keyboard_press(layer, cap, now);
+        let effects = if !term.running {
+            if cap == Cap::Enter { vec![Effect::StartShell(self.shell_folder.clone())] } else { Vec::new() }
         } else {
-            vec![Effect::TermInput(bytes)]
-        }
+            let bytes = term.typed(cap, layer.uppercase());
+            if bytes.is_empty() { Vec::new() } else { vec![Effect::TermInput(bytes)] }
+        };
+        self.refresh();
+        effects
     }
 
     /// Scroll the terminal's screen or the editor's text as a finger goes
@@ -113,6 +111,7 @@ mod tests {
         let (rows, cols) = app.term_size(&f);
         assert!(rows >= 20 && cols >= 40, "a screen of {rows} rows by {cols}");
         app.term_started(rows, cols);
+        app.state.vibrate = false;
         assert_eq!(tap(&mut app, &f, &i, Action::Type(Cap::Char('l'))), vec![Effect::TermInput(b"l".to_vec())]);
         assert_eq!(tap(&mut app, &f, &i, Action::Type(Cap::Enter)), vec![Effect::TermInput(b"\r".to_vec())]);
         assert!(tap(&mut app, &f, &i, Action::TermKey(TermKey::Ctrl)).is_empty());
@@ -127,6 +126,48 @@ mod tests {
     }
 
     #[test]
+    fn terminal_shift_double_tap_locks_until_released_and_survives_symbols() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Terminal, W, H, PPD);
+        app.state.vibrate = false;
+        let (rows, cols) = app.term_size(&f);
+        app.term_started(rows, cols);
+        let mut press = |cap, now| tap_at(&mut app, &f, &i, Action::Type(cap), now);
+
+        press(Cap::Shift, 100);
+        assert_eq!(press(Cap::Char('a'), 160), vec![Effect::TermInput(b"A".to_vec())]);
+        assert_eq!(press(Cap::Char('b'), 220), vec![Effect::TermInput(b"b".to_vec())]);
+        press(Cap::Shift, 300);
+        press(Cap::Shift, 1000);
+        assert_eq!(press(Cap::Char('c'), 1050), vec![Effect::TermInput(b"c".to_vec())], "slow taps toggle without locking");
+
+        press(Cap::Shift, 1200);
+        press(Cap::Shift, 1400);
+        assert_eq!(press(Cap::Char('s'), 1500), vec![Effect::TermInput(b"S".to_vec())], "quick double tap locks");
+        assert_eq!(press(Cap::Char('k'), 1600), vec![Effect::TermInput(b"K".to_vec())]);
+        press(Cap::Show(Layer::Digits), 1700);
+        press(Cap::Show(Layer::Symbols), 1800);
+        assert_eq!(press(Cap::Char('_'), 1900), vec![Effect::TermInput(b"_".to_vec())]);
+        press(Cap::Show(Layer::Letters), 2000);
+        assert_eq!(press(Cap::Char('y'), 2100), vec![Effect::TermInput(b"Y".to_vec())], "symbol entry does not unlock capitals");
+        press(Cap::Shift, 2200);
+        assert_eq!(press(Cap::Char('z'), 2300), vec![Effect::TermInput(b"z".to_vec())]);
+    }
+
+    #[test]
+    fn terminal_keyboard_respects_the_touch_vibration_setting() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Terminal, W, H, PPD);
+        let (rows, cols) = app.term_size(&f);
+        app.term_started(rows, cols);
+        let letter = Action::Type(Cap::Char('a'));
+        assert_eq!(tap_at(&mut app, &f, &i, letter, 100), vec![Effect::Haptic, Effect::TermInput(b"a".to_vec())]);
+        assert_eq!(tap_at(&mut app, &f, &i, Action::TermKey(TermKey::Tab), 200), vec![Effect::Haptic, Effect::TermInput(b"\t".to_vec())]);
+        app.state.vibrate = false;
+        assert_eq!(tap_at(&mut app, &f, &i, letter, 300), vec![Effect::TermInput(b"a".to_vec())]);
+    }
+
+    #[test]
     fn the_file_managers_button_opens_the_terminal_in_the_folder_shown() {
         let (f, i) = (fonts(), info());
         let mut app = App::new(Screen::Files, W, H, PPD);
@@ -137,7 +178,7 @@ mod tests {
         let (rows, cols) = app.term_size(&f);
         app.term_started(rows, cols);
         app.term_ended(TermEnd::Exited(0));
-        assert_eq!(tap(&mut app, &f, &i, Action::Type(Cap::Enter)), vec![Effect::StartShell("/sdcard/Download".into())], "Enter starts it again there");
+        assert_eq!(tap(&mut app, &f, &i, Action::Type(Cap::Enter)), vec![Effect::Haptic, Effect::StartShell("/sdcard/Download".into())], "Enter starts it again there and vibrates");
         app.term_started(rows, cols);
         tap_back(&mut app, &f, &i, 0);
         app.set_files("/data/adb".into(), Ok(Vec::new()), 0);

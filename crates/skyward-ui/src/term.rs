@@ -6,11 +6,13 @@ use crate::color::{mix, Rgba};
 use crate::font::Fonts;
 use crate::geom::Rect;
 use crate::theme::Theme;
-use crate::widgets::{self, Cap};
+use crate::widgets::{self, Cap, Layer};
 use std::num::NonZeroU16;
 
 /// Lines kept above the screen to scroll back to.
 const SCROLLBACK: usize = 2000;
+/// The second Shift press must follow the first this quickly.
+const SHIFT_DOUBLE_TAP_MS: u64 = 450;
 
 /// Type size, line pitch and inner padding of the screen, in dp.
 const TEXT_DP: f32 = 13.0;
@@ -48,13 +50,15 @@ pub struct Term {
     pub running: bool,
     /// Ctrl is held for the next key typed.
     pub ctrl: bool,
+    shift_tap: Option<u64>,
+    caps_locked: bool,
 }
 
 impl Term {
     /// A blank screen of `rows` by `cols` for a shell that has just started.
     pub fn new(rows: u16, cols: u16) -> Term {
         let (rows, cols) = (NonZeroU16::new(rows).expect("a screen has rows"), NonZeroU16::new(cols).expect("a screen has columns"));
-        Term { parser: vt100::Parser::new(rows, cols, SCROLLBACK), running: true, ctrl: false }
+        Term { parser: vt100::Parser::new(rows, cols, SCROLLBACK), running: true, ctrl: false, shift_tap: None, caps_locked: false }
     }
 
     pub fn screen(&self) -> &vt100::Screen {
@@ -74,6 +78,35 @@ impl Term {
         let screen = self.parser.screen_mut();
         let at = screen.scrollback().saturating_add_signed(rows);
         screen.set_scrollback(at);
+    }
+
+    /// Show letters, retaining the lock but dropping a one-shot Shift.
+    pub(crate) fn letter_layer(&mut self) -> Layer {
+        self.shift_tap = None;
+        if self.caps_locked { Layer::CapsLocked } else { Layer::Letters }
+    }
+
+    /// The layout after this tap. An intervening key cancels the double tap.
+    pub(crate) fn keyboard_press(&mut self, layer: Layer, cap: Cap, now: u64) -> Layer {
+        let previous = self.shift_tap.take();
+        match cap {
+            Cap::Shift if self.caps_locked => {
+                self.caps_locked = false;
+                Layer::Letters
+            }
+            Cap::Shift if layer == Layer::Shifted => {
+                self.caps_locked = previous.is_some_and(|at| now.saturating_sub(at) <= SHIFT_DOUBLE_TAP_MS);
+                self.letter_layer()
+            }
+            Cap::Shift => {
+                self.shift_tap = Some(now);
+                Layer::Shifted
+            }
+            Cap::Show(Layer::Letters) => self.letter_layer(),
+            Cap::Show(layer) => layer,
+            Cap::Char(ch) if layer == Layer::Shifted && ch.is_ascii_alphabetic() => Layer::Letters,
+            _ => layer,
+        }
     }
 
     /// What a key of the keyboard sends; `shifted` makes a letter a
@@ -105,6 +138,7 @@ impl Term {
     /// program reading them has asked for: cursor keys, or the keys of an
     /// application.
     pub fn key(&mut self, key: TermKey) -> Vec<u8> {
+        self.shift_tap = None;
         if key == TermKey::Ctrl {
             self.ctrl = !self.ctrl;
             return Vec::new();

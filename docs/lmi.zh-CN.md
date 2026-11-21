@@ -28,10 +28,34 @@
 | 解密前基础设置 | 旧版六项设置已完整迁移到 `/metadata/skyward/settings.json`。再次启动时，语言、主题、亮度、振动、屏幕关闭时间和时区在解密前均已恢复。语言选项位于设置页面；未解密切换 English 和浅色后，配置文件回读核对通过 |
 | 独立校验备份 | 临时启动后，原备份可以开始校验、显示进度并停止；原备份仍可打开，重新完整校验通过。只校验，未执行恢复 |
 | 本地 IMG 与 ZIP 确认 | 临时启动候选版后，匹配 ROM ZIP 验签通过并在确认前取消；无效 IMG 被拒绝，现用 boot 镜像可在确认前返回取消。用现用镜像原样写回 boot 和 recovery，均完成完整分区回读。返回 Android 后两个分区 SHA-256 与原件一致，SukiSU Root 可用 |
+| 格式化 Data、刷入 LOS 与首次开机 | Redmi K30 Pro 临时启动通用安装候选后，完整格式化 Data 成功。官方 LineageOS 23.2（2026-11-18，lmi）经 ADB sideload 验签并实际安装。首次开机进入桌面，ADB 核对 Android 16、开机结束、F2FS 可读写和文件级加密生效 |
 
-实机验证范围限于上述 Redmi K30 Pro 和 Infinity-X 构建。合版验证了只读预检以及解密服务和挂载的正常释放。实际 ROM 写入由此前的安装版验证。未接通的菜单和完整恢复的限制见首页。 [当前限制](../README.zh-CN.md#当前限制)
+实机验证覆盖 Redmi K30 Pro 上的 Infinity-X 3.12 和上述 LineageOS 23.2 构建。早期安装版验证了 Infinity-X 同版重装，通用安装候选验证了从 Infinity-X 切换到 LineageOS。未接通的菜单和完整恢复的限制见首页。 [当前限制](../README.zh-CN.md#当前限制)
+
+## 通用 ZIP 安装
+
+在「安装」中可选择「ADB sideload 安装 ZIP」「从内部存储安装」或「从 U 盘安装」。从内部存储选包需要先用当前系统 PIN 解密。支持有 `lmi` 声明的完整非 A/B Block OTA，以及使用 `META-INF/com/google/android/update-binary` 的脚本 ZIP，例如部分 GApps 和内核包。A/B `payload.bin`、增量 OTA、声明其他设备的包以及双系统包会被拒绝。没有机型声明的脚本 ZIP 仍需自行确认适配；界面无法列出这类脚本实际会改哪些分区。
+
+安装器默认用基础 Recovery 和构建时加入的 OTA 公钥验签。公开的 AOSP 测试密钥可以验证签名与内容是否匹配，不能认证发布者。此类包会标为「公开测试签名，来源未验证」，也需单次放行。SHA-256 用来核对选中的文件，无需为每个 ROM 添加摘要白名单。若确认来源和兼容性，可在当前 ZIP 的确认页单次放行未通过可信验签的包，然后滑动安装。其他 ZIP 仍需重新确认。未放行、未滑动到底或返回时，不会运行包内程序。
+
+通过 OTG 接入 FAT32 或 exFAT U 盘后，可直接选择 ZIP。确认前拔盘会退出当前校验或确认页，重新接入后需重新选包。滑动确认后请保持 U 盘连接，直至安装结束。
+
+「ADB sideload 只读预检」只接受可用内置公钥验证签名的包，并在结果里区分正式签名和公开测试签名。预检只读包和声明，不运行脚本。确认页不能预测脚本的全部行为，也不能证明跨 ROM 后原数据仍能使用。通用 ADB 路径已实机刷入上述 LineageOS。正式 ROM 经内部存储或 U 盘写入，以及具体脚本 ZIP 兼容性仍待验证。
+
+### 电脑端只读回归
+
+使用 2026 年 11 月 18 日的官方 LineageOS 23.2 `lmi` ZIP 与 2026 年 10 月 29 日的 Infinity-X 3.12 `lmi` ZIP。`base-otacerts.zip` 从保持原样的基础 Recovery 取出，已包含 LineageOS 官方公钥和 AOSP 公开测试公钥。运行后检查签名、完整文件摘要，以及 `system`、`vendor`、`product`、`odm`、`system_ext` 和 `boot`、`dtbo`、`vbmeta`、`vbmeta_system`。测试不会执行 ZIP 的程序。
+
+```sh
+export SKYWARD_LMI_BASE_CERTS=/path/to/base-otacerts.zip
+export SKYWARD_LMI_LOS_ZIP=/path/to/lineage-23.2-20261118-nightly-lmi-signed.zip
+export SKYWARD_LMI_INFINITY_ZIP=/path/to/Project_Infinity-X-3.12-lmi-29.10.2026-GAPPS-UNOFFICIAL.zip
+cargo test --release --locked -p skyward-install --test lmi_preflight -- --ignored --nocapture
+```
 
 ## 临时启动与同版重装
+
+以下同版重装记录使用了旧版固定包安装器。测试新版通用流程时，以「通用 ZIP 安装」中的入口和验签规则为准。
 
 以下命令使用 `skyward-lmi.img` 作为构建产物的文件名。使用已有候选镜像时，请填入实际文件名，并核对本页的 SHA-256。
 
@@ -69,15 +93,33 @@
 
 ## 数据备份
 
-进入合版 Skyward 后，先在「解密」中输入当前 Android 的原 PIN，再打开「备份」，选择 `data` 分区、压缩和完成后校验。备份完成后可在「恢复」查看备份时间、大小和来源。
+进入 Skyward 后，先用当前 Android 的 PIN 解密，再打开「备份」。可单独或同时勾选「data 分区」和「共享文件」，目标可选内部存储或经 OTG 接入的 U 盘。每份备份放在 `Skyward/backups/`，由 `backup.toml` 和连续编号的分卷组成。复制时请带齐整个目录。
 
-备份保存在内部存储的 `Skyward/backups/`，每份由 `backup.toml` 和连续编号的分卷组成，复制时请带齐整个目录。文件备份涵盖应用及其数据、账户数据库和系统设置。共享存储（照片、下载等）、存储密钥、相关锁屏文件和指纹等需要按各自的方式保留。恢复 `/data` 会覆盖备份范围内的数据，并要求仍使用创建这份备份时的加密数据分区。恢复出厂设置后，Skyward 会拒绝写入此前的 `data` 备份。
+- **data 分区**涵盖应用及其数据、账户数据库和系统设置。恢复需使用创建备份时的加密数据分区，并会覆盖该备份范围内的数据。
+- **共享文件**涵盖机主的照片、下载等普通文件，跳过 `Skyward/backups/`。恢复时采用当前机主存储的权限，把文件放入 `Skyward/restored/` 下的新目录。结果页会显示路径。
+
+准备清除用户数据时，请保留一份已校验的外部备份。重置后解密新系统的内部存储，在恢复页只勾选「共享文件」；原 `data` 归档仍要求原加密密钥。
 
 ### 独立校验备份
 
 在「恢复」中打开一份备份，选择「校验备份」。校验会读取备份清单和全部编号分卷，核对文件长度、解压后的长度和 SHA-256。页面显示进度并支持停止；停止不会删除原备份。校验期间暂时撤出 MTP 存储，结束后恢复原文件传输设置。
 
 校验通过仅说明内容与备份清单一致，不能代替恢复前的设备和加密密钥检查。清单与内容可以同时被改动，因此该检查也不用于认证来源。电脑端已覆盖普通、压缩、分卷、缺失、损坏、取消及压缩尾部残留等测试。在本页所列 lmi 与 Infinity-X 构建上，已临时启动并验证入口、进度、停止，以及同一备份重新完整校验通过；未执行恢复。
+
+### 使用 OTG U 盘
+
+通过 OTG 接入 FAT32 或 exFAT U 盘。把完整备份目录（含 `backup.toml` 和全部分卷）放在 U 盘的 `Skyward/backups/` 下，再进入「恢复」。外部备份在未解密时也能查看和校验；解密后，内外两处的备份会一起列出，详情页会标明来源。拔出 U 盘后，外部备份从列表移除，正在读盘的校验或复制会中止或报错。
+
+- **备份到 U 盘**：先完成解密，再在「备份 → 存放位置」选 U 盘，滑动确认后写入。候选版会校验所有分卷，再显示完成。等结果页出现后再拔盘。备份未加密，可能含有应用资料，请妥善保管 U 盘。
+- **从 U 盘恢复**：完成解密后打开备份详情。滑动确认后，Skyward 先将所选内容的分卷暂存到本机，校验内容并检查设备和可用空间。选中 data 时还会核对数据密钥。内部存储需要同时容纳分卷和预留的解包空间；空间不足会在写入前停止。只恢复你自己生成的备份。恢复出厂设置后，原有 data 备份无法还原。
+
+exFAT 只读挂载、校验、重新插拔、备份取消和合成数据备份恢复均已在 lmi 实测。FAT32 和整份 data 恢复尚未实测。
+
+## 清除数据
+
+「高级清除」可以分别勾选应用私有数据、内部存储、应用缓存、系统缓存和 Dalvik / ART 缓存。先解密全部用户，再滑动确认。识别到 ROM 的独立 cache 分区时可单选该分区。
+
+「格式化 data」有独立确认页。它会清除 userdata、metadata 及已识别的独立 cache，手机内部的备份也在清除范围内。开始前请核对外部备份，重启后 Android 会重建加密数据分区。
 
 ## 永久安装与回退
 
@@ -133,9 +175,8 @@ for name in aw8697_haptic.bin aw8697_rtp_1.bin; do
 done
 
 target/release/skyward-pack preview-ui \
-  --read-only --block-ota-preflight \
+  --read-only --lmi-zip-install \
   --data-readonly --lmi-data-backup --lmi-apex-files inputs/lmi-apex \
-  --block-ota-install 9cf66b7fa39e1f5afd2b22dfdb13739bbba6140c9456ab659e1df2434933843e \
   --base inputs/recovery.img \
   --binary target/aarch64-linux-android/release/skyward \
   --config devices/lmi.toml \
@@ -147,6 +188,8 @@ target/release/skyward-pack preview-ui \
 sha256sum skyward-lmi.img
 ```
 
+`--lmi-ota-certs` 为可选参数。这里所用的基础 Recovery 已包含 LineageOS 官方公钥。为其他基础镜像加入 LineageOS 签名时，先从 [LineageOS 官方验证器](https://github.com/LineageOS/update_verifier/blob/master/lineageos_pubkey) 取得公钥，再从官方 ROM 的 `META-INF/com/android/otacert` 提取 X.509 证书。用 `openssl x509 -pubkey -noout` 取出证书公钥，把两份公钥都用 `openssl pkey -pubin -outform DER` 转为同一格式，确认字节一致后，将证书保存为 `lineageos.x509.pem` 并打入 `inputs/lineage-ota-certs.zip`。本次核对的公钥 DER SHA-256 是 `0848ca38cb604887cea216a7f39d7dd62bad20b513cfdeff357ece4e731d6372`。不要将来源未经独立核对的 ZIP 自带证书导入可信库。
+
 ## 合版镜像核对
 
 已核对 Android v2 引导头、AVB 哈希描述符、内核、设备树、原 Recovery 的 OTA 证书及固定的 ROM 哈希。早期合版验证了按键冷启动和回退。壁纸与毛玻璃版使用同一份镜像进行临时测试和常驻安装，刷入后从 Android 核对了 recovery 分区和 SukiSU boot 的哈希。
@@ -155,6 +198,7 @@ sha256sum skyward-lmi.img
 
 | 文件 | 实机测试或构建输入的 SHA-256 |
 | --- | --- |
+| `lmi-skyward-1.2.3.img`（v1.2.3） | `78e4174d31091d42deea923af789af3476b567c0b3a5bcdc8841757ebde9f7fe` |
 | `lmi-skyward-1.1.0.img`（v1.1.0） | `05ec4ad8ccdb54415df0d45eaf23d0b240fbc111badb4de384dd383659958661` |
 | `lmi-skyward-backup-verify-test-v1-20261118.img`（独立备份校验版） | `816e4fc083b8588322fed39d731c8da46f3e66dc95940d48b03a3e024e4be850` |
 | `lmi-skyward-settings-preunlock-test-v4-20261118.img`（解密前基础设置版） | `522d5f1251a4fef00e29d811c7263c96474bb906a7ee11b734b10b6c9074b365` |

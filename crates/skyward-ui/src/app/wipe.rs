@@ -7,6 +7,8 @@ use super::*;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Wipe {
     All,
+    /// Data contents while keeping shared storage and encryption keys.
+    DataKeepMedia,
     /// Each app's own data, for every user.
     AppData,
     /// The files users share between apps.
@@ -23,9 +25,31 @@ pub enum Wipe {
     Updates,
 }
 
+impl Wipe {
+    pub(super) fn conflicts_while_keeping_media(self, other: Self) -> bool {
+        matches!((self, other),
+            (Self::DataKeepMedia, Self::Media | Self::AppCaches)
+            | (Self::Media | Self::AppCaches, Self::DataKeepMedia))
+    }
+}
+
 /// What the wipe page offers, in the order it lists them.
-pub const WIPES: [Wipe; 9] =
-    [Wipe::All, Wipe::AppData, Wipe::Media, Wipe::AppCaches, Wipe::SystemCaches, Wipe::Art, Wipe::Logs, Wipe::Updates, Wipe::Cache];
+pub const WIPES: [Wipe; 10] =
+    [Wipe::All, Wipe::DataKeepMedia, Wipe::AppData, Wipe::Media, Wipe::AppCaches, Wipe::SystemCaches, Wipe::Art, Wipe::Logs, Wipe::Updates, Wipe::Cache];
+
+const LMI_WIPES: &[Wipe] = &[Wipe::DataKeepMedia, Wipe::AppData, Wipe::Media, Wipe::AppCaches, Wipe::SystemCaches, Wipe::Art, Wipe::Cache];
+
+impl State {
+    pub(crate) fn lmi_wipe_data_open(&self) -> bool {
+        self.data == Data::Open && !self.lmi_wipe_locked_profiles
+    }
+
+    pub(crate) fn lmi_wipe_offers(&self, item: Wipe) -> bool {
+        LMI_WIPES.contains(&item)
+            && (item != Wipe::DataKeepMedia || self.lmi_data_keep_media)
+            && (item != Wipe::Cache || self.cache_partition)
+    }
+}
 
 /// A part of the phone that erasing goes through, in the order it does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,6 +59,8 @@ pub enum Part {
     Cache,
     /// /metadata, which holds the key the data partition is opened with.
     Metadata,
+    /// Data contents while retaining shared storage and encryption.
+    DataKeepMedia,
     /// The parts of the data partition the wipe page names.
     AppData,
     Media,
@@ -78,6 +104,10 @@ pub enum EraseStop {
     Erased,
     /// The data partition did not open, so nothing in it was erased: why.
     Closed(String),
+    /// The selected work failed validation and made no changes.
+    Preflight(String),
+    /// App Keystore cleanup stopped before wiping the selected files.
+    KeyCleanup(String),
     /// These users' own files are locked, and what was chosen is partly in
     /// them: nothing was erased.
     Locked(Vec<u32>),
@@ -136,6 +166,129 @@ impl App {
 mod tests {
     use super::*;
     use crate::app::testing::*;
+
+    #[test]
+    fn lmi_advanced_wipe_can_select_app_data_and_art_independently() {
+        let (f, i) = (fonts(), info());
+        let mut app = opened(Screen::Wipe, &f, &i);
+        app.state.lmi_wipe = true;
+        app.data_waiting(None);
+        let actions: Vec<_> = app.frame(&f, &i).hits.iter().map(|hit| &hit.action).collect();
+        assert!(actions.contains(&&Action::WipeItem(Wipe::AppData)));
+        assert!(actions.contains(&&Action::WipeItem(Wipe::Media)));
+        assert!(actions.contains(&&Action::WipeItem(Wipe::Art)));
+        assert!(!actions.contains(&&Action::WipeItem(Wipe::All)));
+        tap(&mut app, &f, &i, Action::WipeItem(Wipe::AppData));
+        tap_at(&mut app, &f, &i, Action::WipeItem(Wipe::Art), 1000);
+        assert_eq!(app.confirmed(Confirm::Wipe, 2000), vec![Effect::Wipe(vec![Wipe::AppData, Wipe::Art])]);
+    }
+
+    #[test]
+    fn lmi_data_wipe_is_unavailable_by_default() {
+        let (f, i) = (fonts(), info());
+        let mut app = opened(Screen::Wipe, &f, &i);
+        app.state.lmi_wipe = true;
+        app.data_waiting(None);
+        assert!(!app.frame(&f, &i).hits.iter().any(|h| h.action == Action::WipeItem(Wipe::DataKeepMedia)));
+        assert!(app.act(Action::WipeItem(Wipe::DataKeepMedia), 0).is_empty());
+        assert!(!app.state.wipe[WIPES.iter().position(|w| *w == Wipe::DataKeepMedia).unwrap()]);
+        assert!(app.confirmed(Confirm::Wipe, 1000).is_empty());
+    }
+
+    #[test]
+    fn opted_in_lmi_data_wipe_requires_unlock_and_excludes_shared_storage_wipes() {
+        let (f, i) = (fonts(), info());
+        let mut app = opened(Screen::Wipe, &f, &i);
+        app.state.lmi_wipe = true;
+        app.state.lmi_data_keep_media = true;
+        app.data_waiting(None);
+        assert!(app.frame(&f, &i).hits.iter().any(|hit| hit.action == Action::WipeItem(Wipe::DataKeepMedia)));
+
+        for other in [Wipe::Media, Wipe::AppCaches] {
+            tap(&mut app, &f, &i, Action::WipeItem(other));
+            tap(&mut app, &f, &i, Action::WipeItem(Wipe::DataKeepMedia));
+            assert_eq!(app.confirmed(Confirm::Wipe, 1000), vec![Effect::Wipe(vec![Wipe::DataKeepMedia])]);
+            tap(&mut app, &f, &i, Action::WipeItem(other));
+            assert_eq!(app.confirmed(Confirm::Wipe, 1000), vec![Effect::Wipe(vec![other])]);
+            tap(&mut app, &f, &i, Action::WipeItem(other));
+        }
+
+        tap(&mut app, &f, &i, Action::WipeItem(Wipe::DataKeepMedia));
+        app.state.lmi_wipe_locked_profiles = true;
+        assert!(app.confirmed(Confirm::Wipe, 1000).is_empty());
+        app.state.lmi_wipe_locked_profiles = false;
+        app.data_waiting(Some((0, Keys::Digits)));
+        assert!(app.confirmed(Confirm::Wipe, 1000).is_empty());
+    }
+
+    #[test]
+    fn data_keep_media_is_only_offered_on_the_lmi_runtime() {
+        let (f, i) = (fonts(), info());
+        let mut app = opened(Screen::Wipe, &f, &i);
+        app.state.lmi_data_keep_media = true;
+        assert!(!app.frame(&f, &i).hits.iter().any(|h| h.action == Action::WipeItem(Wipe::DataKeepMedia)));
+        assert!(app.act(Action::WipeItem(Wipe::DataKeepMedia), 0).is_empty());
+        assert!(!app.state.wipe[WIPES.iter().position(|w| *w == Wipe::DataKeepMedia).unwrap()]);
+    }
+
+    #[test]
+    fn lmi_format_data_has_a_separate_confirmation_without_decryption() {
+        let (f, i) = (fonts(), info());
+        let mut app = opened(Screen::Wipe, &f, &i);
+        app.state.lmi_wipe = true;
+        app.state.lmi_format_data = true;
+        app.state.cache_partition = true;
+        app.data_waiting(Some((0, Keys::Digits)));
+        let actions = &app.frame(&f, &i).hits;
+        assert!(actions.iter().any(|hit| hit.action == Action::Open(Screen::FormatData)));
+        assert!(actions.iter().all(|hit| hit.action != Action::Confirm(Confirm::FactoryReset)));
+        assert!(app.confirmed(Confirm::FactoryReset, 0).is_empty());
+
+        app.open(Screen::FormatData);
+        assert_eq!(swipe(&mut app, &f, &i, Confirm::FactoryReset), vec![Effect::FactoryReset]);
+        app.state.lmi_format_data = false;
+        assert!(app.confirmed(Confirm::FactoryReset, 1000).is_empty());
+    }
+
+    #[test]
+    fn lmi_cache_partition_can_be_selected_by_itself_before_unlocking() {
+        let (f, i) = (fonts(), info());
+        let mut app = opened(Screen::Wipe, &f, &i);
+        app.state.lmi_wipe = true;
+        app.state.cache_partition = true;
+        app.data_waiting(Some((0, Keys::Digits)));
+        tap(&mut app, &f, &i, Action::WipeItem(Wipe::Cache));
+        assert_eq!(app.confirmed(Confirm::Wipe, 1000), vec![Effect::Wipe(vec![Wipe::Cache])]);
+        tap_at(&mut app, &f, &i, Action::WipeItem(Wipe::Media), 2000);
+        assert!(app.confirmed(Confirm::Wipe, 2500).is_empty());
+    }
+
+    #[test]
+    fn lmi_wipe_requires_all_users_unlocked_for_data_contents() {
+        let (f, i) = (fonts(), info());
+        let mut app = opened(Screen::Wipe, &f, &i);
+        app.state.lmi_wipe = true;
+        app.refresh();
+        let hits = &app.frame(&f, &i).hits;
+        let choices: Vec<Wipe> = hits.iter().filter_map(|hit| match hit.action {
+            Action::WipeItem(wipe) => Some(wipe),
+            _ => None,
+        }).collect();
+        assert_eq!(choices, [Wipe::AppData, Wipe::Media, Wipe::AppCaches, Wipe::SystemCaches, Wipe::Art]);
+        assert!(hits.iter().any(|h| h.action == Action::Open(Screen::Decrypt)));
+        assert!(!hits.iter().any(|h| h.action == Action::Confirm(Confirm::Wipe)));
+
+        app.data_waiting(Some((10, Keys::Digits)));
+        assert!(!app.frame(&f, &i).hits.iter().any(|h| h.action == Action::Confirm(Confirm::Wipe)));
+        app.data_waiting(None);
+        app.state.lmi_wipe_locked_profiles = true;
+        assert!(!app.frame(&f, &i).hits.iter().any(|h| h.action == Action::Confirm(Confirm::Wipe)));
+        app.state.lmi_wipe_locked_profiles = false;
+        tap(&mut app, &f, &i, Action::WipeItem(Wipe::SystemCaches));
+        assert_eq!(swipe(&mut app, &f, &i, Confirm::Wipe), vec![Effect::Wipe(vec![Wipe::SystemCaches])]);
+        tap(&mut app, &f, &i, Action::WipeItem(Wipe::AppCaches));
+        assert_eq!(swipe(&mut app, &f, &i, Confirm::Wipe), vec![Effect::Wipe(vec![Wipe::AppCaches, Wipe::SystemCaches])]);
+    }
 
     #[test]
     fn the_cant_start_page_retries_looks_around_or_erases() {

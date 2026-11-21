@@ -11,7 +11,7 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
@@ -112,20 +112,42 @@ impl Managed {
         Ok(started)
     }
 
+    pub fn last_pid(&mut self) -> Result<u32> {
+        let child = self.0.last_mut().context("no managed service is running")?;
+        ensure!(child.try_wait()?.is_none(), "the last managed service already exited");
+        Ok(child.id())
+    }
+
+    pub fn stop_last(&mut self, expected: u32) -> Result<()> {
+        let child = self.0.last_mut().context("no managed service to stop")?;
+        ensure!(child.id() == expected, "managed service changed before shutdown");
+        ensure!(child.try_wait()?.is_none(), "the Keystore service exited before shutdown");
+        child.kill().context("stop the native Keystore child")?;
+        let status = child.wait().context("wait for the native Keystore child")?;
+        self.0.pop();
+        ensure!(status.signal() == Some(libc::SIGKILL), "the Keystore service stopped unexpectedly");
+        Ok(())
+    }
+
     pub fn stop(&mut self) -> Result<()> {
         for child in self.0.iter_mut().rev() {
-            if child.try_wait()?.is_none() {
-                if let Err(error) = child.kill()
-                    && child.try_wait()?.is_none()
-                {
-                    return Err(error).with_context(|| format!("stop recovery service {}", child.id()));
-                }
-                child.wait().with_context(|| format!("wait for recovery service {}", child.id()))?;
-            }
+            stop_child(child)?;
         }
         self.0.clear();
         Ok(())
     }
+}
+
+fn stop_child(child: &mut Child) -> Result<()> {
+    if child.try_wait()?.is_none() {
+        if let Err(error) = child.kill()
+            && child.try_wait()?.is_none()
+        {
+            return Err(error).with_context(|| format!("stop recovery service {}", child.id()));
+        }
+        child.wait().with_context(|| format!("wait for recovery service {}", child.id()))?;
+    }
+    Ok(())
 }
 
 impl Drop for Managed {

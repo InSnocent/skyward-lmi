@@ -184,13 +184,15 @@ impl Folder {
 /// Whether a list in a place shows an entry: a folder, or a file the
 /// installer takes. Hidden entries are left out, as the stock file manager
 /// leaves them out.
-fn installable(e: &FileRow) -> bool {
+fn installable(e: &FileRow, zip_only: bool) -> bool {
     if e.name.starts_with('.') {
         return false;
     }
     match e.kind {
         FileKind::Folder { .. } | FileKind::Link { folder: true, .. } => true,
-        FileKind::File | FileKind::Link { folder: false, .. } => installs(e),
+        FileKind::File | FileKind::Link { folder: false, .. } => {
+            installs(e) && (!zip_only || std::path::Path::new(&e.name).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("zip")))
+        }
         FileKind::Special => false,
     }
 }
@@ -300,7 +302,8 @@ impl App {
     /// the place's top, or could not: it becomes the folder shown to choose
     /// a file to install in, with what it holds that may be installed.
     pub fn set_place(&mut self, place: Place, folder: String, files: Result<Vec<FileRow>, String>, listed: i64) {
-        let files = files.map(|entries| entries.into_iter().filter(installable).collect());
+        let zip_only = self.state.lmi_zip_install && place == Place::UsbDrive;
+        let files = files.map(|entries| entries.into_iter().filter(|entry| installable(entry, zip_only)).collect());
         self.show_folder(Screen::Choose(place), folder, files, listed);
     }
 
@@ -309,14 +312,42 @@ impl App {
     /// and one shown while its page is up is read at once. The backups
     /// listed are looked for again, and a backup on a drive gone leaves its
     /// page.
-    pub fn set_usb_drive(&mut self, drive: Option<UsbDrive>) -> Vec<Effect> {
+    pub fn set_usb_drive(&mut self, drive: Option<UsbDrive>, now: u64) -> Vec<Effect> {
         if drive == self.state.usb_drive {
             return Vec::new();
         }
         self.state.usb_drive = drive;
         self.state.drive = Folder::new("");
+        let mut effects = Vec::new();
+        if self.screen() == Screen::Installing
+            && self.state.lmi_zip_install
+            && self.state.source.uses_usb_drive()
+            && !self.state.place_open(Place::UsbDrive)
+            && matches!(self.state.install, Install::Checking { .. } | Install::ConfirmingLmiZip { .. })
+        {
+            if matches!(self.drag, Drag::Confirm { .. }) {
+                self.drag = Drag::Held;
+            }
+            self.knob = None;
+            effects = self.back(now);
+            self.say(self.state.lang.pick(INSTALL_USB_DISCONNECTED), now);
+        }
+        if self.screen() == Screen::Backup && self.state.backup_to == Place::UsbDrive {
+            self.state.confirm = 0.0;
+            self.knob = None;
+            if matches!(self.drag, Drag::Confirm { .. }) {
+                self.drag = Drag::Held;
+            }
+        }
         self.refresh();
         let gone = !self.state.place_open(Place::UsbDrive) && self.state.restore.as_ref().is_some_and(|(e, _)| e.place == Place::UsbDrive);
+        if gone && self.screen() != Screen::RestoreBackup {
+            // In particular, don't go back to the old details after a job
+            // ends, even if another drive with the same folder name is now shown.
+            self.stack.retain(|(page, _, _)| *page != Screen::RestoreBackup);
+            self.state.restore = None;
+            self.state.asking_delete = false;
+        }
         match self.screen() {
             Screen::RestoreBackup if gone => {
                 self.state.restore = None;
@@ -330,9 +361,13 @@ impl App {
             Screen::Restore => return vec![self.find_backups()],
             _ => {}
         }
+        if self.screen() == Screen::Files && std::path::Path::new(&self.state.files.path).starts_with(USB_DRIVE) {
+            effects.push(Effect::ReadDir(self.state.files.path.clone()));
+            return effects;
+        }
         let page = Screen::Choose(Place::UsbDrive);
         if self.screen() != page {
-            return Vec::new();
+            return effects;
         }
         *self.top_mut() = (page, 0.0, Focus::Unset);
         self.fling = None;
@@ -340,7 +375,8 @@ impl App {
         self.seek = None;
         self.pull = 0.0;
         self.snap = true;
-        self.arrive_at(page)
+        effects.extend(self.arrive_at(page));
+        effects
     }
 
     /// `folder` becomes the one the list on page `screen` shows. A folder
@@ -465,6 +501,27 @@ mod tests {
     }
 
     #[test]
+    fn lmi_usb_picker_offers_zip_files_without_decryption() {
+        let (f, i) = (fonts(), info());
+        let mut app = opened(Screen::Install, &f, &i);
+        app.state.block_ota_install = true;
+        app.state.lmi_zip_install = true;
+        let page = Screen::Choose(Place::UsbDrive);
+        assert!(!app.state.data.storage_open());
+        assert!(app.frame(&f, &i).hits.iter().any(|hit| hit.action == Action::Open(page)));
+        assert!(tap(&mut app, &f, &i, Action::Open(page)).is_empty());
+        assert_eq!(app.screen(), page);
+        assert_eq!(app.set_usb_drive(Some(UsbDrive::Shown), 0), vec![Effect::ReadPlace(Place::UsbDrive, String::new())]);
+        app.set_place(Place::UsbDrive, String::new(), Ok(vec![
+            entry("ROMs", folder(2)), entry("update.ZIP", FileKind::File), entry("boot.img", FileKind::File),
+        ]), LISTED);
+        let names: Vec<_> = app.state.drive.entries.as_ref().unwrap().iter().map(|row| row.name.as_str()).collect();
+        assert_eq!(names, ["ROMs", "update.ZIP"]);
+        assert_eq!(tap_at(&mut app, &f, &i, Action::ChooseEntry(1), 1000),
+            vec![Effect::InstallFile(Place::UsbDrive, "update.ZIP".into())]);
+    }
+
+    #[test]
     fn a_usb_drive_shows_its_files_as_soon_as_it_is_plugged_in() {
         let (f, i) = (fonts(), info());
         let mut app = opened(Screen::Install, &f, &i);
@@ -472,7 +529,7 @@ mod tests {
         assert!(tap(&mut app, &f, &i, Action::Open(page)).is_empty(), "with no drive, nothing to read");
         assert_eq!(app.screen(), page);
         assert!(app.frame(&f, &i).rows.is_none(), "the page waits for one");
-        assert_eq!(app.set_usb_drive(Some(UsbDrive::Shown)), vec![Effect::ReadPlace(Place::UsbDrive, String::new())], "read once shown");
+        assert_eq!(app.set_usb_drive(Some(UsbDrive::Shown), 0), vec![Effect::ReadPlace(Place::UsbDrive, String::new())], "read once shown");
         app.set_place(Place::UsbDrive, String::new(), Ok(vec![entry("ROMs", folder(2))]), LISTED);
         assert_eq!(tap(&mut app, &f, &i, Action::ChooseEntry(0)), vec![Effect::ReadPlace(Place::UsbDrive, "ROMs".into())]);
         app.set_place(Place::UsbDrive, "ROMs".into(), Ok(vec![entry("boot.img", FileKind::File)]), LISTED);
@@ -481,13 +538,13 @@ mod tests {
         app.install(Event::Finished(Outcome::Failed(Failure::Unreadable("read /mnt/usb/ROMs/boot.img: Input/output error".into()))), 0);
         tap_at(&mut app, &f, &i, Action::Back, 1000);
         assert_eq!(app.screen(), page, "back to choose another");
-        assert!(app.set_usb_drive(None).is_empty());
+        assert!(app.set_usb_drive(None, 0).is_empty());
         assert_eq!(app.state.drive.path, "", "a drive pulled out leaves nothing of its folders");
         assert!(app.frame(&f, &i).rows.is_none(), "the page waits for another");
         assert!(app.key(Key::Back, 1000).is_empty());
         assert_eq!(app.screen(), Screen::Install);
         let unreadable = Some(UsbDrive::Unreadable("sdg holds no filesystem the kernel reads".into()));
-        assert!(app.set_usb_drive(unreadable).is_empty(), "another page reads nothing");
+        assert!(app.set_usb_drive(unreadable, 0).is_empty(), "another page reads nothing");
         assert!(tap_at(&mut app, &f, &i, Action::Open(page), 1000).is_empty(), "nothing on the drive can be read");
     }
 

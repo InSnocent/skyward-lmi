@@ -368,6 +368,31 @@ pub fn map_slot(slot: Slot) -> Result<SlotMaps> {
     Ok(maps)
 }
 
+/// Give a confirmed script ZIP the unsuffixed logical mapper devices it
+/// expects. Do not replace mappings owned by another part of recovery.
+pub fn map_unslotted() -> Result<SlotMaps> {
+    ensure!(crate::current_slot()?.is_none(), "expected a device without boot slots");
+    let super_dev = super_device();
+    let md = skyward_lp::read(&super_dev, 0)?;
+    let devices = block_devices(&md, &super_dev)?;
+    let mut maps = SlotMaps::default();
+    for p in inspection_partitions(&md.partitions) {
+        let mapped = (|| -> Result<()> {
+            ensure!(dm::status(&p.name)?.is_none(), "{} is already mapped", p.name);
+            dm::create(&p.name, &targets(p, &devices), false)?;
+            Ok(())
+        })();
+        if let Err(e) = mapped {
+            return Err(match unmap_slot(&maps) {
+                Ok(()) => e,
+                Err(r) => e.context(format!("undoing what was mapped before failed too: {r:#}")),
+            });
+        }
+        maps.made.push(p.name.clone());
+    }
+    Ok(maps)
+}
+
 /// Map partition `p` writable with `table`, or make the read-only mapping
 /// of it writable, keeping in `maps` what was done.
 fn map_writable(p: &Partition, table: Vec<dm::Target>, maps: &mut SlotMaps) -> Result<()> {

@@ -11,6 +11,7 @@ pub mod commands;
 pub mod fuse;
 pub mod image;
 pub mod keep;
+pub mod lmi_zip;
 pub mod local_image;
 pub mod ota;
 pub mod package;
@@ -89,6 +90,8 @@ pub enum Event {
     Ready { version: Option<String>, wipe: bool },
     /// The verified A-only OTA waits for confirmation before rewriting partitions.
     BlockReady(block_preflight::BlockPreflight),
+    /// An lmi ZIP, held until the user explicitly confirms the displayed file.
+    LmiZipReady(lmi_zip::Report),
     /// An update package passed the checks and is being installed; the
     /// version it brings.
     Installing { version: Option<String> },
@@ -175,6 +178,8 @@ pub enum Stage {
 pub enum Outcome {
     /// A verified non-A/B OTA inspected without running its updater.
     BlockPreflight(block_preflight::BlockPreflight),
+    /// A signed lmi ZIP was inspected without running its updater.
+    LmiZipPreflight(lmi_zip::Report),
     /// The update is in `slot`, which starts next; `wipe` when all user data
     /// is to be erased before it does.
     Installed { slot: Slot, wipe: bool },
@@ -241,6 +246,8 @@ pub enum Refusal {
     /// the phone's update keys, or not of the zip as it is, where the
     /// screen asked for one made with them.
     Unverified,
+    /// A read-only lmi preflight requires a trusted package signature.
+    LmiPreflightSignature { unsigned: bool },
     /// A system to install beside the installed one, which only someone
     /// at the screen installs, not the system.
     SystemAsked,
@@ -284,6 +291,8 @@ pub enum Command {
     /// Install the update held in [`Event::Ready`], or run the script held
     /// in [`Event::Script`].
     Install,
+    /// Confirm this one lmi ZIP after acknowledging it lacks a verified signature.
+    InstallUnverifiedZip,
     /// Install the system held in [`Event::System`] with a root of `size`
     /// bytes, one of those it offered.
     InstallSystem { size: u64 },

@@ -386,6 +386,13 @@ pub fn make_folder(path: &Path, ownership: Ownership) -> Result<()> {
     Ok(())
 }
 
+/// Give an already created work directory the attributes of its parent.
+pub fn inherit_folder(path: &Path, ownership: Ownership) -> Result<()> {
+    let into = path.parent().with_context(|| format!("{} is in no folder", path.display()))?;
+    ensure!(fs::symlink_metadata(path)?.is_dir(), "expected a work directory");
+    given(path, &give(into, ownership)?, true)
+}
+
 /// Make the file `path`, which is not there yet, given what `ownership`
 /// says as a copy into its folder would be, and open it to be written.
 pub fn make_file(path: &Path, ownership: Ownership) -> Result<File> {

@@ -143,10 +143,10 @@ fn verification_previews(out: &Path, root: &Path, fonts: &Fonts) -> Result<()> {
             app.state.dark = dark;
             app.state.data = Data::Open;
             let held = Held {
-                made: 1_793_000_000, size: 1_000_000, parts: [false, false, true, false],
+                made: 1_793_000_000, size: 1_000_000, parts: [false, false, true, false, false],
                 device: cfg.device.codename.clone(), system: Some("Infinity-X 3.12".into()), slot: None,
             };
-            app.state.restore = Some((BackupEntry { place: Place::Storage, name: "sample-backup".into(), held: Ok(held) }, [false, false, true, false]));
+            app.state.restore = Some((BackupEntry { place: Place::Storage, name: "sample-backup".into(), held: Ok(held) }, [false, false, true, false, false]));
             if name != "details" {
                 app.verification_started(Place::Storage);
                 app.backup_plan(vec![("data".into(), 2_000_000)]);
@@ -394,8 +394,8 @@ fn main() -> Result<()> {
         BackupEntry { place, name: fmt::stamp(made, 0), held: Ok(held) }
     };
     let backups = vec![
-        made(Place::Storage, 1_792_348_260, 6_214_000_000, [true, true, false, true], "OS4.0.4.0.XPACNXM"),
-        made(Place::UsbDrive, 1_791_830_000, 141_000_000, [true, false, false, false], "OS4.0.3.0.XPACNXM"),
+        made(Place::Storage, 1_792_348_260, 6_214_000_000, [true, true, false, true, false], "OS4.0.4.0.XPACNXM"),
+        made(Place::UsbDrive, 1_791_830_000, 141_000_000, [true, false, false, false, false], "OS4.0.3.0.XPACNXM"),
         BackupEntry {
             place: Place::Storage,
             name: "20261020-221500".into(),
@@ -430,7 +430,7 @@ fn main() -> Result<()> {
     };
     let job = |restore, plan: Vec<(String, u64)>, at, outcome| {
         let kind = if restore { BackupKind::Restore } else { BackupKind::Backup { checks: true } };
-        Some(BackupJob { kind, place: Place::Storage, plan, at, outcome, stopping: false })
+        Some(BackupJob { kind, place: Place::Storage, plan, staging: None, at, outcome, stopping: false })
     };
     let reset_asked = || Asked { reason: Some("factroy_reset(1217)".into()), ..Asked::default() };
     let in_download = |app: &mut App, name: &str| {
@@ -480,15 +480,15 @@ fn main() -> Result<()> {
         }),
         ("11-install-light-dual-boot", Screen::Install, false, &|app| app.state.dual_boot = true),
         ("11-install-dark-usb", Screen::Install, true, &|app| {
-            app.set_usb_drive(Some(UsbDrive::Shown));
+            app.set_usb_drive(Some(UsbDrive::Shown), 0);
         }),
         ("19-choose-usb-light-absent", usb_page, false, &|_| {}),
         ("19-choose-usb-dark-unreadable", usb_page, true, &|app| {
             let why = "sdg holds no filesystem the kernel reads: sdg1 as vfat: Invalid argument (os error 22); sdg1 as exfat: Invalid argument (os error 22); sdg1 as ntfs3: No such device (os error 19); sdg1 as ext4: Invalid argument (os error 22); sdg1 as f2fs: Invalid argument (os error 22)";
-            app.set_usb_drive(Some(UsbDrive::Unreadable(why.into())));
+            app.set_usb_drive(Some(UsbDrive::Unreadable(why.into())), 0);
         }),
         ("19-choose-usb-light", usb_page, false, &|app| {
-            app.set_usb_drive(Some(UsbDrive::Shown));
+            app.set_usb_drive(Some(UsbDrive::Shown), 0);
             let made = 1_790_380_800;
             let rows = vec![folder("ROMs", 4, made), file("boot.img", 100_663_296, made), file("ishtar-ota-OS3.0.306.0.WMACNXM.zip", 7_103_043_868, made)];
             app.set_place(Place::UsbDrive, String::new(), Ok(rows), LISTED);
@@ -571,23 +571,23 @@ fn main() -> Result<()> {
         ("43-search-dark-pinyin", Screen::Search, true, &|app| app.state.search = "zd".into()),
         ("44-backup-light", Screen::Backup, false, &|_| {}),
         ("45-backup-dark", Screen::Backup, true, &|app| {
-            app.set_usb_drive(Some(UsbDrive::Shown));
+            app.set_usb_drive(Some(UsbDrive::Shown), 0);
             app.state.backup_to = Place::UsbDrive;
         }),
         ("46-restore-light-none", Screen::Restore, false, &|_| {}),
         ("47-restore-light", Screen::Restore, false, &|app| app.set_backups(backups.clone())),
         ("48-restore-backup-light", Screen::RestoreBackup, false, &|app| {
-            app.state.restore = Some((backups[0].clone(), [true, false, false, true]));
+            app.state.restore = Some((backups[0].clone(), [true, false, false, true, false]));
         }),
         ("48-restore-backup-dark-deleting", Screen::RestoreBackup, true, &|app| {
-            app.state.restore = Some((backups[0].clone(), [true, true, false, true]));
+            app.state.restore = Some((backups[0].clone(), [true, true, false, true, false]));
             app.state.asking_delete = true;
         }),
         ("48-restore-backup-light-other-version", Screen::RestoreBackup, false, &|app| {
-            app.state.restore = Some((backups[1].clone(), [true, false, false, false]));
+            app.state.restore = Some((backups[1].clone(), [true, false, false, false, false]));
         }),
         ("48-restore-backup-light-unreadable", Screen::RestoreBackup, false, &|app| {
-            app.state.restore = Some((backups[2].clone(), [false; 4]));
+            app.state.restore = Some((backups[2].clone(), [false; 5]));
         }),
         ("100-backup-job-light-measuring", Screen::BackupJob, false, &|app| app.state.backup_job = job(false, Vec::new(), None, None)),
         ("101-backup-job-light", Screen::BackupJob, false, &|app| {
@@ -611,7 +611,7 @@ fn main() -> Result<()> {
         }),
         ("107-restore-job-light-done", Screen::BackupJob, false, &|app| {
             let unmade = vec!["/data/user/10".into(), "/data/user_de/10".into(), "/data/misc_ce/10".into()];
-            app.state.backup_job = job(true, plan(), None, Some(BackupEnd::Restored { unmade }))
+            app.state.backup_job = job(true, plan(), None, Some(BackupEnd::Restored { unmade, shared: None }))
         }),
         ("108-restore-job-light-failed", Screen::BackupJob, false, &|app| {
             let at = Some(BackupAt { item: 8, done: 400_000_000, of: 1_405_968_384, checking: false });
@@ -1055,7 +1055,7 @@ fn main() -> Result<()> {
         ("92-wipe-dark-parts-cache", Screen::Wipe, true, &|app| {
             app.state.cache_partition = true;
             app.state.phone_logs = 7;
-            app.state.wipe = [false, false, true, true, true, false, true, false, true];
+            app.state.wipe = [false, false, false, true, true, true, false, true, false, true];
         }),
         ("93-erase-light-media", Screen::Erase, false, &|app| {
             app.erase_started(false, false, vec![Part::Media, Part::AppCaches, Part::SystemCaches, Part::Logs]);

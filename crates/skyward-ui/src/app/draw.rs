@@ -721,6 +721,7 @@ mod tests {
             Screen::Settings,
             Screen::Reboot,
             Screen::Wipe,
+            Screen::FormatData,
             Screen::Mount,
             Screen::Install,
             Screen::Choose(Place::Storage),

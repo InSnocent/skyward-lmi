@@ -10,6 +10,10 @@ use std::path::{Path, PathBuf};
 #[cfg(target_os = "android")]
 mod backup;
 #[cfg(target_os = "android")]
+mod usb_mount;
+#[cfg(any(target_os = "android", test))]
+mod data_wipe;
+#[cfg(target_os = "android")]
 mod decrypt;
 #[cfg(target_os = "android")]
 mod display_probe;

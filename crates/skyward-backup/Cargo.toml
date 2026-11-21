@@ -17,5 +17,4 @@ skyward-files = { path = "../skyward-files" }
 tar = { path = "../../vendor/tar" }
 toml = { workspace = true }
 
-[dev-dependencies]
 tempfile = "3.27.0"

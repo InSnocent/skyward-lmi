@@ -59,7 +59,18 @@ const DIGESTS: [(ObjectIdentifier, Hash); 6] = [
 pub struct Key {
     public: Public,
     hash: Hash,
+    public_test_key: bool,
 }
+
+// SHA-256 of the DER SubjectPublicKeyInfo for AOSP's public testkey.
+// Match the key, not the certificate name or signature, since the same
+// key can appear in several certificates.
+const AOSP_TEST_KEY: [u8; 32] = [
+    0xef, 0x57, 0xb6, 0x90, 0x16, 0x5c, 0xb5, 0x61,
+    0xb5, 0x02, 0x69, 0x22, 0xc0, 0x0d, 0x2d, 0x65,
+    0x74, 0xe8, 0xb1, 0x84, 0xfa, 0x7d, 0x16, 0x1e,
+    0x07, 0x6f, 0x06, 0xe0, 0x6e, 0x6d, 0x35, 0xdb,
+];
 
 enum Public {
     Rsa(RsaPublicKey),
@@ -84,6 +95,30 @@ pub enum Verdict {
     Unverified,
     /// The check was stopped before it had read the package.
     Stopped,
+}
+
+/// Provenance on the manual lmi ZIP path. A public development key
+/// can verify the package's signature without identifying its publisher.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ZipSignature {
+    Trusted,
+    PublicTest,
+    Unsigned,
+    Unverified,
+}
+
+impl ZipSignature {
+    pub fn matches_included_key(self) -> bool {
+        matches!(self, Self::Trusted | Self::PublicTest)
+    }
+
+    fn legacy(self) -> Verdict {
+        match self {
+            Self::Trusted | Self::PublicTest => Verdict::Signed,
+            Self::Unsigned => Verdict::Unsigned,
+            Self::Unverified => Verdict::Unverified,
+        }
+    }
 }
 
 /// The keys of the certificates in the zip `zip`: those of its entries
@@ -126,7 +161,8 @@ fn key(pem: &[u8]) -> Result<Key> {
         EC_KEY => Public::Ec(p256::PublicKey::from_public_key_der(&der).context("read the key as a P-256 key")?.into()),
         other => bail!("a key of the algorithm {other} is not taken"),
     };
-    Ok(Key { public, hash })
+    let public_test_key = <[u8; 32]>::from(Sha256::digest(&der)) == AOSP_TEST_KEY;
+    Ok(Key { public, hash, public_test_key })
 }
 
 /// Check that the package `file`, `size` bytes, was signed with one of
@@ -134,54 +170,82 @@ fn key(pem: &[u8]) -> Result<Key> {
 /// of has been read, and of how much; the check stops when it answers
 /// false.
 pub fn verify<R: Read + Seek>(file: R, size: u64, keys: &[Key], read: impl FnMut(u64, u64) -> bool) -> Result<Verdict> {
-    verify_zip(file, size, keys, None, read)
+    verify_zip(file, size, keys, None, false, read).map(|(status, _)| status.map_or(Verdict::Stopped, ZipSignature::legacy))
 }
 
 /// Verify the OTA signature and match the exact ZIP selected for this build.
 pub fn verify_pinned<R: Read + Seek>(
     file: R, size: u64, keys: &[Key], digest: [u8; 32], read: impl FnMut(u64, u64) -> bool,
 ) -> Result<Verdict> {
-    verify_zip(file, size, keys, Some(digest), read)
+    verify_zip(file, size, keys, Some(digest), false, read).map(|(status, _)| status.map_or(Verdict::Stopped, ZipSignature::legacy))
 }
 
-fn verify_zip<R: Read + Seek>(
-    mut file: R, size: u64, keys: &[Key], expected: Option<[u8; 32]>, mut read: impl FnMut(u64, u64) -> bool,
-) -> Result<Verdict> {
+/// Read and hash the whole file in the same pass that checks its signature.
+/// Even an unsigned ZIP is read to the end, so its bytes are pinned by the
+/// package filesystem before the installer asks the user to confirm.
+pub fn verify_and_hash<R: Read + Seek>(
+    file: R, size: u64, keys: &[Key], read: impl FnMut(u64, u64) -> bool,
+) -> Result<Option<(ZipSignature, [u8; 32])>> {
+    let (signature, digest) = verify_zip(file, size, keys, None, true, read)?;
+    Ok(signature.zip(digest))
+}
+
+struct SignedEnd {
+    record: Vec<u8>,
+    signature_start: usize,
+}
+
+fn signed_end(file: &mut (impl Read + Seek), size: u64) -> Result<Result<SignedEnd, ZipSignature>> {
     if size < FOOTER as u64 {
-        return Ok(Verdict::Unsigned);
+        return Ok(Err(ZipSignature::Unsigned));
     }
     let mut footer = [0u8; FOOTER];
     file.seek(SeekFrom::Start(size - FOOTER as u64)).context("seek to the package's last bytes")?;
     file.read_exact(&mut footer).context("read the package's last bytes")?;
     if footer[2..4] != [0xff, 0xff] {
-        return Ok(Verdict::Unsigned);
+        return Ok(Err(ZipSignature::Unsigned));
     }
     let start = usize::from(u16::from_le_bytes([footer[0], footer[1]]));
     let comment = usize::from(u16::from_le_bytes([footer[4], footer[5]]));
-    // The signature lies in the comment, before the footer, and the comment
-    // follows the record that ends the zip's directory. That record is the
-    // only one there: a zip reader taking a later one as the end of the
-    // directory would read entries the signature is not of.
+    // There must be only one end record, or a ZIP parser could look at
+    // a directory outside the bytes that were signed.
     let tail = EOCD + comment;
     if start > comment || start <= FOOTER || size < tail as u64 {
-        return Ok(Verdict::Unverified);
+        return Ok(Err(ZipSignature::Unverified));
     }
-    let mut eocd = vec![0u8; tail];
+    let mut record = vec![0u8; tail];
     file.seek(SeekFrom::Start(size - tail as u64)).context("seek to the end of the zip's directory")?;
-    file.read_exact(&mut eocd).context("read the end of the zip's directory")?;
-    if !eocd.starts_with(EOCD_MAGIC) || eocd[4..].windows(4).any(|w| w == EOCD_MAGIC) {
-        return Ok(Verdict::Unverified);
+    file.read_exact(&mut record).context("read the end of the zip's directory")?;
+    if !record.starts_with(EOCD_MAGIC) || record[4..].windows(4).any(|w| w == EOCD_MAGIC) {
+        return Ok(Err(ZipSignature::Unverified));
     }
+    Ok(Ok(SignedEnd { record, signature_start: tail - start }))
+}
 
-    // The signature is of all but the comment and its length.
-    let signed = size - comment as u64 - 2;
-    let wanted = |hash: Hash| keys.iter().any(|k| k.hash == hash);
-    let (mut sha1, mut sha256) = (wanted(Hash::Sha1).then(Sha1::new), (wanted(Hash::Sha256) || expected.is_some()).then(Sha256::new));
+fn verify_zip<R: Read + Seek>(
+    mut file: R, size: u64, keys: &[Key], expected: Option<[u8; 32]>, whole: bool,
+    mut read: impl FnMut(u64, u64) -> bool,
+) -> Result<(Option<ZipSignature>, Option<[u8; 32]>)> {
+    let end = signed_end(&mut file, size)?;
+    if let Err(verdict) = end
+        && !whole
+    {
+        return Ok((Some(verdict), None));
+    }
+    // The signature is of all but the comment and its length. An unsigned
+    // or structurally invalid signature leaves the entire file to hash.
+    let suffix = end.as_ref().map_or(&[][..], |end| &end.record[EOCD - 2..]);
+    let signed = size - suffix.len() as u64;
+    let want_digest = whole || expected.is_some();
+    let wanted = |hash: Hash| end.is_ok() && keys.iter().any(|k| k.hash == hash);
+    let mut sha1 = wanted(Hash::Sha1).then(Sha1::new);
+    let mut sha256 = (wanted(Hash::Sha256) || want_digest).then(Sha256::new);
     file.seek(SeekFrom::Start(0)).context("rewind the package")?;
     let mut chunk = vec![0u8; CHUNK];
     let mut done = 0;
+    let total = if whole { size } else { signed };
     while done < signed {
-        let n = CHUNK.min((signed - done) as usize);
+        let n = (signed - done).min(CHUNK as u64) as usize;
         file.read_exact(&mut chunk[..n]).context("read the package")?;
         if let Some(h) = &mut sha1 {
             h.update(&chunk[..n]);
@@ -190,20 +254,28 @@ fn verify_zip<R: Read + Seek>(
             h.update(&chunk[..n]);
         }
         done += n as u64;
-        if !read(done, signed) {
-            return Ok(Verdict::Stopped);
+        if !read(done, total) {
+            return Ok((None, None));
         }
     }
-    if let Some(expected) = expected {
-        let digest: [u8; 32] = sha256.as_ref().expect("pin requires SHA-256").clone().chain_update(&eocd[EOCD - 2..]).finalize().into();
-        if digest != expected {
-            return Ok(Verdict::Unverified);
-        }
+    let digest: Option<[u8; 32]> = want_digest.then(|| {
+        sha256.as_ref().expect("the package is being hashed").clone().chain_update(suffix).finalize().into()
+    });
+    if whole && !suffix.is_empty() && !read(size, size) {
+        return Ok((None, None));
     }
+    if expected.is_some() && digest != expected {
+        return Ok((Some(ZipSignature::Unverified), digest));
+    }
+    let end = match end {
+        Ok(end) => end,
+        Err(verdict) => return Ok((Some(verdict), digest)),
+    };
     let sha1 = sha1.map(|h| h.finalize().to_vec()).unwrap_or_default();
     let sha256 = sha256.map(|h| h.finalize().to_vec()).unwrap_or_default();
-
-    let Some(signature) = signature(&eocd[tail - start..tail - FOOTER]) else { return Ok(Verdict::Unverified) };
+    let Some(signature) = signature(&end.record[end.signature_start..end.record.len() - FOOTER]) else {
+        return Ok((Some(ZipSignature::Unverified), digest));
+    };
     let made_with = |key: &Key| match (&key.public, key.hash) {
         (Public::Rsa(rsa), Hash::Sha1) => rsa.verify(Pkcs1v15Sign::new::<Sha1>(), &sha1, &signature).is_ok(),
         (Public::Rsa(rsa), Hash::Sha256) => rsa.verify(Pkcs1v15Sign::new::<Sha256>(), &sha256, &signature).is_ok(),
@@ -213,7 +285,15 @@ fn verify_zip<R: Read + Seek>(
         // An EC key signs only SHA-256 digests.
         (Public::Ec(_), Hash::Sha1) => false,
     };
-    Ok(if keys.iter().any(made_with) { Verdict::Signed } else { Verdict::Unverified })
+    let mut status = ZipSignature::Unverified;
+    for key in keys.iter().filter(|key| made_with(key)) {
+        if !key.public_test_key {
+            status = ZipSignature::Trusted;
+            break;
+        }
+        status = ZipSignature::PublicTest;
+    }
+    Ok((Some(status), digest))
 }
 
 /// The signature in a PKCS#7 signed-data block, its first signer's; none
@@ -287,6 +367,42 @@ mod tests {
                 assert_eq!(check(package, &keys_of(&[other])), Verdict::Unverified);
             }
         }
+    }
+
+    #[test]
+    fn hashes_the_complete_zip_for_known_unknown_and_unsigned_packages() {
+        let keys = keys_of(&[TESTKEY]);
+        for (package, verdict) in [
+            (SIGNED_TESTKEY, ZipSignature::Trusted),
+            (SIGNED_EC, ZipSignature::Unverified),
+            (b"unsigned".as_slice(), ZipSignature::Unsigned),
+        ] {
+            let mut progress = None;
+            let checked = verify_and_hash(Cursor::new(package), package.len() as u64, &keys, |done, total| {
+                progress = Some((done, total));
+                true
+            }).unwrap();
+            assert_eq!(checked, Some((verdict, Sha256::digest(package).into())));
+            assert_eq!(progress, Some((package.len() as u64, package.len() as u64)));
+        }
+    }
+
+    #[test]
+    fn a_valid_public_test_signature_does_not_authenticate_the_publisher() {
+        let mut keys = keys_of(&[TESTKEY]);
+        keys[0].public_test_key = true;
+        let checked = verify_and_hash(Cursor::new(SIGNED_TESTKEY), SIGNED_TESTKEY.len() as u64, &keys, |_, _| true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(checked.0, ZipSignature::PublicTest);
+        assert!(checked.0.matches_included_key());
+        assert_eq!(check(SIGNED_TESTKEY, &keys), Verdict::Signed, "older paths still report a valid signature");
+    }
+
+    #[test]
+    fn cancelling_a_full_check_produces_no_digest() {
+        let keys = keys_of(&[TESTKEY]);
+        assert_eq!(verify_and_hash(Cursor::new(SIGNED_TESTKEY), SIGNED_TESTKEY.len() as u64, &keys, |_, _| false).unwrap(), None);
     }
 
     #[test]

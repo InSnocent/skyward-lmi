@@ -90,6 +90,11 @@ impl App {
             // Everything takes in every part, so choosing it leaves the
             // parts out, and choosing a part on its own leaves it out.
             Action::WipeItem(item) => {
+                if (self.state.lmi_wipe && !self.state.lmi_wipe_offers(item))
+                    || (!self.state.lmi_wipe && item == Wipe::DataKeepMedia)
+                {
+                    return Vec::new();
+                }
                 let k = WIPES.iter().position(|&w| w == item).expect("the page offers only what it lists");
                 let on = !self.state.wipe[k];
                 match (on, item) {
@@ -100,6 +105,13 @@ impl App {
                     (true, _) => {
                         self.state.wipe[0] = false;
                         self.state.wipe[k] = true;
+                        if self.state.lmi_wipe {
+                            for (other, selected) in WIPES.iter().copied().zip(&mut self.state.wipe) {
+                                if item.conflicts_while_keeping_media(other) {
+                                    *selected = false;
+                                }
+                            }
+                        }
                     }
                     (false, _) => self.state.wipe[k] = false,
                 }
@@ -107,6 +119,14 @@ impl App {
             }
             Action::Confirm(_) => self.say(l.pick(["请按住圆形按钮向右滑动", "請按住圓形按鈕向右滑動", "Hold the round button and slide it right"]), now),
             Action::Slider(_) | Action::Pattern => {}
+            Action::AllowUnverifiedZip => {
+                if let Install::ConfirmingLmiZip { report, allowed } = &mut self.state.install
+                    && report.requires_approval()
+                {
+                    *allowed = true;
+                    self.refresh();
+                }
+            }
             Action::Sideload | Action::SideloadPreflight => match self.state.install {
                 Install::Idle | Install::Finished { .. } => {
                     let preflight = action == Action::SideloadPreflight || (self.state.block_ota_preflight && !self.state.block_ota_install);
@@ -274,15 +294,19 @@ impl App {
             // All a backup holds is ticked to restore at first.
             Action::OpenBackup(i) => {
                 let entry = self.state.backups[i].clone();
-                let parts = entry.held.as_ref().map_or([false; 4], |h| h.parts);
+                let mut parts = entry.held.as_ref().map_or([false; 5], |h| h.parts);
+                if self.state.lmi_backup {
+                    parts = [false, false, parts[2], false, parts[SHARED_FILES]];
+                } else {
+                    parts[SHARED_FILES] = false;
+                }
                 self.state.restore = Some((entry, parts));
                 self.state.asking_delete = false;
                 self.open(Screen::RestoreBackup);
             }
             Action::VerifyBackup => {
                 if let Some((entry, _)) = &self.state.restore
-                    && self.state.data_backup_only
-                    && entry.place == Place::Storage
+                    && self.state.lmi_backup
                     && self.state.place_open(entry.place)
                 {
                     return vec![Effect::VerifyBackup { place: entry.place, name: entry.name.clone() }];
@@ -323,7 +347,7 @@ impl App {
                 self.state.next_slot = Some(slot);
                 self.refresh();
             }
-            Action::Type(cap) if self.screen() == Screen::Terminal => return self.term_typed(cap),
+            Action::Type(cap) if self.screen() == Screen::Terminal => return self.term_typed(cap, now),
             Action::Type(cap) if self.screen() == Screen::Editor => self.edit_typed(cap),
             Action::Type(cap) => return self.type_key(cap, now),
             Action::TermKey(key) if self.screen() == Screen::Editor => {
@@ -384,7 +408,7 @@ impl App {
                 let folder = self.state.files.path.clone();
                 let running = self.term.as_ref().is_some_and(|term| term.running);
                 self.open(Screen::Terminal);
-                self.state.layer = Layer::Letters;
+                self.term_letters();
                 if running {
                     return vec![Effect::ShellTo(folder)];
                 }
@@ -768,7 +792,13 @@ impl App {
         match which {
             Confirm::Reboot => fx.push(Effect::Reboot(TARGETS[self.state.reboot])),
             Confirm::Wipe => {
-                let chosen: Vec<Wipe> = WIPES.iter().zip(self.state.wipe).filter(|(_, on)| *on).map(|(&w, _)| w).collect();
+                let chosen: Vec<Wipe> = WIPES.iter().zip(self.state.wipe)
+                    .filter(|&(&w, on)| on && if self.state.lmi_wipe { self.state.lmi_wipe_offers(w) } else { w != Wipe::DataKeepMedia })
+                    .map(|(&w, _)| w).collect();
+                if self.state.lmi_wipe && !self.state.lmi_wipe_data_open() && chosen.iter().any(|&w| w != Wipe::Cache) {
+                    self.say(l.pick(DECRYPT_FIRST), now);
+                    return fx;
+                }
                 match chosen.is_empty() {
                     true => self.say(l.pick(["请选择要清除的内容", "請選擇要清除的內容", "Choose what to wipe"]), now),
                     false => fx.push(Effect::Wipe(chosen)),
@@ -782,9 +812,15 @@ impl App {
                 }
             }
             Confirm::RunScript => {
-                if self.state.install == Install::ConfirmingScript {
+                let effect = match &self.state.install {
+                    Install::ConfirmingScript => Some(Effect::Install),
+                    Install::ConfirmingLmiZip { report, .. } if !report.requires_approval() => Some(Effect::Install),
+                    Install::ConfirmingLmiZip { allowed: true, .. } => Some(Effect::InstallUnverifiedZip),
+                    _ => None,
+                };
+                if let Some(effect) = effect {
                     self.state.install = Install::Scripting { stage: None, running: false };
-                    fx.push(Effect::Install);
+                    fx.push(effect);
                     self.refresh();
                 }
             }
@@ -794,6 +830,8 @@ impl App {
                     Some(["请选择要备份的内容", "請選擇要備份的內容", "Choose what to back up"])
                 } else if s.backup[2] && s.data != Data::Open {
                     Some(["备份 data 分区需先完成「解密」", "備份 data 分割區需先完成「解密」", "Decrypt before backing up the data partition"])
+                } else if s.backup[SHARED_FILES] && !s.data.storage_open() {
+                    Some(DECRYPT_FIRST)
                 } else if s.place_open(s.backup_to) {
                     None
                 } else {
@@ -804,7 +842,8 @@ impl App {
                         (Place::UsbDrive, _) => USB_DRIVE_WANTED,
                     })
                 };
-                let backup = Effect::Backup { parts: s.backup, place: s.backup_to, compress: s.compress, verify: s.verify };
+                let verify = s.verify || (s.lmi_backup && s.backup_to == Place::UsbDrive);
+                let backup = Effect::Backup { parts: s.backup, place: s.backup_to, compress: s.compress, verify };
                 match refused {
                     Some(why) => self.say(l.pick(why), now),
                     None => fx.push(backup),
@@ -812,18 +851,25 @@ impl App {
             }
             Confirm::Restore => {
                 let (entry, parts) = self.state.restore.as_ref().expect("the restore page shows a backup");
+                if entry.place == Place::UsbDrive && !self.state.place_open(entry.place) {
+                    return fx;
+                }
                 let restore = Effect::Restore { place: entry.place, name: entry.name.clone(), parts: *parts };
                 if !parts.contains(&true) {
                     self.say(l.pick(["请选择要恢复的内容", "請選擇要還原的內容", "Choose what to restore"]), now);
                 } else if parts[2] && self.state.data != Data::Open {
                     self.say(l.pick(["恢复 data 分区需先完成「解密」", "還原 data 分割區需先完成「解密」", "Decrypt before restoring the data partition"]), now);
+                } else if parts[SHARED_FILES] && !self.state.data.storage_open() {
+                    self.say(l.pick(DECRYPT_FIRST), now);
                 } else {
                     fx.push(restore);
                 }
             }
             Confirm::DeleteBackup => {
                 let (entry, _) = self.state.restore.as_ref().expect("the restore page shows a backup");
-                fx.push(Effect::DeleteBackup { place: entry.place, name: entry.name.clone() });
+                if !self.state.lmi_backup || entry.place == Place::Storage {
+                    fx.push(Effect::DeleteBackup { place: entry.place, name: entry.name.clone() });
+                }
             }
             Confirm::Slot => match (&self.state.boot_slots, self.state.next_slot) {
                 (Some(Ok(slots)), Some(pick)) if pick != slots.active => fx.push(Effect::SetSlot(pick)),
@@ -834,7 +880,11 @@ impl App {
                 }
                 _ => self.say(l.pick(["无法读取启动槽位", "無法讀取啟動槽位", "Couldn't read the boot slots"]), now),
             },
-            Confirm::FactoryReset => fx.push(Effect::FactoryReset),
+            Confirm::FactoryReset => {
+                if !self.state.lmi_wipe || (self.state.lmi_format_data && self.screen() == Screen::FormatData) {
+                    fx.push(Effect::FactoryReset);
+                }
+            }
             Confirm::Merge => {
                 if self.state.update == Standing::Waiting {
                     self.state.update = Standing::Merging(0.0);

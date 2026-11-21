@@ -257,7 +257,8 @@ impl App {
                 | Install::Choosing(_)
                 | Install::SystemChoosing(_)
                 | Install::Confirming { .. }
-                | Install::ConfirmingScript => {
+                | Install::ConfirmingScript
+                | Install::ConfirmingLmiZip { .. } => {
                     self.state.install = Install::Ending;
                     fx.push(Effect::Cancel);
                 }
@@ -317,7 +318,7 @@ impl App {
                 Vec::new()
             }
             Screen::Terminal => {
-                self.state.layer = Layer::Letters;
+                self.term_letters();
                 if self.term.is_none() {
                     self.shell_folder = "/".into();
                     vec![Effect::StartShell(self.shell_folder.clone())]

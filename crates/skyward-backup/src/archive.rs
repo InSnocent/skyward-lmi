@@ -6,11 +6,12 @@
 //! make such a folder, so one gone is not made again.
 
 use anyhow::{bail, ensure, Context, Result};
-use skyward_files::Cancelled;
+use skyward_files::{Cancelled, Ownership};
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
+use std::{fs::OpenOptions, os::unix::fs::OpenOptionsExt};
 use std::io::{self, ErrorKind, Read, Write};
-use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tar::{Archive, Builder, EntryType, Header};
@@ -26,17 +27,37 @@ const MTIME: &str = "mtime";
 /// archive is unpacked into it, each from the folder, a `*` in it standing
 /// for any one name.
 #[derive(Debug, Clone)]
-pub struct Skipped(Vec<Vec<String>>);
+pub struct Skipped {
+    paths: Vec<Vec<String>>,
+    shared_files: bool,
+}
 
 impl Skipped {
     pub fn new(paths: &[String]) -> Skipped {
-        Skipped(paths.iter().map(|p| p.split('/').filter(|s| !s.is_empty()).map(str::to_string).collect()).collect())
+        Skipped {
+            paths: paths.iter().map(|p| p.split('/').filter(|s| !s.is_empty()).map(str::to_string).collect()).collect(),
+            shared_files: false,
+        }
+    }
+
+    /// Keep portable files, excluding the recovery's own backup and scratch folders.
+    pub fn shared_files() -> Skipped {
+        Skipped { shared_files: true, ..Self::new(&[crate::FOLDER.into()]) }
+    }
+
+    fn excludes(&self, rel: &Path, meta: &fs::Metadata, dev: u64) -> bool {
+        if self.holds(rel) || meta.file_type().is_socket() || (meta.is_dir() && meta.dev() != dev) {
+            return true;
+        }
+        let scratch = rel.parent().is_some_and(|parent| parent.as_os_str().is_empty() || parent == Path::new(crate::RESTORED_SHARED))
+            && rel.file_name().is_some_and(|name| name.as_encoded_bytes().starts_with(b".skyward-restore-"));
+        self.shared_files && (meta.dev() != dev || !(meta.is_file() || meta.is_dir()) || scratch)
     }
 
     /// Whether `rel` itself is skipped.
     fn holds(&self, rel: &Path) -> bool {
         let names: Vec<&str> = rel.components().map(|c| c.as_os_str().to_str().unwrap_or_default()).collect();
-        self.0.iter().any(|p| p.len() == names.len() && p.iter().zip(&names).all(|(want, name)| want == "*" || want == name))
+        self.paths.iter().any(|p| p.len() == names.len() && p.iter().zip(&names).all(|(want, name)| want == "*" || want == name))
     }
 
     /// Whether `rel` is skipped or inside what is.
@@ -63,11 +84,11 @@ pub fn measure(root: &Path, skipped: &Skipped, cancel: &AtomicBool) -> Result<(u
         }
         for (name, path, meta) in children(folder)? {
             let rel = rel.join(&name);
-            if skipped.holds(&rel) || meta.file_type().is_socket() || (meta.is_dir() && meta.dev() != dev) {
+            if skipped.excludes(&rel, &meta, dev) {
                 continue;
             }
             sum.1 += 1;
-            if meta.is_file() && (meta.nlink() == 1 || seen.insert((meta.dev(), meta.ino()))) {
+            if meta.is_file() && (skipped.shared_files || meta.nlink() == 1 || seen.insert((meta.dev(), meta.ino()))) {
                 sum.0 += meta.len();
             } else if meta.is_dir() {
                 walk(&path, &rel, dev, skipped, cancel, seen, sum)?;
@@ -103,7 +124,8 @@ pub fn pack(root: &Path, skipped: &Skipped, out: impl Write, cancel: &AtomicBool
     let mut b = Builder::new(out);
     let meta = fs::symlink_metadata(root).with_context(|| format!("look at {}", root.display()))?;
     let mut packing = Packing { links: HashMap::new(), done: 0, cancel, progress };
-    packing.folder(&mut b, root, Path::new(""), meta.dev(), skipped, key(root)?.as_deref())?;
+    let key = if skipped.shared_files { None } else { key(root)? };
+    packing.folder(&mut b, root, Path::new(""), meta.dev(), skipped, key.as_deref())?;
     b.into_inner().context("finish the archive")?.flush().context("finish the archive")?;
     Ok(())
 }
@@ -123,14 +145,15 @@ impl Packing<'_> {
     fn folder<W: Write>(&mut self, b: &mut Builder<W>, path: &Path, rel: &Path, dev: u64, skipped: &Skipped, above: Option<&[u8]>) -> Result<()> {
         for (name, path, meta) in children(path)? {
             let rel = rel.join(&name);
-            if skipped.holds(&rel) || meta.file_type().is_socket() || (meta.is_dir() && meta.dev() != dev) {
+            if skipped.excludes(&rel, &meta, dev) {
                 continue;
             }
             if self.cancel.load(Ordering::Relaxed) {
                 return Err(Cancelled.into());
             }
-            let own = if meta.is_dir() { key(&path)? } else { None };
-            if let Err(e) = self.entry(b, &path, &rel, &meta, meta.is_dir() && own.as_deref() != above) {
+            let own = if !skipped.shared_files && meta.is_dir() { key(&path)? } else { None };
+            let key_root = meta.is_dir() && own.as_deref() != above;
+            if let Err(e) = self.entry(b, &path, &rel, &meta, key_root, skipped.shared_files) {
                 // A file stopped partway through comes back as an error of
                 // the archive's writing; it was stopped all the same.
                 if self.cancel.load(Ordering::Relaxed) {
@@ -145,20 +168,23 @@ impl Packing<'_> {
         Ok(())
     }
 
-    fn entry<W: Write>(&mut self, b: &mut Builder<W>, path: &Path, rel: &Path, meta: &fs::Metadata, key_root: bool) -> Result<()> {
+    fn entry<W: Write>(&mut self, b: &mut Builder<W>, path: &Path, rel: &Path, meta: &fs::Metadata, key_root: bool, shared: bool) -> Result<()> {
         let kind = meta.file_type();
         let mut header = Header::new_gnu();
-        header.set_mode(meta.mode() & 0o7777);
-        header.set_uid(u64::from(meta.uid()));
-        header.set_gid(u64::from(meta.gid()));
+        let mode = if shared { if kind.is_dir() { 0o755 } else { 0o644 } } else { meta.mode() & 0o7777 };
+        header.set_mode(mode);
+        header.set_uid(if shared { 0 } else { u64::from(meta.uid()) });
+        header.set_gid(if shared { 0 } else { u64::from(meta.gid()) });
         header.set_mtime(meta.mtime().max(0) as u64);
         header.set_size(0);
-        let mut records = beyond(path, meta)?;
-        records.push((MTIME.into(), format!("{}.{:09}", meta.mtime(), meta.mtime_nsec()).into_bytes()));
-        if key_root {
-            records.push((KEY_ROOT.into(), b"1".to_vec()));
+        if !shared {
+            let mut records = beyond(path, meta)?;
+            records.push((MTIME.into(), format!("{}.{:09}", meta.mtime(), meta.mtime_nsec()).into_bytes()));
+            if key_root {
+                records.push((KEY_ROOT.into(), b"1".to_vec()));
+            }
+            b.append_pax_extensions(records.iter().map(|(k, v)| (k.as_str(), v.as_slice())))?;
         }
-        b.append_pax_extensions(records.iter().map(|(k, v)| (k.as_str(), v.as_slice())))?;
         if kind.is_dir() {
             header.set_entry_type(EntryType::Directory);
             b.append_data(&mut header, rel, io::empty())?;
@@ -172,12 +198,20 @@ impl Packing<'_> {
                 b.append_link(&mut header, rel, first)?;
                 return Ok(());
             }
-            if meta.nlink() > 1 {
+            if !shared && meta.nlink() > 1 {
                 self.links.insert(id, rel.to_path_buf());
             }
             header.set_entry_type(EntryType::Regular);
             header.set_size(meta.len());
-            let file = File::open(path)?;
+            let file = if shared {
+                let file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path)?;
+                let opened = file.metadata()?;
+                ensure!(opened.is_file() && (opened.dev(), opened.ino(), opened.len()) == (meta.dev(), meta.ino(), meta.len()),
+                    "the shared file changed while opening it");
+                file
+            } else {
+                File::open(path)?
+            };
             let feed = Feed { file, left: meta.len(), done: &mut self.done, cancel: self.cancel, progress: &mut *self.progress };
             b.append_data(&mut header, rel, feed)?;
         } else {
@@ -274,6 +308,8 @@ pub fn unpack(input: impl Read, root: &Path, skipped: &Skipped, cancel: &AtomicB
         let path = root.join(&rel);
         if let Ok(existing) = fs::symlink_metadata(&path) {
             ensure!(existing.dev() == dev, "{} is on another filesystem", rel.display());
+            ensure!(!existing.is_dir() || header.entry_type() == EntryType::Directory,
+                "{} is a directory; refusing to replace it with another file type", rel.display());
         }
         let mtime = records.mtime.unwrap_or((header.mtime()? as i64, 0));
         let made = (|| -> Result<bool> {
@@ -295,34 +331,25 @@ pub fn unpack(input: impl Read, root: &Path, skipped: &Skipped, cancel: &AtomicB
                     folders.push((rel.clone(), mtime));
                 }
                 EntryType::Regular => {
-                    let name = path.file_name().context("it has no name")?.to_string_lossy().into_owned();
-                    let temp = path.with_file_name(format!(".{name}.skyward-restore"));
-                    // One a restore that stopped left behind goes first.
-                    remove_any(&temp)?;
-                    let mut file = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temp).context("make it")?;
+                    let parent = path.parent().context("the restored file has no parent")?;
+                    let mut temp = tempfile::Builder::new().prefix(".skyward-restore-").tempfile_in(parent).context("make a temporary restore file")?;
                     let mut buf = vec![0u8; 1 << 20];
                     loop {
                         if cancel.load(Ordering::Relaxed) {
-                            drop(file);
-                            fs::remove_file(&temp).context("take away the part written")?;
                             return Err(Cancelled.into());
                         }
                         let n = entry.read(&mut buf).context("read it from the archive")?;
                         if n == 0 {
                             break;
                         }
-                        file.write_all(&buf[..n]).context("write it")?;
+                        temp.write_all(&buf[..n]).context("write it")?;
                         done += n as u64;
                         progress(done);
                     }
-                    file.sync_all().context("write it")?;
-                    drop(file);
-                    give(&temp, &header, &records, false)?;
-                    times(&temp, mtime)?;
-                    if fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir()) {
-                        remove(&path)?;
-                    }
-                    fs::rename(&temp, &path).context("put it in place")?;
+                    give(temp.path(), &header, &records, false)?;
+                    times(temp.path(), mtime)?;
+                    temp.as_file().sync_all().context("write it")?;
+                    temp.persist(&path).map_err(|failure| failure.error).context("put it in place")?;
                 }
                 EntryType::Symlink => {
                     let target = entry.link_name().context("read where it points")?.context("it points nowhere")?.into_owned();
@@ -382,6 +409,157 @@ pub fn unpack(input: impl Read, root: &Path, skipped: &Skipped, cancel: &AtomicB
     Ok(unpacked)
 }
 
+/// Extract ordinary files into a new shared-storage folder. Ownership and
+/// permissions come from the destination, including after it is re-encrypted.
+pub fn unpack_shared_files(
+    input: impl Read, root: &Path, cancel: &AtomicBool, progress: &mut dyn FnMut(u64),
+) -> Result<()> {
+    let meta = fs::symlink_metadata(root)?;
+    ensure!(meta.is_dir() && fs::read_dir(root)?.next().is_none(), "shared files need a new empty folder");
+    let mut archive = Archive::new(input);
+    let mut buffer = vec![0; 1 << 20];
+    let mut folders = Vec::new();
+    let mut done = 0;
+    for entry in archive.entries().context("read the shared files archive")? {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(Cancelled.into());
+        }
+        let mut entry = entry.context("read a shared files entry")?;
+        let relative = entry.path()?.into_owned();
+        ensure!(is_relative_entry(&relative), "invalid shared file path {}", relative.display());
+        check_parents(root, &relative, meta.dev())?;
+        let path = root.join(&relative);
+        let at = (i64::try_from(entry.header().mtime()?).context("shared file time is out of range")?, 0);
+        match entry.header().entry_type() {
+            EntryType::Directory => {
+                skyward_files::make_folder(&path, Ownership::Shared)?;
+                folders.push((path, at));
+            }
+            EntryType::Regular => {
+                let mut out = skyward_files::make_file(&path, Ownership::Shared)?;
+                loop {
+                    if cancel.load(Ordering::Relaxed) {
+                        return Err(Cancelled.into());
+                    }
+                    let n = entry.read(&mut buffer)?;
+                    if n == 0 {
+                        break;
+                    }
+                    out.write_all(&buffer[..n])?;
+                    done += n as u64;
+                    progress(done);
+                }
+                times(&path, at)?;
+                out.sync_all()?;
+            }
+            kind => bail!("unsupported shared file type {kind:?} at {}", relative.display()),
+        }
+    }
+    for (folder, at) in folders.iter().rev() {
+        times(folder, *at)?;
+        File::open(folder)?.sync_all()?;
+    }
+    Ok(())
+}
+
+/// Validate the archive's entries and payloads without touching the target.
+/// This is used for a staged external restore before any data is replaced.
+pub fn inspect(input: impl Read, root: &Path, skipped: &Skipped, cancel: &AtomicBool) -> Result<u64> {
+    let root_meta = fs::symlink_metadata(root)?;
+    ensure!(root_meta.is_dir(), "restore root is not a directory");
+    let mut archive = Archive::new(input);
+    let mut seen = HashMap::new();
+    let mut needed = 0_u64;
+    let mut buf = vec![0; 1 << 20];
+    for entry in archive.entries().context("read the data archive")? {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(Cancelled.into());
+        }
+        let mut entry = entry.context("read a data archive entry")?;
+        let rel = entry.path()?.into_owned();
+        ensure!(is_relative_entry(&rel), "the archive names {} outside its folder", rel.display());
+        if skipped.covers(&rel) {
+            continue;
+        }
+        cstr(&rel)?;
+        let mut parent_exists = true;
+        if let Some(parent) = rel.parent().filter(|p| !p.as_os_str().is_empty()) {
+            let Some(&(EntryType::Directory, exists)) = seen.get(parent) else {
+                bail!("{} has no parent directory in the archive", rel.display());
+            };
+            parent_exists = exists;
+        }
+        let info = records(&mut entry).with_context(|| format!("read metadata for {}", rel.display()))?;
+        let header = entry.header();
+        let kind = header.entry_type();
+        let mut there = false;
+        if parent_exists {
+            match fs::symlink_metadata(root.join(&rel)) {
+                Ok(meta) => {
+                    ensure!(meta.dev() == root_meta.dev(), "{} is on another filesystem", rel.display());
+                    ensure!(!meta.is_dir() || kind == EntryType::Directory, "{} would replace an existing directory", rel.display());
+                    ensure!(!info.key_root || meta.is_dir(), "{} is missing its encrypted directory", rel.display());
+                    // An ordinary restored directory may replace a file or
+                    // link. Its descendants are not present at this target.
+                    there = meta.is_dir();
+                }
+                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                Err(e) => return Err(e).with_context(|| format!("inspect restore target {}", rel.display())),
+            }
+        }
+        ensure!(!seen.contains_key(&rel), "the archive repeats {}", rel.display());
+        ensure!(!info.key_root || kind == EntryType::Directory, "invalid key directory {}", rel.display());
+        ensure!(header.uid()? <= u32::MAX.into() && header.gid()? <= u32::MAX.into(), "invalid owner for {}", rel.display());
+        header.mode()?;
+        header.mtime()?;
+        ensure!(info.xattrs.iter().all(|(name, _)| !name.is_empty() && !name.contains('\0')), "invalid attribute for {}", rel.display());
+        let mut left = entry.size();
+        ensure!(kind == EntryType::Regular || left == 0, "unexpected payload for {}", rel.display());
+        // Reserve space for the whole expansion without counting any old
+        // files as freed yet. Account for allocation rounding and metadata.
+        let pages = left.div_ceil(4096).checked_add(2).context("restore size overflows")?;
+        needed = needed.checked_add(pages.checked_mul(4096).context("restore size overflows")?).context("restore size overflows")?;
+        match kind {
+            EntryType::Directory | EntryType::Fifo | EntryType::Regular => {}
+            EntryType::Symlink => {
+                let link = entry.link_name()?.context("a symbolic link has no target")?;
+                cstr(&link)?;
+                ensure!(!link.as_os_str().is_empty(), "a symbolic link has an empty target");
+            }
+            EntryType::Link => {
+                let link = entry.link_name()?.context("a hard link has no target")?;
+                ensure!(is_relative_entry(&link) && matches!(seen.get(link.as_ref()), Some((EntryType::Regular, _))), "invalid archive hard link");
+            }
+            EntryType::Char | EntryType::Block => {
+                header.device_major()?;
+                header.device_minor()?;
+            }
+            _ => bail!("the archive holds a {kind:?} at {}", rel.display()),
+        }
+        while left > 0 {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(Cancelled.into());
+            }
+            let n = left.min(buf.len() as u64) as usize;
+            entry.read_exact(&mut buf[..n])?;
+            left -= n as u64;
+        }
+        seen.insert(rel, (kind, there));
+    }
+    ensure!(!seen.is_empty(), "the data archive contains no restorable entries");
+    // tar::Archive stops at the first zero header. Our writer ends the
+    // archive with two zero blocks; reject missing or non-zero trailing data.
+    let mut tail = archive.into_inner();
+    tail.read_exact(&mut buf[..512]).context("missing data archive terminator")?;
+    ensure!(buf[..512].iter().all(|&b| b == 0), "invalid data archive terminator");
+    loop {
+        let n = tail.read(&mut buf)?;
+        if n == 0 { break; }
+        ensure!(buf[..n].iter().all(|&b| b == 0), "unexpected bytes after the data archive");
+    }
+    Ok(needed)
+}
+
 fn is_relative_entry(path: &Path) -> bool {
     !path.as_os_str().is_empty() && path.components().all(|component| matches!(component, Component::Normal(_)))
 }
@@ -403,16 +581,27 @@ fn check_parents(root: &Path, entry: &Path, dev: u64) -> Result<()> {
 fn sweep(root: &Path, rel: &Path, dev: u64, held: &HashSet<PathBuf>, skipped: &Skipped, above: Option<&[u8]>) -> Result<()> {
     for (name, path, meta) in children(&root.join(rel))? {
         let rel = rel.join(&name);
-        if skipped.holds(&rel) || (meta.is_dir() && meta.dev() != dev) {
+        if skipped.holds(&rel) || meta.dev() != dev {
             continue;
         }
-        let own = if meta.is_dir() { key(&path)? } else { None };
-        if held.contains(&rel) {
-            if meta.is_dir() {
-                sweep(root, &rel, dev, held, skipped, own.as_deref())?;
+        let keep = held.contains(&rel);
+        if meta.is_dir() {
+            let own = key(&path)?;
+            if !keep && own.as_deref() != above {
+                continue;
             }
-        } else if !(meta.is_dir() && own.as_deref() != above) {
-            remove(&path)?;
+            // An omitted ordinary directory may still hold an excluded or
+            // separately encrypted child. Inspect its children before removal.
+            sweep(root, &rel, dev, held, skipped, own.as_deref())?;
+            if !keep {
+                match fs::remove_dir(&path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == ErrorKind::DirectoryNotEmpty => {}
+                    Err(e) => return Err(e).with_context(|| format!("take away {}", path.display())),
+                }
+            }
+        } else if !keep {
+            fs::remove_file(&path).with_context(|| format!("take away {}", path.display()))?;
         }
     }
     Ok(())
@@ -712,6 +901,42 @@ mod tests {
     }
 
     #[test]
+    fn a_sweep_leaves_excluded_data_even_if_the_archive_omits_the_parent_directory() {
+        let from = tempfile::tempdir().unwrap();
+        let to = tempfile::tempdir().unwrap();
+        fs::write(from.path().join("restored.txt"), b"fixture").unwrap();
+        let system = to.path().join("system_de/0");
+        fs::create_dir_all(system.join("spblob")).unwrap();
+        fs::write(system.join("spblob/key"), b"must stay").unwrap();
+        fs::write(system.join("obsolete"), b"remove").unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut tar = Vec::new();
+        pack(from.path(), &skipped(), &mut tar, &cancel, &mut |_| {}).unwrap();
+        unpack(tar.as_slice(), to.path(), &skipped(), &cancel, &mut |_| {}).unwrap();
+        assert_eq!(fs::read(system.join("spblob/key")).unwrap(), b"must stay");
+        assert!(!system.join("obsolete").exists());
+    }
+
+    #[test]
+    fn restoring_files_does_not_remove_existing_sibling_names() {
+        let to = tempfile::tempdir().unwrap();
+        let mut builder = Builder::new(Vec::new());
+        for (path, contents) in [(".sample.skyward-restore", &b"sibling"[..]), ("sample", &b"original"[..])] {
+            let mut header = Header::new_gnu();
+            header.set_mode(0o600);
+            header.set_uid(u64::from(unsafe { libc::geteuid() }));
+            header.set_gid(u64::from(unsafe { libc::getegid() }));
+            header.set_mtime(0);
+            header.set_size(contents.len() as u64);
+            builder.append_data(&mut header, path, contents).unwrap();
+        }
+        let tar = builder.into_inner().unwrap();
+        unpack(tar.as_slice(), to.path(), &skipped(), &AtomicBool::new(false), &mut |_| {}).unwrap();
+        assert_eq!(fs::read(to.path().join(".sample.skyward-restore")).unwrap(), b"sibling");
+        assert_eq!(fs::read(to.path().join("sample")).unwrap(), b"original");
+    }
+
+    #[test]
     fn binary_extended_attributes_survive_restore() {
         let to = tempfile::tempdir().unwrap();
         let cancel = AtomicBool::new(false);
@@ -727,6 +952,8 @@ mod tests {
         header.set_size(0);
         builder.append_data(&mut header, "app-ephemeral", io::empty()).unwrap();
         let tar = builder.into_inner().unwrap();
+
+        inspect(tar.as_slice(), to.path(), &skipped(), &cancel).unwrap();
 
         let mut archive = Archive::new(tar.as_slice());
         let mut entries = archive.entries().unwrap();
@@ -752,6 +979,7 @@ mod tests {
 
     #[test]
     fn records_with_invalid_pax_lengths_are_rejected() {
+        let target = tempfile::tempdir().unwrap();
         let mut builder = Builder::new(Vec::new());
         let incomplete = b"20 mtime=20\n";
         let mut pax = Header::new_ustar();
@@ -768,9 +996,7 @@ mod tests {
         builder.append_data(&mut dir, "app-ephemeral", io::empty()).unwrap();
 
         let tar = builder.into_inner().unwrap();
-        let mut archive = Archive::new(tar.as_slice());
-        let mut entry = archive.entries().unwrap().next().unwrap().unwrap();
-        let error = records(&mut entry).err().unwrap();
+        let error = inspect(tar.as_slice(), target.path(), &skipped(), &AtomicBool::new(false)).unwrap_err();
         assert_eq!(error.root_cause().to_string(), "malformed pax extension");
     }
 
@@ -840,7 +1066,8 @@ mod tests {
         let stop = AtomicBool::new(false);
         let mut archive = Vec::new();
         pack(&from, &skipped(), &mut archive, &stop, &mut |_| {}).unwrap();
-        // A backup of an existing directory safely replaces its symbolic link.
+        // Preflight and restore accept the directory without following the link.
+        inspect(archive.as_slice(), &to, &skipped(), &stop).unwrap();
         unpack(archive.as_slice(), &to, &skipped(), &stop, &mut |_| {}).unwrap();
         assert_eq!(fs::read(outside.join("value")).unwrap(), b"original");
         assert_eq!(fs::read(to.join("link/value")).unwrap(), b"backup");
@@ -858,6 +1085,51 @@ mod tests {
         assert!(unpack(archive.as_slice(), &to, &skipped(), &stop, &mut |_| {}).is_err());
         assert_eq!(fs::read(outside.join("value")).unwrap(), b"original");
         fs::remove_dir_all(at).unwrap();
+    }
+
+    #[test]
+    fn shared_files_restore_under_the_new_owner_and_exclude_backups() {
+        let source = tempfile::tempdir().unwrap();
+        let existing = tempfile::tempdir().unwrap();
+        let fresh = tempfile::tempdir().unwrap();
+        let base = source.path();
+        fs::create_dir_all(base.join(crate::FOLDER)).unwrap();
+        fs::create_dir(base.join("DCIM")).unwrap();
+        fs::write(base.join(crate::FOLDER).join("older-backup"), b"excluded").unwrap();
+        let incomplete = Path::new(crate::RESTORED_SHARED).join(".skyward-restore-files-interrupted");
+        fs::create_dir_all(base.join(&incomplete)).unwrap();
+        fs::write(base.join(&incomplete).join("partial"), b"excluded").unwrap();
+        fs::write(base.join("DCIM/照片.txt"), b"photo").unwrap();
+        fs::hard_link(base.join("DCIM/照片.txt"), base.join("copy.txt")).unwrap();
+        std::os::unix::fs::symlink("copy.txt", base.join("alias.txt")).unwrap();
+        fs::write(existing.path().join("copy.txt"), b"keep this file").unwrap();
+        let stop = AtomicBool::new(false);
+        let skipped = Skipped::shared_files();
+        assert_eq!(measure(base, &skipped, &stop).unwrap().0, 10);
+        let mut bytes = Vec::new();
+        pack(base, &skipped, &mut bytes, &stop, &mut |_| {}).unwrap();
+
+        unpack_shared_files(bytes.as_slice(), fresh.path(), &stop, &mut |_| {}).unwrap();
+        assert_eq!(fs::read(fresh.path().join("DCIM/照片.txt")).unwrap(), b"photo");
+        assert_eq!(fs::read(fresh.path().join("copy.txt")).unwrap(), b"photo");
+        assert_eq!(fs::metadata(fresh.path().join("copy.txt")).unwrap().mode() & 0o7111, 0);
+        assert!(!fresh.path().join(crate::FOLDER).exists());
+        assert!(!fresh.path().join(incomplete).exists());
+        assert!(!fresh.path().join("alias.txt").exists());
+        assert!(unpack_shared_files(bytes.as_slice(), existing.path(), &stop, &mut |_| {}).is_err());
+        assert_eq!(fs::read(existing.path().join("copy.txt")).unwrap(), b"keep this file");
+    }
+
+    #[test]
+    fn shared_files_restore_refuses_link_entries() {
+        let root = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("a-missing-file", root.path().join("a-link")).unwrap();
+        let mut bytes = Vec::new();
+        let stop = AtomicBool::new(false);
+        pack(root.path(), &Skipped::new(&[]), &mut bytes, &stop, &mut |_| {}).unwrap();
+        assert!(unpack_shared_files(bytes.as_slice(), target.path(), &stop, &mut |_| {}).is_err());
+        assert_eq!(fs::read_dir(target.path()).unwrap().count(), 0);
     }
 
     #[test]

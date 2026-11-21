@@ -1,6 +1,7 @@
 //! Erasing what the system, the wipe page or an update asks to erase, the
 //! way a phone's own recovery erases it, on a thread of its own.
 
+use crate::data_wipe::{self, APP_CACHES, SYSTEM_CACHES};
 use anyhow::{ensure, Context, Result};
 use skyward_block::fstab::{self, Entry};
 use skyward_block::{erase, mount};
@@ -10,7 +11,8 @@ use skyward_sys::worker::Worker;
 use skyward_vab::Hold;
 use std::ffi::CString;
 use std::fs;
-use std::os::fd::RawFd;
+use std::io::Read;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -33,10 +35,6 @@ const OWNER_APPS: &str = "/data/data";
 const USER_APPS: &str = "/data/user";
 const USER_APPS_EARLY: &str = "/data/user_de";
 
-/// In each app's own data, the folders it keeps caches in: of what it
-/// fetched or worked out, and of code it compiled itself.
-const APP_CACHES: [&str; 2] = ["cache", "code_cache"];
-
 /// Where the system notes the inode of each, on the folder of the app's
 /// own data, so the folders are found while the user's names are locked.
 /// Clearing an app's data takes the folders with it, and the notes too.
@@ -45,11 +43,6 @@ const CACHE_INODES: [&str; 2] = ["user.inode_cache", "user.inode_code_cache"];
 /// In each user's shared storage, the folders apps keep their own files
 /// in, one for each app; the first also holds each app's cache folder.
 const SHARED_APP_FOLDERS: [&str; 2] = ["Android/data", "Android/media"];
-
-/// The caches the system keeps for itself: the apps it has parsed, the
-/// resources of the overlays it applies, and /cache, which on phones with
-/// no cache partition is this folder.
-const SYSTEM_CACHES: [&str; 3] = ["/data/system/package_cache", "/data/resource-cache", "/data/cache"];
 
 /// Where ART keeps on the data partition what it compiles ahead of time:
 /// the system's own apps, what the ART module compiles for the boot
@@ -96,6 +89,8 @@ const PROGRESS_EVERY: Duration = Duration::from_millis(100);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
     Data,
+    /// Data contents without shared storage or encryption material.
+    DataKeepMedia,
     Cache,
     /// /metadata, which holds the key the data partition is opened with.
     Metadata,
@@ -139,6 +134,10 @@ pub enum Stop {
     Refused(Refusal),
     /// The data partition did not open, for the parts in it.
     Closed(String),
+    /// Validation failed before the operation could change user data.
+    Preflight(String),
+    /// The key stage started but did not verify. File deletion did not begin.
+    KeyCleanup(String),
     /// These users' own files are still locked, and the parts chosen are
     /// partly in them: nothing was erased.
     Locked(Vec<u32>),
@@ -184,6 +183,79 @@ pub fn factory_reset(reformat: Option<String>) -> Result<Plan, Stop> {
         Ok(Err(refusal)) => Err(Stop::Refused(refusal)),
         Err(e) => Err(Stop::Failed(Step::Data, e)),
     }
+}
+
+/// Validate the physical targets and ROM's startup format policy on lmi.
+pub(crate) fn lmi_format_plan() -> Result<Plan, Stop> {
+    let device = (|| -> Result<()> {
+        ensure!(skyward_sys::prop("ro.product.device").as_deref() == Some("lmi") && skyward_vab::current_slot()?.is_none(),
+            "the reset requires an unslotted lmi");
+        Ok(())
+    })();
+    device.map_err(failed(Step::Data))?;
+    let mut plan = factory_reset(None)?;
+    let validate = (|| -> Result<()> {
+        let key = plan.data.extra("keydirectory").context("data has no metadata key directory")?;
+        let relative = Path::new(key).strip_prefix(METADATA).context("data encryption keys are outside metadata")?;
+        ensure!(plan.data.filesystem == "f2fs" && plan.data.extra("fileencryption").is_some()
+            && !relative.as_os_str().is_empty()
+            && relative.components().all(|c| matches!(c, std::path::Component::Normal(_))),
+            "unsupported encryption or filesystem for lmi data");
+        let data = lmi_writable_partition(&mut plan.data, "userdata")?;
+        let metadata = lmi_formatter(&mut plan.metadata, "metadata")?;
+        ensure!(data != metadata, "data and metadata alias the same partition");
+        if let Some(cache) = &mut plan.cache {
+            let cache = lmi_formatter(cache, "cache")?;
+            ensure!(cache != data && cache != metadata, "cache aliases an encrypted data partition");
+        }
+        Ok(())
+    })();
+    validate.map_err(failed(Step::Data))?;
+    Ok(plan)
+}
+
+/// An independent cache partition from the live ROM's fstab.
+pub(crate) fn lmi_cache_plan() -> Result<Option<Parts>, Stop> {
+    let Some(mut cache) = cache().map_err(failed(Step::Cache))? else { return Ok(None) };
+    lmi_formatter(&mut cache, "cache").map_err(failed(Step::Cache))?;
+    Ok(Some(Parts { steps: vec![Step::Cache], cache: Some(cache), logs: Vec::new(), reformat: None }))
+}
+
+fn lmi_formatter(entry: &mut Entry, name: &str) -> Result<(u32, u32)> {
+    let program = match entry.filesystem.as_str() {
+        "ext4" => "/system/bin/mke2fs",
+        "f2fs" => "/system/bin/make_f2fs",
+        other => anyhow::bail!("unsupported {name} filesystem {other}"),
+    };
+    ensure!(Path::new(program).is_file(), "{program} is missing");
+    lmi_writable_partition(entry, name)
+}
+
+fn lmi_writable_partition(entry: &mut Entry, name: &str) -> Result<(u32, u32)> {
+    use std::os::unix::fs::FileTypeExt;
+    ensure!(Path::new(&entry.device).file_name().is_some_and(|n| n == name)
+        && !entry.extras.iter().any(|flag| flag == "logical" || flag == "slotselect"),
+        "the fstab entry is not the physical {name} partition");
+    let device = PathBuf::from(fstab::device(entry)?).canonicalize()?;
+    let by_name = Path::new(skyward_block::BY_NAME).join(name);
+    let dev = skyward_block::devnum(&device)?;
+    ensure!(fs::metadata(&device)?.file_type().is_block_device() && dev == skyward_block::devnum(&by_name)?,
+        "fstab and the boot device disagree on {name}");
+    let point = Path::new(&entry.mount_point);
+    ensure!(mount::points_of(dev)?.iter().all(|path| path == point),
+        "{name} is mounted outside {}", entry.mount_point);
+    ensure!(mount::mount_ids()?.iter().all(|(_, path)| path == point || !path.starts_with(point)),
+        "another filesystem is mounted below {}", entry.mount_point);
+    let file = fs::File::open(&device)?;
+    let mut readonly: libc::c_int = 0;
+    const BLKROGET: libc::c_int = 0x125e;
+    if unsafe { libc::ioctl(file.as_raw_fd(), BLKROGET, &mut readonly) } != 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| format!("check {name} for write protection"));
+    }
+    ensure!(readonly == 0, "{name} is read-only");
+    ensure!(skyward_block::size_bytes(&device)? != 0, "{name} is empty");
+    entry.device = device.to_str().context("invalid physical partition path")?.to_owned();
+    Ok(dev)
 }
 
 /// The update that keeps the data partition from being erased, if one does,
@@ -267,7 +339,7 @@ pub struct Parts {
 /// folders in the data partition.
 pub fn parts(steps: Vec<Step>, logs: &[String], reformat: Option<String>) -> Result<Parts, Stop> {
     assert!(
-        steps.iter().all(|s| !matches!(s, Step::Data | Step::Metadata)),
+        steps.iter().all(|s| !matches!(s, Step::Data | Step::DataKeepMedia | Step::Metadata)),
         "the data partition and /metadata are erased whole only by a factory reset, not {steps:?}"
     );
     let cache = match steps.contains(&Step::Cache) {
@@ -311,7 +383,7 @@ impl Parts {
                 }),
                 Step::Media => shared_storage(&users.storage).and_then(|paths| clear(&paths, tell)),
                 Step::AppCaches => users.app_caches().and_then(|paths| clear(&paths, tell)),
-                Step::SystemCaches => clear_files(&SYSTEM_CACHES.map(PathBuf::from), tell),
+                Step::SystemCaches => clear_files(&SYSTEM_CACHES.map(|p| Path::new(DATA).join(p)), tell),
                 Step::Art => clear_files(&ART_CACHES.map(PathBuf::from), tell),
                 Step::Logs => users.logs(&self.logs).and_then(|folders| clear_files(&folders, tell)),
                 Step::Updates => clear_files(&[PathBuf::from(UPDATES)], tell),
@@ -319,12 +391,73 @@ impl Parts {
                     let cache = self.cache.as_ref().expect("the cache partition was found as the parts were");
                     remake_cache(cache, self.reformat.as_deref().unwrap_or(&cache.filesystem))
                 }
-                Step::Data | Step::Metadata => unreachable!("only a factory reset erases {step:?}"),
+                Step::Data | Step::DataKeepMedia | Step::Metadata => unreachable!("only a factory reset erases {step:?}"),
             };
             erased.map_err(failed(step))?;
         }
         Ok(())
     }
+}
+
+/// Plan every requested group before deleting any files on the lmi mount.
+pub(crate) fn clear_lmi_groups(
+    root: data_wipe::DataRoot,
+    choices: Vec<(Step, data_wipe::Group)>,
+    tell: &mut dyn FnMut(Event),
+) -> Result<(), Stop> {
+    data_wipe::validate_groups(choices.iter().map(|&(_, group)| group))
+        .map_err(|error| Stop::Preflight(error.to_string()))?;
+    if choices.iter().any(|(step, _)| *step == Step::DataKeepMedia) {
+        crate::legacy_data::check_keystore_sdk()
+            .map_err(|error| Stop::Preflight(format!("check the installed Android SDK: {error:#}")))?;
+    }
+    let mut planned = choices.into_iter().map(|(step, group)| {
+        let planned = root.prepare(group).map_err(|error| Stop::Preflight(format!("{step:?}: {error:#}")))?;
+        Ok((step, planned))
+    }).collect::<Result<Vec<_>, Stop>>()?;
+    if let Some((_, plan)) = planned.iter_mut().find(|(step, _)| *step == Step::DataKeepMedia) {
+        let scratch = Path::new("/dev");
+        let keys = data_wipe::KeyCleanup::prepare(&root, scratch)
+            .map_err(|error| Stop::Preflight(format!("check Android Keystore: {error:#}")))?;
+        let mut started = false;
+        let outcome = keys.apply(&root, plan, scratch, |targets, files| {
+            let mut begin = || {
+                started = true;
+                tell(Event::NeedsReboot);
+            };
+            let cleared = if targets.is_empty() {
+                begin();
+                Ok(())
+            } else {
+                let store = data_wipe::KeystoreTarget::open(&root, Path::new(DATA), files)?;
+                crate::legacy_data::clear_app_keys(&store, targets, begin)
+            };
+            if started {
+                let stopped = crate::legacy_data::stop_for_local_install()
+                    .context("stop the lmi decryption services");
+                cleared?;
+                stopped
+            } else {
+                cleared
+            }
+        });
+        outcome.map_err(|error| {
+            if started {
+                Stop::KeyCleanup(format!("{error:#}"))
+            } else {
+                Stop::Preflight(format!("prepare app Keystore cleanup: {error:#}"))
+            }
+        })?;
+    }
+    for (step, planned) in planned {
+        tell(Event::At(step));
+        told(tell, |_, progress| {
+            root.execute(planned, &mut |done, total| {
+                progress(skyward_files::Progress { entries: done, total_entries: total, ..Default::default() });
+            })
+        }).map_err(failed(step))?;
+    }
+    Ok(())
 }
 
 /// Where the data partition keeps each user's apps' data and shared
@@ -728,22 +861,29 @@ fn read_logs(device: &Path, at: &Path) -> Result<Option<(Look, Vec<Log>)>> {
         return Ok(None);
     }
     let read = (|| -> Result<Option<(Look, Vec<Log>)>> {
+        use rustix::fs::{self as at_fs, Mode};
+        use rustix::io::Errno;
         let dir = at.join(CACHE_LOGS);
-        if !dir.is_dir() {
-            return Ok(None);
-        }
+        let folder = match at_fs::open(&dir, crate::storage::DIRECTORY, Mode::empty()) {
+            Ok(fd) => fs::File::from(fd),
+            Err(Errno::NOENT | Errno::NOTDIR | Errno::LOOP) => return Ok(None),
+            Err(error) => return Err(error).context("open the cache log directory"),
+        };
+        // Keep lookups inside the mounted cache, even if a name is a link.
+        let path = Path::new("/proc/self/fd").join(folder.as_raw_fd().to_string()).join(".");
         let mut logs = Vec::new();
-        for path in contents(&dir)? {
-            let name = path.file_name().with_context(|| format!("{} has no name", path.display()))?.to_owned();
+        for log in contents(&path)? {
+            let name = log.file_name().with_context(|| format!("{} has no name", log.display()))?;
             let text = name.to_string_lossy();
-            if !(text.starts_with("last_") || text == "log") || !path.is_file() {
+            if !(text.starts_with("last_") || text == "log") || !fs::symlink_metadata(&log)?.is_file() {
                 continue;
             }
-            let mut data = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-            data.truncate(LOG_KEPT);
-            logs.push(Log { name: PathBuf::from(name), data, look: look(&path)? });
+            let file = crate::storage::open_regular(&folder, name)?;
+            let mut data = Vec::new();
+            file.take(LOG_KEPT as u64).read_to_end(&mut data)?;
+            logs.push(Log { name: PathBuf::from(name), data, look: look(&log)? });
         }
-        Ok(Some((look(&dir)?, logs)))
+        Ok(Some((look(&path)?, logs)))
     })();
     let unmounted = mount::umount(at);
     let read = read?;
@@ -756,6 +896,8 @@ pub enum Event {
     At(Step),
     /// How far the part under way has come: entries done, of how many.
     Progress(u64, u64),
+    /// Decryption services may have stopped; require a system reboot.
+    NeedsReboot,
     /// Erasing opened the data partition, as far as it opens without any
     /// user's credential.
     Opened(Opening),
@@ -806,6 +948,8 @@ pub fn said(stop: &Stop) -> String {
     match stop {
         Stop::Refused(r) => format!("refused: {r:?}"),
         Stop::Closed(why) => format!("the data partition did not open: {why}"),
+        Stop::Preflight(why) => format!("wipe did not pass preflight: {why}"),
+        Stop::KeyCleanup(why) => format!("app Keystore cleanup stopped before file removal: {why}"),
         Stop::Locked(users) => format!("the own files of users {users:?} are locked"),
         Stop::Failed(step, e) => format!("{step:?} failed: {e:#}"),
     }

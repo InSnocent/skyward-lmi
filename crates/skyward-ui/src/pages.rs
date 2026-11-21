@@ -2,7 +2,7 @@ use crate::app::{
     Action, BackupAt, BackupEnd, BackupJob, BackupKind, Check, ClashChoice, Confirm, Damage, Data, Dock, DownloadEnd, EraseStop, Field, FileKind,
     FileOp, FileTask, Fold, Folder, Frame, FsAction, FsChoice, FsRow, Have, HeroArt, Hit, Install, JobEnd, Keys, Pick, Place, Rows, Screen,
     SkywardCheck, SkywardEnd, SkywardJob, SkywardStage, Slider, Source, State, Switch, SystemsWork, Target, UsbDrive, UsbLink, Wipe, ADDABLE,
-    BACKUP_PARTS, DATA_ERASED, DATA_PARTITION, DOWNLOADS, FASTBOOT_CHOICES, SCREEN_OFF, TARGETS, TIME_ZONES, USB_DRIVE_UNREADABLE,
+    BACKUP_PARTS, DATA_ERASED, DATA_PARTITION, DOWNLOADS, FASTBOOT_CHOICES, LMI_BACKUP_PARTS, SCREEN_OFF, SHARED_FILES, TARGETS, TIME_ZONES, USB_DRIVE_UNREADABLE,
     USB_DRIVE_WANTED, WIPES, installs, starting,
 };
 use crate::canvas::Canvas;
@@ -20,7 +20,7 @@ use crate::tr;
 use crate::icons::{self, Icon};
 use crate::widgets::{self, Caption, Detail, Fact, Outline, Row, Spec, SystemCard, SystemMark, Tone, Trail};
 use skyward_info::{DeviceInfo, VERSION};
-use skyward_install::{Outcome, Reflash, Refusal, Stage};
+use skyward_install::{Outcome, Reflash, Refusal, Stage, lmi_zip};
 use skyward_net::download::Progress;
 use skyward_net::supplicant::Security;
 use skyward_net::wlan::{Bands, Network, Power, Stage as Joining};
@@ -70,6 +70,7 @@ pub fn render(screen: Screen, cx: &Ctx) -> Frame {
         Screen::CropWallpaper => crop_wallpaper(cx),
         Screen::Reboot => reboot(cx),
         Screen::Wipe => wipe(cx),
+        Screen::FormatData => format_data(cx),
         Screen::Mount => mount(cx),
         Screen::Install => install(cx),
         Screen::Choose(place) => choose(cx, place),
@@ -130,11 +131,12 @@ pub fn confirm_label(which: Confirm, s: &State) -> (&'static str, bool) {
         Confirm::Backup => (["滑动以备份", "滑動以備份", "Slide to back up"], false),
         Confirm::Restore => (["滑动以恢复", "滑動以還原", "Slide to restore"], true),
         Confirm::Slot => (["滑动以切换", "滑動以切換", "Slide to switch"], true),
+        Confirm::FactoryReset if s.lmi_wipe => (["滑动以格式化", "滑動以格式化", "Slide to format"], true),
         Confirm::FactoryReset => (["滑动以恢复出厂设置", "滑動以恢復原廠設定", "Slide to factory reset"], true),
         Confirm::DeleteEntry | Confirm::DeleteBackup => (["滑动以删除", "滑動以刪除", "Slide to delete"], true),
         Confirm::Install => (INSTALL, false),
         Confirm::InstallWipe => (["滑动以安装并清除", "滑動以安裝並清除", "Slide to install and wipe"], true),
-        Confirm::RunScript if s.local_zip_name().is_some() => (["滑动以刷入 ZIP", "滑動以刷入 ZIP", "Swipe to flash ZIP"], true),
+        Confirm::RunScript if s.local_zip_name().is_some() || matches!(s.install, Install::ConfirmingLmiZip { .. }) => (["滑动以刷入 ZIP", "滑動以刷入 ZIP", "Swipe to flash ZIP"], true),
         Confirm::RunScript => (INSTALL, true),
         Confirm::Merge => (["滑动以合并", "滑動以合併", "Slide to merge"], true),
         Confirm::Relabel => (["滑动以修复", "滑動以修復", "Slide to fix"], true),
@@ -1074,7 +1076,11 @@ pub fn install(cx: &Ctx) -> Frame {
         if cx.state.block_ota_install {
             let (subtitle, action) = if cx.state.data.storage_open() {
                 (
-                    l.pick(["选择与此 Recovery 匹配的完整 ROM", "選擇與此 Recovery 相符的完整 ROM", "Choose the full ROM matching this recovery"]),
+                    if cx.state.lmi_zip_install {
+                        l.pick(["选择完整 lmi ROM、脚本 ZIP 或 IMG", "選擇完整 lmi ROM、指令碼 ZIP 或 IMG", "Choose a full lmi ROM, script ZIP or IMG"])
+                    } else {
+                        l.pick(["选择与此 Recovery 匹配的完整 ROM", "選擇與此 Recovery 相符的完整 ROM", "Choose the full ROM matching this recovery"])
+                    },
                     Action::Open(Screen::Choose(Place::Storage)),
                 )
             } else {
@@ -1084,6 +1090,16 @@ pub fn install(cx: &Ctx) -> Frame {
                 .icon(BLUE, Icon::Phone).subtitle(subtitle));
             actions.push(action);
         }
+        if cx.state.lmi_zip_install {
+            let subtitle = match &cx.state.usb_drive {
+                Some(UsbDrive::Shown) => ["选择 U 盘中的 ZIP", "選擇 USB 隨身碟中的 ZIP", "Choose a ZIP on the USB drive"],
+                Some(UsbDrive::Unreadable(_)) => USB_DRIVE_UNREADABLE,
+                None => USB_DRIVE_WANTED,
+            };
+            let place = Place::UsbDrive;
+            rows.push(Row::new(install_title(l, Source::File(place))).icon(PURPLE, Icon::UsbDrive).subtitle(l.pick(subtitle)));
+            actions.push(Action::Open(Screen::Choose(place)));
+        }
         let subtitle = l.pick(["在电脑上运行 adb sideload", "在電腦上執行 adb sideload", "Run adb sideload on the computer"]);
         if cx.state.block_ota_preflight {
             let title = l.pick(["ADB sideload 只读预检", "ADB sideload 唯讀預檢", "ADB sideload preflight"]);
@@ -1091,7 +1107,9 @@ pub fn install(cx: &Ctx) -> Frame {
             actions.push(Action::SideloadPreflight);
         }
         if cx.state.block_ota_install || cx.state.sideload_test {
-            let title = if cx.state.block_ota_install {
+            let title = if cx.state.lmi_zip_install {
+                l.pick(["ADB sideload 安装 ZIP", "ADB sideload 安裝 ZIP", "Install ZIP via ADB sideload"])
+            } else if cx.state.block_ota_install {
                 l.pick(["ADB sideload 安装系统", "ADB sideload 安裝系統", "Install system via ADB sideload"])
             } else {
                 l.pick(["ADB sideload 测试", "ADB sideload 測試", "ADB sideload test"])
@@ -1100,7 +1118,13 @@ pub fn install(cx: &Ctx) -> Frame {
             actions.push(Action::Sideload);
         }
         let rows = widgets::list(&mut c, t, f, y, &rows);
-        let note = if cx.state.block_ota_install {
+        let note = if cx.state.lmi_zip_install {
+            l.pick([
+                "ZIP 默认验签，滑动确认后才会安装。也可选择 lmi 的 boot 或 recovery IMG。",
+                "ZIP 預設驗證簽章，滑動確認後才會安裝。也可選擇 lmi 的 boot 或 recovery IMG。",
+                "ZIPs are checked against trusted signatures. Swipe to install. You can also choose an lmi boot or recovery IMG.",
+            ])
+        } else if cx.state.block_ota_install {
             l.pick([
                 "可选择对应的完整 ROM ZIP 或 lmi 的 boot / recovery IMG。核对后需滑动确认才会写入目标分区。",
                 "可選擇對應的完整 ROM ZIP 或 lmi 的 boot / recovery IMG。核對後需滑動確認才會寫入目標分割區。",
@@ -1309,14 +1333,22 @@ fn reflashed(c: &mut Canvas, cx: &Ctx, y: f32) -> f32 {
     }
 }
 
+/// Show a short, following tail during the install. On the result page the
+/// complete on-screen history can be scrolled.
+fn visible_script_output(s: &State) -> &[String] {
+    const LIVE_LINES: usize = 8;
+    let lines = &s.script_output;
+    if matches!(s.install, Install::Scripting { .. }) { &lines[lines.len().saturating_sub(LIVE_LINES)..] } else { lines }
+}
+
 /// What the install script showed, where there is any: its heading, and
 /// under it the lines as the page's long list, the last thing on the page.
 fn script_output(c: &mut Canvas, cx: &Ctx, y: f32, rows: &mut Option<Rows>) -> f32 {
-    let lines = &cx.state.script_output;
+    let lines = visible_script_output(cx.state);
     if lines.is_empty() {
         return y;
     }
-    let y = widgets::section(c, cx.t, cx.f, y, cx.state.lang.pick(["安装脚本输出", "安裝指令碼輸出", "Install script output"]));
+    let y = widgets::section(c, cx.t, cx.f, y, cx.state.lang.pick(["安装日志", "安裝記錄", "Install log"]));
     *rows = Some(Rows { edges: widgets::output_edges(c, cx.t, cx.f, y, lines), action: None });
     y
 }
@@ -1431,8 +1463,9 @@ pub fn installing(cx: &Ctx) -> Frame {
             });
             let y = widgets::progress_card(&mut c, t, f, y + t.m.card_gap, l.pick(["正在校验 ZIP", "正在驗證 ZIP", "Checking ZIP"]), &detail, progress);
             let track = widgets::pending_confirm(&mut c, t, f, y + t.m.dp(28.0), l.pick(["等待校验", "等待驗證", "Awaiting verification"]));
-            widgets::footnote(&mut c, t, f, track.y + track.h,
-                l.pick(["现在只读取文件。校验通过后，滑动才会刷入。返回可取消。", "現在只讀取檔案。驗證通過後，滑動才會刷入。返回可取消。", "Checking only. After verification, swipe to flash or go back to cancel."]))
+            let y = widgets::footnote(&mut c, t, f, track.y + track.h,
+                l.pick(["现在只读取文件。校验通过后，滑动才会刷入。返回可取消。", "現在只讀取檔案。驗證通過後，滑動才會刷入。返回可取消。", "Checking only. After verification, swipe to flash or go back to cancel."]));
+            if s.source.uses_usb_drive() { widgets::footnote(&mut c, t, f, y, l.pick(KEEP_DRIVE)) } else { y }
         }
         Install::Checking { stage: Some(Stage::InspectingImage { done, total }), .. } => {
             let read = share(*done, *total);
@@ -1649,6 +1682,42 @@ pub fn installing(cx: &Ctx) -> Frame {
             let y = widgets::progress_card(&mut c, t, f, top, &title, &detail, done);
             widgets::footnote(&mut c, t, f, y, until_installed(l, s.source))
         }
+        Install::ConfirmingLmiZip { report, allowed } => {
+            let heading = l.pick(["检查安装包", "檢查安裝包", "Review installation package"]);
+            let detail = match &report.kind {
+                lmi_zip::Kind::Block(_) => l.pick([
+                    "完整 ROM 会更新 super。若包包含 boot，当前 Root 可能失效。",
+                    "完整 ROM 會更新 super。若包包含 boot，目前的 Root 可能失效。",
+                    "A full ROM updates super. If it includes boot, current root access may be lost.",
+                ]),
+                lmi_zip::Kind::Script => l.pick([
+                    "脚本以 Recovery 权限运行，实际写入哪些分区由脚本决定。",
+                    "指令碼以 Recovery 權限執行，實際寫入哪些分割區由指令碼決定。",
+                    "The script runs with recovery privileges and controls which partitions it writes.",
+                ]),
+            };
+            let y = widgets::list(&mut c, t, f, top, &[standing(heading, ORANGE, Icon::Install, detail)]).bottom;
+            let facts = lmi_zip_facts(l, report, s.local_zip_name());
+            let mut y = widgets::info_card(&mut c, t, f, y + t.m.card_gap, &facts);
+            if s.source.uses_usb_drive() {
+                y = widgets::footnote(&mut c, t, f, y, until_installed(l, s.source));
+            }
+            if report.requires_approval() && !allowed {
+                let row = Row::new(l.pick(["仅本次允许安装", "僅本次允許安裝", "Allow this ZIP once"]))
+                    .icon(ORANGE, Icon::Install)
+                    .subtitle(l.pick(["确认来源可信后再继续", "確認來源可信後再繼續", "Continue only if you trust the source"]));
+                let allow = widgets::list(&mut c, t, f, y + t.m.card_gap, &[row]);
+                out.extend(hits(&allow.rows, &[Action::AllowUnverifiedZip]));
+                y = allow.bottom;
+            } else {
+                let (label, danger) = confirm_label(Confirm::RunScript, s);
+                let track = widgets::confirm(&mut c, t, f, y + t.m.dp(28.0), label, danger, s.confirm);
+                out.push(Hit { rect: track, action: Action::Confirm(Confirm::RunScript) });
+                y = track.y + track.h;
+            }
+            let note = l.pick(["返回将取消安装，不会运行安装脚本。", "返回將取消安裝，不會執行安裝指令碼。", "Going back cancels the install without running the script."]);
+            widgets::footnote(&mut c, t, f, y, note)
+        }
         Install::ConfirmingScript => {
             let name = s.package_name.as_deref().unwrap_or(l.pick(["刷机包", "刷機包", "Flashable zip"]));
             let detail = l.pick([
@@ -1719,7 +1788,7 @@ pub fn installing(cx: &Ctx) -> Frame {
     };
     let title = match (&s.install, s.local_zip_name()) {
         (Install::Checking { .. }, Some(_)) => l.pick(["校验 ZIP", "驗證 ZIP", "Check ZIP"]),
-        (Install::ConfirmingScript, Some(_)) => l.pick(["确认刷入 ZIP", "確認刷入 ZIP", "Confirm ZIP installation"]),
+        (Install::ConfirmingLmiZip { .. }, _) | (Install::ConfirmingScript, Some(_)) => l.pick(["确认刷入 ZIP", "確認刷入 ZIP", "Confirm ZIP installation"]),
         _ => install_title(l, s.source),
     };
     Frame { rows, ..Frame::new(t, fit(c, t, bottom), out, title, top) }
@@ -1777,6 +1846,23 @@ fn block_ota_facts(l: Lang, report: &skyward_install::block_preflight::BlockPref
     ]
 }
 
+fn lmi_zip_facts(l: Lang, report: &lmi_zip::Report, name: Option<&str>) -> Vec<(&'static str, String)> {
+    let mut facts = Vec::new();
+    if let Some(name) = name { facts.push((l.pick(["文件", "檔案", "File"]), name.to_owned())); }
+    let signature = match report.signature {
+        lmi_zip::ZipSignature::Trusted => l.pick(["可信签名验证通过", "可信簽章驗證通過", "Trusted signature verified"]),
+        lmi_zip::ZipSignature::PublicTest => l.pick(["公开测试签名，来源未验证", "公開測試簽章，來源未驗證", "Public test key; source not authenticated"]),
+        lmi_zip::ZipSignature::Unsigned => l.pick(["没有整包签名", "沒有整包簽章", "No whole-file signature"]),
+        lmi_zip::ZipSignature::Unverified => l.pick(["签名未获信任或内容不符", "簽章未獲信任或內容不符", "Untrusted signature or changed content"]),
+    };
+    facts.push((l.pick(["签名", "簽章", "Signature"]), signature.into()));
+    facts.push(("SHA-256", report.sha256_hex()));
+    if let lmi_zip::Kind::Block(targets) = &report.kind {
+        facts.extend(block_ota_facts(l, targets));
+    }
+    facts
+}
+
 fn finished(
     c: &mut Canvas,
     cx: &Ctx,
@@ -1788,7 +1874,7 @@ fn finished(
 ) -> f32 {
     let (t, f, source, l) = (cx.t, cx.f, cx.state.source, cx.state.lang);
     let gap = t.m.card_gap;
-    let zip_preflight_failed = cx.state.local_zip_name().is_some() && cx.state.block_ota_targets.is_none();
+    let zip_preflight_failed = cx.state.local_zip_name().is_some() && !cx.state.lmi_zip_install && cx.state.block_ota_targets.is_none();
     let zip_failure = ["ZIP 未通过预检", "ZIP 未通過預檢", "ZIP preflight failed"];
     let choose_another = ["选择其他文件", "選擇其他檔案", "Choose another file"];
     let (again, another) = match source {
@@ -1804,6 +1890,15 @@ fn finished(
     let installed = l.pick(["安装成功", "安裝成功", "Installed"]);
     let nothing_written = l.pick(["未写入任何内容。", "未寫入任何內容。", "Nothing was written."]);
     match outcome {
+        Outcome::LmiZipPreflight(report) => {
+            let title = l.pick(["只读预检通过", "唯讀預檢通過", "Preflight passed"]);
+            let detail = l.pick(["已检查签名和包结构。未运行安装脚本。", "已檢查簽章和包結構。未執行安裝指令碼。", "Signature and package structure checked. The updater did not run."]);
+            let y = widgets::list(c, t, f, top, &[standing(title, GREEN, Icon::Install, detail)]).bottom;
+            let y = widgets::info_card(c, t, f, y + gap, &lmi_zip_facts(l, report, None));
+            let next = widgets::list(c, t, f, y + gap, &[restart, again]);
+            out.extend(hits(&next.rows, &[Action::RebootTo(Target::System), another]));
+            widgets::footnote(c, t, f, next.bottom, nothing_written)
+        }
         Outcome::BlockPreflight(report) => {
             let title = l.pick(["只读预检通过", "唯讀預檢通過", "Preflight passed"]);
             let detail = l.pick(["原 Recovery 证书验签通过。", "原 Recovery 憑證驗證通過。", "Verified against the original recovery certificates."]);
@@ -1976,6 +2071,22 @@ fn wipe_row(w: Wipe, s: &State) -> (&'static str, String) {
     let l = s.lang;
     let (title, what): (Text, String) = match w {
         Wipe::All => (["全部数据", "全部資料", "All data"], capitalized(l, &factory_reset(s))),
+        Wipe::DataKeepMedia => (
+            ["Data（保留内部存储）", "Data（保留內部儲存空間）", "Data (keep internal storage)"],
+            l.pick([
+                "清除应用、账户、Root 模块和多数系统设置。保留内部存储、用户身份和解密所需凭据",
+                "清除應用程式、帳戶、Root 模組和多數系統設定。保留內部儲存空間、使用者身分和解密所需憑證",
+                "Clears apps, accounts, root modules and most settings. Keeps internal storage, user identities and decryption credentials",
+            ]).into(),
+        ),
+        Wipe::AppData if s.lmi_wipe => (
+            ["应用数据", "應用程式資料", "App data"],
+            l.pick([
+                "清除各用户的应用私有文件、设置和登录状态",
+                "清除各使用者的應用程式私有檔案、設定和登入狀態",
+                "Clears users' private app files, settings and sign-ins",
+            ]).into(),
+        ),
         Wipe::AppData => (
             ["应用数据", "應用程式資料", "App data"],
             l.pick([
@@ -1984,6 +2095,14 @@ fn wipe_row(w: Wipe, s: &State) -> (&'static str, String) {
                 "/data/data, /data/user, /data/user_de, and Android/data and Android/media in internal storage. Apps go back to how they were first installed",
             ])
             .into(),
+        ),
+        Wipe::Media if s.lmi_wipe => (
+            ["内部存储", "內部儲存空間", "Internal storage"],
+            l.pick([
+                "清除各用户的照片、视频、下载和保存在手机里的备份",
+                "清除各使用者的相片、影片、下載和儲存在手機裡的備份",
+                "Clears users' photos, videos, downloads and backups stored on the phone",
+            ]).into(),
         ),
         Wipe::Media => (
             ["内部存储", "內部儲存空間", "Internal storage"],
@@ -2006,6 +2125,14 @@ fn wipe_row(w: Wipe, s: &State) -> (&'static str, String) {
                 "/data/system/package_cache, /data/resource-cache and /data/cache, made again at the next start",
             ])
             .into(),
+        ),
+        Wipe::Art if s.lmi_wipe => (
+            ["Dalvik / ART 缓存", "Dalvik / ART 快取", "Dalvik / ART cache"],
+            l.pick([
+                "清除已编译的运行时文件，下次开机时重新生成",
+                "清除已編譯的執行階段檔案，下次開機時重新產生",
+                "Clears compiled runtime files. Android rebuilds them at the next start",
+            ]).into(),
         ),
         Wipe::Art => (
             ["ART 缓存", "ART 快取", "ART cache"],
@@ -2035,7 +2162,7 @@ fn wipe_row(w: Wipe, s: &State) -> (&'static str, String) {
             l.pick(["/data/ota_package 中的系统更新包", "/data/ota_package 中的系統更新檔", "System update packages in /data/ota_package"]).into(),
         ),
         Wipe::Cache => (
-            ["全部内容", "全部內容", "Everything"],
+            if s.lmi_wipe { ["cache 分区", "cache 分割區", "Cache partition"] } else { ["全部内容", "全部內容", "Everything"] },
             l.pick(["格式化 cache 分区，保留 recovery 文件夹中的日志", "格式化 cache 分割區，保留 recovery 資料夾中的記錄", "Formats the cache partition, keeping the logs in its recovery folder"]).into(),
         ),
     };
@@ -2051,6 +2178,44 @@ pub fn wipe(cx: &Ctx) -> Frame {
     let mut c = long_page(cx);
     let mut out = Vec::new();
     let top = t.m.content_top;
+    if s.lmi_wipe {
+        let y = widgets::section_first(&mut c, t, f, top, l.pick(["高级清除", "進階清除", "Advanced wipe"]));
+        let choices: Vec<_> = WIPES.into_iter().filter(|&w| s.lmi_wipe_offers(w)).collect();
+        let labels: Vec<_> = choices.iter().map(|&w| wipe_row(w, s)).collect();
+        let rows: Vec<Row> = choices.iter().zip(&labels)
+            .map(|(&w, (name, sub))| Row::new(name).subtitle(sub).trail(Trail::Check(chosen(w))))
+            .collect();
+        let rows = widgets::list(&mut c, t, f, y, &rows);
+        out.extend(rows.rows.iter().zip(&choices).map(|(&rect, &w)| Hit { rect, action: Action::WipeItem(w) }));
+        let needs_data = choices.iter().any(|&w| w != Wipe::Cache && chosen(w));
+        let y = if s.lmi_wipe_data_open() || (s.cache_partition && chosen(Wipe::Cache) && !needs_data) {
+            let (label, danger) = confirm_label(Confirm::Wipe, s);
+            let track = widgets::confirm(&mut c, t, f, rows.bottom + t.m.dp(24.0), label, danger, s.confirm);
+            out.push(Hit { rect: track, action: Action::Confirm(Confirm::Wipe) });
+            track.y + track.h
+        } else if s.data == Data::Open && s.lmi_wipe_locked_profiles {
+            widgets::footnote(&mut c, t, f, rows.bottom, l.pick([
+                "仍有用户资料未解锁。请返回系统检查其他用户的存储。",
+                "仍有使用者資料未解鎖。請返回系統檢查其他使用者的儲存空間。",
+                "Some user files are still locked. Check the other users' storage in Android.",
+            ]))
+        } else {
+            let words = ["解密以清除 data 中的项目", "解密以清除 data 中的項目", "Decrypt to wipe items in data"];
+            let decrypt = widgets::list(&mut c, t, f, rows.bottom + t.m.card_gap, &[Row::new(l.pick(words))]);
+            out.extend(hits(&decrypt.rows, &[Action::Open(Screen::Decrypt)]));
+            decrypt.bottom
+        };
+        let y = if s.lmi_format_data {
+            let format = widgets::list(&mut c, t, f, y + t.m.card_gap, &[
+                Row::new(l.pick(LMI_FORMAT_DATA)).tint(t.pal.danger).subtitle(l.pick([
+                    "清除整个 data 并重建加密", "清除整個 data 並重建加密", "Erase all of data and recreate encryption",
+                ])),
+            ]);
+            out.extend(hits(&format.rows, &[Action::Open(Screen::FormatData)]));
+            format.bottom
+        } else { y };
+        return Frame::new(t, fit(c, t, y), out, l.pick(["清除数据", "清除資料", "Wipe data"]), top);
+    }
     let y = widgets::section_first(&mut c, t, f, top, l.pick(["恢复出厂设置", "恢復原廠設定", "Factory reset"]));
     let (name, sub) = wipe_row(Wipe::All, s);
     let all = widgets::list(&mut c, t, f, y, &[Row::new(name).subtitle(&sub).trail(Trail::Check(chosen(Wipe::All)))]);
@@ -2084,6 +2249,32 @@ pub fn wipe(cx: &Ctx) -> Frame {
     let track = widgets::confirm(&mut c, t, f, y + t.m.dp(24.0), label, danger, s.confirm);
     out.push(Hit { rect: track, action: Action::Confirm(Confirm::Wipe) });
     Frame::new(t, fit(c, t, track.y + track.h), out, l.pick(["清除数据", "清除資料", "Wipe data"]), top)
+}
+
+const LMI_FORMAT_DATA: Text = ["格式化 data", "格式化 data", "Format data"];
+
+/// Separate confirmation for the encrypted data reset on lmi.
+pub fn format_data(cx: &Ctx) -> Frame {
+    let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
+    let mut c = long_page(cx);
+    let mut out = Vec::new();
+    let top = t.m.content_top;
+    let heading = l.pick(["清除全部用户数据", "清除全部使用者資料", "Erase all user data"]);
+    let body = capitalized(l, &factory_reset(s));
+    let warning = widgets::list(&mut c, t, f, top, &[standing(heading, ORANGE, Icon::Wipe, &body)]);
+    let note = l.pick([
+        "手机里的备份也会被清除。重启后，Android 会创建新的加密数据分区。",
+        "手機裡的備份也會被清除。重啟後，Android 會建立新的加密資料分割區。",
+        "Backups stored on the phone are erased too. Android creates a new encrypted data partition on reboot.",
+    ]);
+    let y = widgets::footnote(&mut c, t, f, warning.bottom, note);
+    let bottom = if s.lmi_format_data {
+        let (label, danger) = confirm_label(Confirm::FactoryReset, s);
+        let track = widgets::confirm(&mut c, t, f, y + t.m.dp(24.0), label, danger, s.confirm);
+        out.push(Hit { rect: track, action: Action::Confirm(Confirm::FactoryReset) });
+        track.y + track.h
+    } else { y };
+    Frame::new(t, fit(c, t, bottom), out, l.pick(LMI_FORMAT_DATA), top)
 }
 
 /// A page laid out above the on-screen keyboard: where the keyboard's top
@@ -2156,8 +2347,12 @@ pub fn backup(cx: &Ctx) -> Frame {
     });
     let boot = l.pick(["boot、init_boot、vendor_boot、dtbo、vbmeta 和 recovery", "boot、init_boot、vendor_boot、dtbo、vbmeta 和 recovery", "boot, init_boot, vendor_boot, dtbo, vbmeta and recovery"]);
     let modem = l.pick(["IMEI、基带设置和传感器校准数据", "IMEI、基頻設定和感應器校正資料", "IMEI, modem settings and sensor calibration"]);
-    let subs = [boot, system, data, modem];
-    let choices: &[usize] = if s.data_backup_only { &[2] } else { &[0, 1, 2, 3] };
+    let shared = l.pick([
+        "机主的照片、下载和其他内部存储文件", "機主的照片、下載和其他內部儲存空間檔案",
+        "The owner's photos, downloads and other internal storage files",
+    ]);
+    let subs = [boot, system, data, modem, shared];
+    let choices: &[usize] = if s.lmi_backup { LMI_BACKUP_PARTS } else { &[0, 1, 2, 3] };
     let rows: Vec<Row> = choices.iter()
         .map(|&k| Row::new(l.pick(BACKUP_PARTS[k])).subtitle(subs[k]).trail(Trail::Check(s.backup[k])))
         .collect();
@@ -2176,26 +2371,39 @@ pub fn backup(cx: &Ctx) -> Frame {
         Some(UsbDrive::Unreadable(_)) => USB_DRIVE_UNREADABLE,
         None => USB_DRIVE_WANTED,
     });
-    let mut places = vec![Row::new(place_name(l, Place::Storage)).subtitle(&storage).trail(Trail::Check(s.backup_to == Place::Storage))];
-    let mut actions = vec![Action::BackupTo(Place::Storage)];
-    if !s.data_backup_only {
-        places.push(Row::new(place_name(l, Place::UsbDrive)).subtitle(usb).trail(Trail::Check(s.backup_to == Place::UsbDrive)));
-        actions.push(Action::BackupTo(Place::UsbDrive));
-    }
-    let places = widgets::list(&mut c, t, f, y, &places);
-    out.extend(hits(&places.rows, &actions));
+    let places = widgets::list(&mut c, t, f, y, &[
+        Row::new(place_name(l, Place::Storage)).subtitle(&storage).trail(Trail::Check(s.backup_to == Place::Storage)),
+        Row::new(place_name(l, Place::UsbDrive)).subtitle(usb).trail(Trail::Check(s.backup_to == Place::UsbDrive)),
+    ]);
+    out.extend(hits(&places.rows, &[Action::BackupTo(Place::Storage), Action::BackupTo(Place::UsbDrive)]));
     let y = widgets::section(&mut c, t, f, places.bottom, l.pick(["选项", "選項", "Options"]));
+    let on_usb = s.lmi_backup && s.backup_to == Place::UsbDrive;
+    let verify_note = if on_usb {
+        ["保存到 U 盘时总会校验", "儲存到 USB 隨身碟時一律驗證", "USB backups are always verified"]
+    } else {
+        ["确认备份文件完整", "確認備份檔案完整", "Checks the backup's files are whole"]
+    };
     let options = widgets::list(&mut c, t, f, y, &[
         Row::new(l.pick(["压缩", "壓縮", "Compress"])).subtitle(l.pick(["备份更小，耗时更长", "備份更小，耗時更長", "Smaller, and slower to make"])).trail(Trail::Switch(s.compress)),
-        Row::new(l.pick(["完成后校验", "完成後驗證", "Verify when done"])).subtitle(l.pick(["确认备份文件完整", "確認備份檔案完整", "Checks the backup's files are whole"])).trail(Trail::Switch(s.verify)),
+        Row::new(l.pick(["完成后校验", "完成後驗證", "Verify when done"])).subtitle(l.pick(verify_note)).trail(Trail::Switch(s.verify || on_usb)),
     ]);
-    out.extend(hits(&options.rows, &[Action::Toggle(Switch::Compress), Action::Toggle(Switch::Verify)]));
+    out.push(Hit { rect: options.rows[0], action: Action::Toggle(Switch::Compress) });
+    if !on_usb {
+        out.push(Hit { rect: options.rows[1], action: Action::Toggle(Switch::Verify) });
+    }
     let note = l.pick([
         "备份将保存在 Skyward/backups 文件夹中，以开始备份的时间命名。",
         "備份將儲存在 Skyward/backups 資料夾中，以開始備份的時間命名。",
         "Backups go in the Skyward/backups folder, named by when they began.",
     ]);
-    let y = widgets::footnote(&mut c, t, f, options.bottom, note);
+    let mut y = widgets::footnote(&mut c, t, f, options.bottom, note);
+    if on_usb {
+        y = widgets::footnote(&mut c, t, f, y, l.pick([
+            "U 盘上的备份未加密，可能含应用资料。请妥善保管 U 盘。",
+            "USB 隨身碟上的備份未加密，可能包含應用程式資料。請妥善保管隨身碟。",
+            "Backups on the drive are not encrypted and can contain app data. Keep the drive somewhere safe.",
+        ]));
+    }
     let (label, danger) = confirm_label(Confirm::Backup, cx.state);
     let track = widgets::confirm(&mut c, t, f, y + t.m.dp(24.0), label, danger, s.confirm);
     out.push(Hit { rect: track, action: Action::Confirm(Confirm::Backup) });
@@ -2224,11 +2432,11 @@ pub fn restore(cx: &Ctx) -> Frame {
             out.extend(hits(&prompt.rows, &[Action::Open(Screen::Decrypt)]));
         }
         y = prompt.bottom;
-        if !s.backups.is_empty() || !s.data_backup_only {
+        if !s.backups.is_empty() || !s.lmi_backup {
             y += t.m.card_gap;
         }
     }
-    let bottom = if s.backups.is_empty() && locked && s.data_backup_only {
+    let bottom = if s.backups.is_empty() && locked && s.lmi_backup {
         y
     } else if s.backups.is_empty() {
         let empty = if locked {
@@ -2251,11 +2459,11 @@ pub fn restore(cx: &Ctx) -> Frame {
         out.extend(list.rows.iter().enumerate().map(|(k, &rect)| Hit { rect, action: Action::OpenBackup(k) }));
         list.bottom
     };
-    let note = if s.data_backup_only {
+    let note = if s.lmi_backup {
         l.pick([
-            "解密后，在内部存储的 Skyward/backups 文件夹中查找数据备份。",
-            "解密後，在內部儲存空間的 Skyward/backups 資料夾中尋找資料備份。",
-            "Decrypt first to find data backups in internal storage under Skyward/backups.",
+            "在 Skyward/backups 中查找备份。内部存储需先解密；FAT32 或 exFAT 的 OTG U 盘可直接查看和校验。",
+            "在 Skyward/backups 中尋找備份。內部儲存空間須先解密；FAT32 或 exFAT 的 OTG USB 隨身碟可直接檢視和驗證。",
+            "Backups are under Skyward/backups. Decrypt internal storage first, or view and verify a FAT32 or exFAT OTG drive directly.",
         ])
     } else { l.pick([
         "将在内部存储和 U 盘中的 Skyward/backups 文件夹查找备份，查找内部存储需先完成「解密」。",
@@ -2263,6 +2471,15 @@ pub fn restore(cx: &Ctx) -> Frame {
         "Backups are looked for in the Skyward/backups folders of internal storage and the USB drive. Internal storage needs the data partition decrypted first.",
     ]) };
     let bottom = widgets::footnote(&mut c, t, f, bottom, note);
+    let bottom = if s.lmi_backup {
+        match &s.usb_drive {
+            Some(UsbDrive::Shown) => widgets::footnote(&mut c, t, f, bottom, l.pick([
+                "U 盘已只读挂载。", "USB 隨身碟已唯讀掛載。", "USB drive mounted read-only.",
+            ])),
+            Some(UsbDrive::Unreadable(_)) => widgets::footnote(&mut c, t, f, bottom, l.pick(USB_DRIVE_UNREADABLE)),
+            None => bottom,
+        }
+    } else { bottom };
     Frame::new(t, fit(c, t, bottom), out, l.pick(["恢复", "還原", "Restore"]), top)
 }
 
@@ -2275,7 +2492,8 @@ pub fn restore_backup(cx: &Ctx) -> Frame {
     let mut c = long_page(cx);
     let mut out = Vec::new();
     let top = t.m.content_top;
-    let start = if s.data_backup_only && entry.place == Place::Storage && s.place_open(entry.place) {
+    let lmi_usb = s.lmi_backup && entry.place == Place::UsbDrive;
+    let start = if s.lmi_backup && s.place_open(entry.place) {
         let check = widgets::list(&mut c, t, f, top, &[
             Row::new(l.pick(["校验备份", "驗證備份", "Verify backup"])).icon(BLUE, Icon::Shield)
                 .subtitle(l.pick(["检查备份文件，不恢复数据", "檢查備份檔案，不還原資料", "Checks backup files without restoring data"])),
@@ -2318,14 +2536,37 @@ pub fn restore_backup(cx: &Ctx) -> Frame {
                     "This backup is from another device ({device}) and can't be restored to this phone."
                 );
                 widgets::footnote(&mut c, t, f, y, &note)
+            } else if s.lmi_backup && !LMI_BACKUP_PARTS.iter().any(|&k| held.parts[k]) {
+                widgets::footnote(&mut c, t, f, y, l.pick([
+                    "这份备份没有可恢复的 data 分区或共享文件。", "這份備份沒有可還原的 data 分割區或共用檔案。",
+                    "This backup has no data partition or shared files to restore.",
+                ]))
+            } else if lmi_usb && (!s.data.storage_open() || (!held.parts[SHARED_FILES] && s.data != Data::Open)) {
+                widgets::footnote(&mut c, t, f, y, l.pick([
+                    "U 盘备份可以直接校验。要恢复内容，请从首页先完成解密。",
+                    "USB 隨身碟備份可以直接驗證。要還原內容，請從首頁先完成解密。",
+                    "You can verify a USB backup now. To restore it, decrypt from the home page first.",
+                ]))
             } else {
                 let y = widgets::section(&mut c, t, f, y, l.pick(["恢复内容", "還原內容", "Contents"]));
-                let kept: Vec<usize> = (0..BACKUP_PARTS.len()).filter(|&k| held.parts[k]).collect();
+                let available: &[usize] = if s.lmi_backup { LMI_BACKUP_PARTS } else { &[0, 1, 2, 3] };
+                let kept: Vec<usize> = available.iter().copied().filter(|&k| held.parts[k]).collect();
                 let rows: Vec<Row> = kept.iter().map(|&k| Row::new(l.pick(BACKUP_PARTS[k])).trail(Trail::Check(chosen[k]))).collect();
                 let list = widgets::list(&mut c, t, f, y, &rows);
                 out.extend(list.rows.iter().zip(&kept).map(|(&rect, &k)| Hit { rect, action: Action::RestorePart(k) }));
-                let note = l.pick(["恢复后，所选内容的现有数据将被备份覆盖。", "還原後，所選內容的現有資料將被備份覆寫。", "Restoring writes the backup over what the parts chosen hold now."]);
-                let mut y = widgets::footnote(&mut c, t, f, list.bottom, note);
+                let mut y = list.bottom;
+                if chosen.iter().take(SHARED_FILES).any(|&part| part) {
+                    let note = l.pick(["所选分区的现有数据将被备份覆盖。", "所選分割區的現有資料將被備份覆寫。", "Restoring writes over the selected partitions' current data."]);
+                    y = widgets::footnote(&mut c, t, f, y, note);
+                }
+                if chosen[SHARED_FILES] {
+                    let note = l.pick([
+                        "共享文件将恢复到内部存储的 Skyward/restored 新目录。",
+                        "共用檔案將還原到內部儲存空間的 Skyward/restored 新資料夾。",
+                        "Shared files are restored into a new folder under Skyward/restored in internal storage.",
+                    ]);
+                    y = widgets::footnote(&mut c, t, f, y, note);
+                }
                 if chosen[2] {
                     let note = l.pick([
                         "data 分区将恢复应用、账户和设置，内部存储、锁屏密码和指纹保持不变。恢复出厂设置后，无法再恢复此前的 data 分区备份。",
@@ -2333,6 +2574,13 @@ pub fn restore_backup(cx: &Ctx) -> Frame {
                         "The data partition gets its apps, accounts and settings back, and internal storage, the screen lock and fingerprints stay as they are. After a factory reset, an earlier backup of the data partition can't be restored.",
                     ]);
                     y = widgets::footnote(&mut c, t, f, y, note);
+                }
+                if lmi_usb {
+                    y = widgets::footnote(&mut c, t, f, y, l.pick([
+                        "恢复前会把备份复制到本机并校验，需要足够的内部存储空间。请仅恢复你自己生成的备份。",
+                        "還原前會將備份複製到本機並驗證，需要足夠的內部儲存空間。請僅還原自行備份的資料。",
+                        "The backup is copied to this phone and verified before restoring. Make sure there is enough free space and use a backup you made yourself.",
+                    ]));
                 }
                 // The boot partitions' vbmeta checks the system's: one of
                 // another version without the other may not start.
@@ -2355,6 +2603,9 @@ pub fn restore_backup(cx: &Ctx) -> Frame {
             }
         }
     };
+    if lmi_usb {
+        return Frame::new(t, fit(c, t, y), out, l.pick(["备份详情", "備份詳細資料", "Backup details"]), top);
+    }
     let delete = widgets::list(&mut c, t, f, y + t.m.dp(28.0), &[Row::new(l.pick(["删除备份", "刪除備份", "Delete backup"])).tint(t.pal.danger).trail(Trail::None)]);
     out.extend(hits(&delete.rows, &[Action::AskDelete]));
     let mut bottom = delete.bottom;
@@ -2461,6 +2712,12 @@ pub fn backup_job(cx: &Ctx) -> Frame {
                     let (name, passed) = (&job.plan[a.item].0, fmt::bytes(passed));
                     (format!("{verb} {name}"), tr!(l, "{past} {passed}，共 {total}", "{past} {passed}，共 {total}", "{past} {passed} of {total}"), over)
                 }
+                None if let Some((done, of)) = job.staging => {
+                    let (copied, total) = (fmt::bytes(done), fmt::bytes(of));
+                    (l.pick(["正在从 U 盘复制备份", "正在從 USB 隨身碟複製備份", "Copying the USB backup"]).to_string(),
+                        tr!(l, "已复制 {copied}，共 {total}", "已複製 {copied}，共 {total}", "Copied {copied} of {total}"),
+                        share(done, of.max(1)).min(1.0))
+                }
                 None if verifying => (
                     l.pick(["正在读取备份", "正在讀取備份", "Reading the backup"]).to_string(),
                     l.pick(["正在检查清单和分卷文件", "正在檢查清單和分卷檔案", "Checking the manifest and numbered volumes"]).to_string(),
@@ -2507,6 +2764,9 @@ pub fn backup_job(cx: &Ctx) -> Frame {
                     ]);
                     (failed, RED, detail.to_string())
                 }
+                BackupEnd::Failed(_) if job.place == Place::UsbDrive && matches!(job.kind, BackupKind::Backup { .. }) => {
+                    (failed, RED, l.pick(["请重新连接 U 盘，并校验列表中显示的备份。", "請重新連接 USB 隨身碟，並驗證清單中顯示的備份。", "Reconnect the USB drive and verify any backup shown in the list."]).to_string())
+                }
                 BackupEnd::Failed(_) => (failed, RED, gone.to_string()),
             };
             widgets::list(&mut c, t, f, top, &[standing(title, color, icon, &detail)]).bottom
@@ -2522,6 +2782,11 @@ pub fn backup_job(cx: &Ctx) -> Frame {
                 l.pick(["仅校验备份文件，不会恢复数据。可以随时停止。", "僅驗證備份檔案，不會還原資料。可以隨時停止。", "Only checks backup files. No data is restored, and you can stop at any time."]).to_string()
             } else { match (job.kind.restores(), job.at) {
                 (false, _) => tr!(l, "备份完成前，{keep}停止后将删除未完成的备份。", "備份完成前，{keep}停止後將刪除未完成的備份。", "{keep} until the backup is done. Stopping deletes the unfinished backup."),
+                (true, Some(a)) if !a.checking && s.lmi_backup && job.place == Place::UsbDrive => l.pick([
+                    "备份已复制到本机并校验；恢复完成前请不要关机。",
+                    "備份已複製到本機並驗證；還原完成前請勿關機。",
+                    "The local copy is verified. Don't power off before the restore finishes.",
+                ]).to_string(),
                 (true, Some(a)) if !a.checking => tr!(l, "恢复完成前，{keep}", "還原完成前，{keep}", "{keep} until the restore is done."),
                 (true, _) => l.pick(["校验备份完成前，不会写入任何内容。", "驗證備份完成前，不會寫入任何內容。", "Nothing is written until the backup is verified."]).to_string(),
             } };
@@ -2538,7 +2803,7 @@ pub fn backup_job(cx: &Ctx) -> Frame {
         }
         Some(end) => {
             match end {
-                BackupEnd::Restored { unmade } if !unmade.is_empty() => {
+                BackupEnd::Restored { unmade, .. } if !unmade.is_empty() => {
                     let folders = unmade.join(l.pick(["、", "、", ", "]));
                     let note = tr!(
                         l,
@@ -2550,6 +2815,10 @@ pub fn backup_job(cx: &Ctx) -> Frame {
                 }
                 BackupEnd::Failed(why) => y = widgets::footnote(&mut c, t, f, y, why),
                 _ => {}
+            }
+            if let BackupEnd::Restored { shared: Some(path), .. } = end {
+                let note = tr!(l, "共享文件已恢复至内部存储的 {path}。", "共用檔案已還原至內部儲存空間的 {path}。", "Shared files restored to {path} in internal storage.");
+                y = widgets::footnote(&mut c, t, f, y, &note);
             }
             let (rows, acts): (Vec<Row>, Vec<Action>) = match end {
                 BackupEnd::Restored { .. } => (
@@ -3599,7 +3868,7 @@ pub fn row(screen: Screen, cx: &Ctx, i: usize, c: &mut Canvas) {
             };
             files::row(c, cx.t, cx.f, entry, caption, cx.state.wallpaper().is_some());
         }
-        Screen::Installing => widgets::output_row(c, cx.t, cx.f, &cx.state.script_output, i, cx.state.wallpaper().is_some()),
+        Screen::Installing => widgets::output_row(c, cx.t, cx.f, visible_script_output(cx.state), i, cx.state.wallpaper().is_some()),
         Screen::PartWork => {
             let work = cx.state.part_work.as_ref().expect("the page of partition work shows work");
             widgets::output_row(c, cx.t, cx.f, &work.output, i, cx.state.wallpaper().is_some())
@@ -4451,7 +4720,7 @@ mod tests {
     fn job(restore: bool, checks: bool) -> BackupJob {
         let plan = vec![("boot".into(), 200), ("system".into(), 800)];
         let kind = if restore { BackupKind::Restore } else { BackupKind::Backup { checks } };
-        BackupJob { kind, place: Place::Storage, plan, at: None, outcome: None, stopping: false }
+        BackupJob { kind, place: Place::Storage, plan, staging: None, at: None, outcome: None, stopping: false }
     }
 
     fn at(item: usize, done: u64, of: u64, checking: bool) -> BackupAt {

@@ -88,7 +88,14 @@ impl LocalFile {
     /// it is served in.
     pub fn open(path: &Path) -> Result<(LocalFile, Offer)> {
         let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-        let size = file.metadata().with_context(|| format!("look at {}", path.display()))?.len();
+        Self::from_file(file).with_context(|| format!("look at {}", path.display()))
+    }
+
+    /// Serve a checked open file, keeping the same descriptor until the install ends.
+    pub(crate) fn from_file(file: File) -> Result<(LocalFile, Offer)> {
+        let info = file.metadata()?;
+        anyhow::ensure!(info.is_file(), "the package is not a regular file");
+        let size = info.len();
         let block_size = file_block(size);
         Ok((LocalFile { file, block_size: u64::from(block_size) }, Offer { size, block_size }))
     }

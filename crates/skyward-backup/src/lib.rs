@@ -18,6 +18,9 @@ pub const MANIFEST: &str = "backup.toml";
 /// Where backups go, from the top of the place they are kept in.
 pub const FOLDER: &str = "Skyward/backups";
 
+/// Where restored shared files are published in owner storage.
+pub const RESTORED_SHARED: &str = "Skyward/restored";
+
 /// The layout of a backup this recovery writes and reads.
 pub const FORMAT: u32 = 1;
 
@@ -35,10 +38,12 @@ pub enum Part {
     /// The baseband's settings with the phone's own identity, and the
     /// sensors' calibration.
     Efs,
+    /// Ordinary files from the owner's shared storage.
+    SharedFiles,
 }
 
 impl Part {
-    pub const ALL: [Part; 4] = [Part::Boot, Part::System, Part::Data, Part::Efs];
+    pub const ALL: [Part; 5] = [Part::Boot, Part::System, Part::Data, Part::Efs, Part::SharedFiles];
 
     pub fn uses_slot(self) -> bool {
         matches!(self, Self::Boot | Self::System)
@@ -79,7 +84,7 @@ impl Item {
     /// The name that precedes the numbered files making up this part.
     pub fn file_name(part: Part, name: &str, compressed: bool) -> String {
         let ext = match part {
-            Part::Data => "tar",
+            Part::Data | Part::SharedFiles => "tar",
             _ => "img",
         };
         let compression = if compressed { ".lz4" } else { "" };
@@ -120,13 +125,13 @@ impl Manifest {
     }
 
     /// Which of [`Part::ALL`] it holds.
-    pub fn parts(&self) -> [bool; 4] {
+    pub fn parts(&self) -> [bool; 5] {
         Part::ALL.map(|p| self.items.iter().any(|i| i.part == p))
     }
 
     /// The bytes its files take.
     pub fn size(&self) -> u64 {
-        self.items.iter().map(|i| i.stored.stored).sum()
+        self.items.iter().fold(0u64, |bytes, item| bytes.saturating_add(item.stored.stored))
     }
 }
 
@@ -181,7 +186,7 @@ mod tests {
         };
         m.write(&at, Ownership::Kept).unwrap();
         assert_eq!(Manifest::read(&at).unwrap(), m);
-        assert_eq!(m.parts(), [true, false, true, false]);
+        assert_eq!(m.parts(), [true, false, true, false, false]);
         assert_eq!(m.size(), 100_663_296 + 4_500_000_000);
         std::fs::remove_dir_all(&at).unwrap();
     }

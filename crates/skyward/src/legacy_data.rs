@@ -29,6 +29,139 @@ fn stop_services() -> Result<()> {
     Ok(())
 }
 
+const KEYSTORE_PATH: &str = "/mnt/system/system/bin/keystore2";
+const TEMP_STORE: &str = "/tmp/skyward-keystore";
+const KEYSTORE_INTERFACE: &str = "android.system.keystore2.IKeystoreService";
+const KEYSTORE_SERVICE: &str = "android.system.keystore2.IKeystoreService/default";
+const MAINTENANCE: &str = "android.security.maintenance";
+const MAINTENANCE_INTERFACE: &str = "android.security.maintenance.IKeystoreMaintenance";
+const APP_DOMAIN: i32 = 0;
+const GET_NUMBER_OF_ENTRIES: u32 = 8;
+const CLEAR_NAMESPACE: u32 = 5;
+
+pub(crate) fn clear_app_keys(
+    store: &crate::data_wipe::KeystoreTarget<'_>,
+    targets: &std::collections::BTreeSet<u32>,
+    before_stopping: impl FnOnce(),
+) -> Result<()> {
+    use skyward_binder::{driver::Binder, parcel::Parcel, service, status};
+
+    ensure!(!targets.is_empty(), "no app key namespaces were selected");
+    check_keystore_sdk()?;
+    let config = skyward_config::DeviceConfig::load("/skyward/device.toml")?;
+    let mut keystore = config.services.last().cloned().context("missing lmi Keystore configuration")?;
+    ensure!(config.device.codename == "lmi"
+        && keystore.path == KEYSTORE_PATH && keystore.args == [TEMP_STORE]
+        && keystore.user.as_deref() == Some("keystore")
+        && keystore.ready_service.as_deref() == Some(KEYSTORE_SERVICE)
+        && !keystore.oneshot,
+        "unexpected lmi Keystore service configuration");
+    keystore.args = vec![store.path().to_str().context("invalid Keystore path")?.to_owned()];
+    store.check_path()?;
+
+    let mut services = SERVICES.lock().expect("the lmi services lock is not poisoned");
+    let active = services.as_mut().context("the lmi decryption services are not active")?;
+    let old = active.last_pid()?;
+    require_keystore_process(old, Path::new(TEMP_STORE))?;
+    let binder = Binder::open()?;
+    drop(checked_service(&binder, KEYSTORE_SERVICE, KEYSTORE_INTERFACE, old)?);
+    drop(checked_service(&binder, MAINTENANCE, MAINTENANCE_INTERFACE, old)?);
+
+    before_stopping();
+    active.stop_last(old)?;
+    let timeout = Instant::now() + Duration::from_secs(5);
+    loop {
+        if service::find(&binder, KEYSTORE_SERVICE)?.is_none()
+            && service::find(&binder, MAINTENANCE)?.is_none()
+        {
+            break;
+        }
+        ensure!(Instant::now() < timeout, "previous Keystore registrations did not expire");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    store.check_path()?;
+    let mut native = crate::services::Managed::start(&[keystore])?;
+    let pid = native.last_pid()?;
+    let cleared = (|| -> Result<()> {
+        require_keystore_process(pid, store.path())?;
+        let main = checked_service(&binder, KEYSTORE_SERVICE, KEYSTORE_INTERFACE, pid)?;
+        let maintenance = checked_service(&binder, MAINTENANCE, MAINTENANCE_INTERFACE, pid)?;
+
+        // The main service opens SQLite lazily. Count the caller's own keys
+        // to initialize it and check the actual open file before clearing.
+        let mut count = Parcel::call(KEYSTORE_INTERFACE);
+        count.i32(APP_DOMAIN);
+        count.i64(-1);
+        let reply = main.transact(GET_NUMBER_OF_ENTRIES, &count).context("initialize the inspected Keystore")?;
+        let mut reply = reply.read();
+        status::ok(&mut reply)?;
+        ensure!(reply.i32()? >= 0, "the native Keystore returned an invalid entry count");
+        store.check_service_database(pid)?;
+
+        for &uid in targets {
+            let mut request = Parcel::call(MAINTENANCE_INTERFACE);
+            request.i32(APP_DOMAIN);
+            request.i64(i64::from(uid));
+            let reply = maintenance.transact(CLEAR_NAMESPACE, &request)
+                .context("clear an Android app Keystore namespace")?;
+            status::ok(&mut reply.read()).context("Android rejected app Keystore cleanup")?;
+        }
+        store.check_service_database(pid)
+    })();
+    let stopped = native.stop_last(pid).context("stop the native Keystore before reading the result");
+    cleared?;
+    stopped
+}
+
+pub(crate) fn check_keystore_sdk() -> Result<()> {
+    let props = fs::read_to_string("/mnt/system/system/build.prop")
+        .context("read the installed system SDK for Keystore")?;
+    let mut found = false;
+    for (name, value) in props.lines().filter_map(|line| line.split_once('=')) {
+        if matches!(name.trim(), "ro.system.build.version.sdk" | "ro.build.version.sdk") {
+            ensure!(value.trim() == "36", "app Keystore cleanup requires an Android 16 system");
+            found = true;
+        }
+    }
+    ensure!(found, "the installed system did not declare its Android SDK");
+    Ok(())
+}
+
+fn require_keystore_process(pid: u32, directory: &Path) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let process = procfs::process::Process::new(pid.try_into()?)?;
+    ensure!(process.exe()? == Path::new(KEYSTORE_PATH)
+        && process.status()?.euid == crate::data_wipe::KeystoreTarget::UID,
+        "unexpected native Keystore process");
+    let command = fs::read(format!("/proc/{pid}/cmdline"))?;
+    let command = command.strip_suffix(&[0]).context("invalid Keystore process arguments")?;
+    let args: Vec<_> = command.split(|&byte| byte == 0).collect();
+    ensure!(args == [KEYSTORE_PATH.as_bytes(), directory.as_os_str().as_bytes()],
+        "native Keystore is using a different directory");
+    Ok(())
+}
+
+fn checked_service<'a>(
+    binder: &'a skyward_binder::driver::Binder,
+    name: &str,
+    interface: &str,
+    pid: u32,
+) -> Result<skyward_binder::driver::Handle<'a>> {
+    use skyward_binder::service;
+    // The main service can register before the maintenance endpoint.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(handle) = service::find(binder, name)? {
+            ensure!(service::pid(&handle)? == pid && service::interface(&handle)? == interface,
+                "unexpected Android Keystore Binder service");
+            return Ok(handle);
+        }
+        ensure!(Instant::now() < deadline, "Android Keystore Binder service did not register");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn unmount_partition(name: &str, point: &str) -> Result<()> {
     let path = Path::new(point);
     if let Some(mounted) = mount::visible(path)? {
@@ -72,7 +205,7 @@ fn start() -> Result<crate::services::Managed> {
     crate::mount_firmware("modem")?;
     skyward_sys::ueventd::apply()?;
 
-    let key_db = Path::new("/tmp/skyward-keystore");
+    let key_db = Path::new(TEMP_STORE);
     fs::create_dir_all(key_db)?;
     fs::set_permissions(key_db, fs::Permissions::from_mode(0o700))?;
     std::os::unix::fs::chown(key_db, Some(1017), Some(1017))?;
